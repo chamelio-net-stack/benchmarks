@@ -51,14 +51,15 @@ __u64 txb_interval_total, txp_interval_total;
 __u64 t_start_ns;
 __u64 t_last_report_ns, t_next_report_ns;
 
-int src_port;
-const char *src_server_ip;
-int rem_port;
-const char *rem_server_ip;
 static pthread_barrier_t start_barrier;
 static pthread_t *threads = NULL;
 static struct core *cores = NULL;
+
+int src_port;
+const char *src_ip;
 struct sockaddr_in src_addr;
+int rem_port;
+const char *rem_ip;
 
 static inline __u64 now_ns(void)
 {
@@ -71,14 +72,14 @@ static inline int parse_args(int argc, char **argv)
 {
   int i;
 
-  if (argc < 3)
+  if (argc < 5)
   {
     fprintf(stderr, "Usage: %s <src_bind_ip> <src_port> <rem_bind_ip> <rem_port>" 
         " [--msize N] [--ncores N] [--buf-size]\n", argv[0]);
     return -1;
   }
 
-  src_server_ip = argv[1];
+  src_ip = argv[1];
   src_port = atoi(argv[2]);
   if (src_port <= 0 || src_port > 65535)
   {
@@ -86,7 +87,7 @@ static inline int parse_args(int argc, char **argv)
     return -1;
   }
 
-  rem_server_ip = argv[3];
+  rem_ip = argv[3];
   rem_port = atoi(argv[4]);
   if (rem_port <= 0 || rem_port > 65535)
   {
@@ -337,7 +338,7 @@ static inline void init_server()
 {
   src_addr.sin_family = AF_INET;
   src_addr.sin_port = htons((__u16) src_port);
-  if (inet_pton(AF_INET, src_server_ip, &src_addr.sin_addr) != 1)
+  if (inet_pton(AF_INET, src_ip, &src_addr.sin_addr) != 1)
   {
     fprintf(stderr, "invalid bind_ip\n");
     abort();
@@ -389,7 +390,7 @@ int main(int argc, char **argv)
   pthread_barrier_wait(&start_barrier);
 
   printf("UDP echo server listening on %s:%d (msize=%zu) (bsize=%zu) (ncores=%d)\n", 
-      src_server_ip, src_port, msize, bsize, ncores);
+      src_ip, src_port, msize, bsize, ncores);
   fflush(stdout);
   
   /* Establish timebase and reporting windows */
