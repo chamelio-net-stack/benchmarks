@@ -13,10 +13,10 @@ cc = meson.get_compiler('c')
 threads_dep = dependency('threads', required: true)
 dpdk_dep = dependency('libdpdk', required: true)
 
-demi_inc = include_directories('/root/include')
+demi_inc = include_directories('/workspaces/include')
 demi_lib = cc.find_library(
   'demikernel',
-  dirs: ['/root/lib'],
+  dirs: ['/workspaces/lib'],
   required: true,
 )
 demi_dep = declare_dependency(
@@ -24,6 +24,10 @@ demi_dep = declare_dependency(
   dependencies: [
     demi_lib,
     dpdk_dep,
+  ],
+  link_args: [
+    '-Wl,-rpath,/workspaces/lib',
+    '-Wl,-rpath,/workspaces/lib/x86_64-linux-gnu',
   ],
 )
 

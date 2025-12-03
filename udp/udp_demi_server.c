@@ -201,7 +201,7 @@ static inline void core_init(struct core *c)
     c->sgas[i] = demi_sgaalloc(msize);
     if (c->sgas[i].sga_numsegs == 0)
     {
-      fprintf(stderr, "failed to allocate sga");
+      fprintf(stderr, "failed to allocate sga\n");
       abort();
     }
   }
@@ -274,25 +274,25 @@ static inline void * core_thread(void *arg)
   int ret;
   struct core *c;
 
+  const struct demi_args args = {
+    .argc = 0,
+    .argv = NULL,
+    .callback = NULL,
+  };
+  
+  ret = demi_init(&args);
+  if (ret != 0)
+  {
+    fprintf(stderr, "Failed to initialize the demikernel\n");
+    abort();
+  }
+  
   c = (struct core *) arg;
   core_init(c);
 
   /* Core 0 waits here while others wait in init */
   if (c->id == 0)
     pthread_barrier_wait(&start_barrier);
-
-  const struct demi_args args = {
-    .argc = 0,
-    .argv = NULL,
-    .callback = NULL,
-  };
-
-  ret = demi_init(&args);
-  if (ret != 0)
-  {
-    fprintf(stderr, "Failed to initialize the demikernel");
-    abort();
-  }
 
   while (1)
   {
@@ -313,12 +313,6 @@ static inline void prepare_cores()
     memset(&cores[i], 0, sizeof(struct core));
     cores[i].id = i;
     memset(&cores[i].dst_addr, 0, sizeof(cores[i].dst_addr));
-
-    if (inet_pton(AF_INET, src_server_ip, &src_addr.sin_addr) != 1)
-    {
-      fprintf(stderr, "Invalid server_ip\n");
-      abort();
-    }
   }
 }
 
@@ -343,10 +337,9 @@ static inline void init_server()
 {
   src_addr.sin_family = AF_INET;
   src_addr.sin_port = htons((__u16) src_port);
-  memset(&src_addr, 0, sizeof(src_addr));
   if (inet_pton(AF_INET, src_server_ip, &src_addr.sin_addr) != 1)
   {
-    fprintf(stderr, "Invalid bind_ip\n");
+    fprintf(stderr, "invalid bind_ip\n");
     abort();
   }
 
