@@ -28,10 +28,11 @@
 struct core {
   int id;
   int fd;
-  int npop;
-  int npush;
+  int popped;
+  demi_qtoken_t txqt;
+  demi_qtoken_t rxqt;
   demi_qresult_t res;
-  demi_sgarray_t *sgas;
+  demi_sgarray_t sga;
   __u64 rxb_interval;
   __u64 rxp_interval;
   __u64 txb_interval;
@@ -43,7 +44,6 @@ struct core {
 /* Default arg values */
 size_t msize = 64;
 size_t bsize = 4096;
-size_t nsgas = 0;
 int ncores = 1;
 
 __u64 rxb_interval_total, rxp_interval_total;
@@ -172,8 +172,7 @@ static inline void print_stats(__u64 now)
 
 static inline void core_init(struct core *c)
 {
-  int i, ret, fd;
-  demi_sgarray_t *sgas;
+  int ret, fd;
 
   ret = demi_socket(&fd, AF_INET, SOCK_DGRAM, 0);
   if (ret < 0) 
@@ -189,33 +188,27 @@ static inline void core_init(struct core *c)
     abort();
   }
 
-  nsgas = bsize / msize;
-  sgas = calloc(nsgas, sizeof(demi_sgarray_t));
-  if (sgas == NULL)
+  c->sga = demi_sgaalloc(msize);
+  if (c->sga.sga_numsegs == 0)
   {
-    fprintf(stderr, "failed to allocate array of sgas for core\n");
+    fprintf(stderr, "failed to allocate sga\n");
     abort();
   }
-  c->sgas = sgas;
 
-  for (i = 0; i < nsgas; i++)
-  {
-    c->sgas[i] = demi_sgaalloc(msize);
-    if (c->sgas[i].sga_numsegs == 0)
-    {
-      fprintf(stderr, "failed to allocate sga\n");
-      abort();
-    }
-  }
-
+  memset(&c->dst_addr, 0, sizeof(c->dst_addr));
   c->dst_addr.sin_family = AF_INET;
   c->dst_addr.sin_port = htons((__u16) rem_port);
-  memset(&c->dst_addr, 0, sizeof(c->dst_addr));
+  if (inet_pton(AF_INET, rem_ip, &c->dst_addr.sin_addr) != 1)
+  {
+    fprintf(stderr, "invalid server_ip\n");
+    abort();
+  }
+  c->dst_len = sizeof(c->dst_addr);
 
   c->fd = fd;
-  c->npop = 0;
-  c->npush = 0;
-  c->dst_len = sizeof(c->dst_addr);
+  c->txqt = -1;
+  c->rxqt = -1;
+  c->popped = 0;
   c->rxb_interval = 0;
   c->rxp_interval = 0;
   c->txb_interval = 0;
@@ -225,50 +218,57 @@ static inline void core_init(struct core *c)
 static inline void core_rx(struct core *c)
 {
   int ret;
-  demi_qtoken_t qt = -1;
 
-  while (c->npop < nsgas)
-  {
-    assert(demi_pop(&qt, c->fd) == 0);
-    ret = demi_wait(&c->res, qt, &timeout) ;    
-    assert(ret == 0 || ret == ETIMEDOUT);
-   
-    if (ret != 0)
-      break;
+  if (c->rxqt == -1)
+    assert(demi_pop(&c->rxqt, c->fd) == 0);
     
-    assert(c->res.qr_opcode == DEMI_OPC_POP);
-    assert(c->res.qr_value.sga.segments[0].data_len_bytes == msize);
-    memcpy(&c->sgas[c->npop], &c->res.qr_value.sga, sizeof(demi_sgarray_t));
-    __sync_fetch_and_add(&c->rxp_interval, 1);
-    __sync_fetch_and_add(&c->rxb_interval, 
-        c->res.qr_value.sga.segments[0].data_len_bytes);
-    c->npop++;
+  if (c->rxqt != -1)
+  {
+    ret = demi_wait(&c->res, c->rxqt, &timeout);
+    assert(ret == 0 || ret == ETIMEDOUT);
+    
+    if (ret == 0)
+    {
+      assert(c->res.qr_opcode == DEMI_OPC_POP);
+      assert(c->res.qr_value.sga.sga_numsegs == 1);
+      assert(c->res.qr_value.sga.segments[0].data_len_bytes == msize);
+      memcpy(c->sga.segments[0].data_buf_ptr, 
+          c->res.qr_value.sga.segments[0].data_buf_ptr, msize);
+      __sync_fetch_and_add(&c->rxb_interval, msize);
+      __sync_fetch_and_add(&c->rxp_interval, 1);
+      c->rxqt = -1;
+      c->popped = 1;
+      demi_sgafree(&c->res.qr_value.sga);
+    }
   }
 }
 
 static inline void core_tx(struct core *c)
 {
   int ret;
-  demi_qtoken_t qt = -1;
-  
-  while (c->npush < c->npop)
+
+  if (c->txqt == -1 && c->popped)
   {
-    assert(demi_pushto(&qt, c->fd, &c->sgas[c->npush], 
+    c->sga.sga_numsegs = 1;
+    c->sga.segments[0].data_len_bytes = msize;
+    assert(demi_pushto(&c->txqt, c->fd, &c->sga, 
         (const struct sockaddr *) &c->dst_addr, c->dst_len) == 0);
-    ret = demi_wait(&c->res, qt, &timeout);
-    assert(ret == 0 || ret == ETIMEDOUT);
-          
-    if (ret != 0)
-      break;
-    
-    assert(c->res.qr_opcode == DEMI_OPC_PUSH);
-    __sync_fetch_and_add(&c->txp_interval, 1);
-    __sync_fetch_and_add(&c->txb_interval, msize);
-    c->npush++;
+    c->popped = 0;
   }
   
-  c->npop = 0;
-  c->npush = 0;
+  if (c->txqt != -1)
+  {
+    ret = demi_wait(&c->res, c->txqt, NULL);
+    assert(ret == 0 || ret == ETIMEDOUT);
+    
+    if (ret == 0)
+    {
+      assert(c->res.qr_opcode == DEMI_OPC_PUSH);
+      __sync_fetch_and_add(&c->txp_interval, 1);
+      __sync_fetch_and_add(&c->txb_interval, msize);
+      c->txqt = -1;
+    }
+  }
 }
 
 static inline void * core_thread(void *arg)
@@ -314,7 +314,6 @@ static inline void prepare_cores()
   {
     memset(&cores[i], 0, sizeof(struct core));
     cores[i].id = i;
-    memset(&cores[i].dst_addr, 0, sizeof(cores[i].dst_addr));
   }
 }
 
