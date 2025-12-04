@@ -60,6 +60,7 @@ const char *src_ip;
 struct sockaddr_in src_addr;
 int rem_port;
 const char *rem_ip;
+struct timespec timeout;
 
 static inline __u64 now_ns(void)
 {
@@ -229,7 +230,7 @@ static inline void core_rx(struct core *c)
   while (c->npop < nsgas)
   {
     assert(demi_pop(&qt, c->fd) == 0);
-    ret = demi_wait(&c->res, qt, 0) ;    
+    ret = demi_wait(&c->res, qt, &timeout) ;    
     assert(ret == 0 || ret == ETIMEDOUT);
    
     if (ret != 0)
@@ -254,7 +255,7 @@ static inline void core_tx(struct core *c)
   {
     assert(demi_pushto(&qt, c->fd, &c->sgas[c->npush], 
         (const struct sockaddr *) &c->dst_addr, c->dst_len) == 0);
-    ret = demi_wait(&c->res, qt, 0);
+    ret = demi_wait(&c->res, qt, &timeout);
     assert(ret == 0 || ret == ETIMEDOUT);
           
     if (ret != 0)
@@ -366,6 +367,9 @@ static inline void init_server()
   rxp_interval_total = 0;
   txb_interval_total = 0;
   txp_interval_total = 0;
+
+  timeout.tv_nsec = 0;
+  timeout.tv_sec = 0;
 }
 
 int main(int argc, char **argv)
