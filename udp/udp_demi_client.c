@@ -60,6 +60,7 @@ int duration = 30;
 double rate = 10.0;
 int ncores = 1;
 
+struct timespec timeout;
 const char *rem_ip;
 int rem_port;
 int src_port;
@@ -405,15 +406,19 @@ static inline void core_tx(struct core *c)
   struct payload_hdr ph;
   demi_qtoken_t qt = -1;
   
+  fprintf(stderr, "core_tx tokens=%f msize=%ld\n", c->tokens, msize);
   while (c->tokens >= (double) msize)
   {
+    fprintf(stderr, "inside core_tx loop\n");
     ph.tsc = util_rdtsc();
     c->txsga.sga_numsegs = 1;
     c->txsga.segments[0].data_len_bytes = sizeof(ph);
     memcpy(c->txsga.segments[0].data_buf_ptr, &ph, sizeof(ph));
     assert(demi_pushto(&qt, c->fd, &c->txsga,
-        (const struct sockaddr *) &c->dst, c->dstlen));
-    ret = demi_wait(&c->res, qt, 0);
+        (const struct sockaddr *) &c->dst, c->dstlen) == 0);
+    fprintf(stderr, "finished push\n");
+    ret = demi_wait(&c->res, qt, &timeout);
+    fprintf(stderr, "finished wait tx\n");
     assert(ret == 0 || ret == ETIMEDOUT);
 
     if (ret != 0)
@@ -434,10 +439,14 @@ static inline void core_rx(struct core *c)
   demi_qtoken_t qt = -1;
   struct payload_hdr *ph;
 
+  fprintf(stderr, "core_rx\n");
   while (1)
   {
+    fprintf(stderr, "inside core_rx loop\n");
     assert(demi_pop(&qt, c->fd) == 0);
-    ret = demi_wait(&c->res, qt, 0) ;    
+    fprintf(stderr, "called pop\n");
+    ret = demi_wait(&c->res, qt, &timeout);
+    fprintf(stderr, "finished waiting rx\n");    
     assert(ret == 0 || ret == ETIMEDOUT);
    
     if (ret != 0)
@@ -583,6 +592,9 @@ static inline void init_client()
     perror("pthread_barrier_init");
     exit(EXIT_FAILURE);
   }
+
+  timeout.tv_nsec = 0;
+  timeout.tv_sec = 0;
 }
 
 int main(int argc, char **argv)
