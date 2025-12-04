@@ -2,7 +2,7 @@
  * latency percentiles (p50, p99, p99.9) in microseconds.
  *
  * Usage:
- *   ./udp_demi_client <src_ip> <rem_port> <rem_ip> <rem_port>
+ *   ./udp_demi_client <src_ip> <src_port> <rem_ip> <rem_port>
  *     [--msize N] [--duration S] [--rate R] [--ncores N]
  *
  *   --msize Total UDP payload bytes.
@@ -39,10 +39,11 @@ struct core {
   int id;
   int fd;
   demi_qresult_t res;
-  demi_sgarray_t txsga;
-  demi_sgarray_t rxsga;
-  struct sockaddr_in dst;
-  socklen_t dstlen;
+  demi_qtoken_t txqt;
+  demi_qtoken_t rxqt;
+  demi_sgarray_t sga;
+  struct sockaddr_in dst_addr;
+  socklen_t dst_len;
   __u64 txb_load_interval;
   __u64 txp_load_interval;
   __u64 txb_tp_interval;
@@ -376,21 +377,26 @@ static inline void core_init(struct core *c)
     abort();
   }
   
-  c->txsga = demi_sgaalloc(msize);
-  if (c->txsga.sga_numsegs == 0)
+  c->sga = demi_sgaalloc(msize);
+  if (c->sga.sga_numsegs == 0)
   {
     fprintf(stderr, "failed to allocate sga for tx\n");
     abort();
   }
-
-  c->rxsga = demi_sgaalloc(msize);
-  if (c->rxsga.sga_numsegs == 0)
+  
+  memset(&c->dst_addr, 0, sizeof(c->dst_addr));
+  c->dst_addr.sin_family = AF_INET;
+  c->dst_addr.sin_port   = htons((__u16) rem_port);
+  if (inet_pton(AF_INET, rem_ip, &c->dst_addr.sin_addr) != 1)
   {
-    fprintf(stderr, "failed to allocate sga for rx\n");
+    fprintf(stderr, "invalid server_ip\n");
     abort();
   }
+  c->dst_len = sizeof(c->dst_addr);
   
   c->fd = fd;
+  c->txqt = -1;
+  c->rxqt = -1;
   c->txb_load_interval = 0;
   c->txp_load_interval = 0;
   c->txb_tp_interval = 0;
@@ -404,31 +410,31 @@ static inline void core_tx(struct core *c)
 {
   int ret;
   struct payload_hdr ph;
-  demi_qtoken_t qt = -1;
   
-  fprintf(stderr, "core_tx tokens=%f msize=%ld\n", c->tokens, msize);
-  while (c->tokens >= (double) msize)
+  if (c->tokens >= (double) msize && c->txqt == -1)
   {
-    fprintf(stderr, "inside core_tx loop\n");
     ph.tsc = util_rdtsc();
-    c->txsga.sga_numsegs = 1;
-    c->txsga.segments[0].data_len_bytes = sizeof(ph);
-    memcpy(c->txsga.segments[0].data_buf_ptr, &ph, sizeof(ph));
-    assert(demi_pushto(&qt, c->fd, &c->txsga,
-        (const struct sockaddr *) &c->dst, c->dstlen) == 0);
-    fprintf(stderr, "finished push\n");
-    ret = demi_wait(&c->res, qt, &timeout);
-    fprintf(stderr, "finished wait tx\n");
+    c->sga.sga_numsegs = 1;
+    c->sga.segments[0].data_len_bytes = msize;
+    memcpy(c->sga.segments[0].data_buf_ptr, &ph, sizeof(ph));
+    assert(demi_pushto(&c->txqt, c->fd, &c->sga,
+        (const struct sockaddr *) &c->dst_addr, c->dst_len) == 0);
+  }
+  
+  if (c->txqt != -1)
+  {
+    ret = demi_wait(&c->res, c->txqt, &timeout);
     assert(ret == 0 || ret == ETIMEDOUT);
-
-    if (ret != 0)
-      break;
     
-    assert(c->res.qr_opcode == DEMI_OPC_PUSH);
-    c->tokens -= msize;
-    c->total_tx_pkts++;
-    __sync_fetch_and_add(&c->txb_load_interval, msize);
-    __sync_fetch_and_add(&c->txp_load_interval, 1);
+    if (ret == 0)
+    {
+      assert(c->res.qr_opcode == DEMI_OPC_PUSH);
+      c->tokens -= msize;
+      c->total_tx_pkts++;
+      __sync_fetch_and_add(&c->txb_load_interval, msize);
+      __sync_fetch_and_add(&c->txp_load_interval, 1);
+      c->txqt = -1;
+    }
   }
 }
 
@@ -436,30 +442,30 @@ static inline void core_rx(struct core *c)
 {
   int ret;
   __u64 rtt_us;
-  demi_qtoken_t qt = -1;
   struct payload_hdr *ph;
+  
+  if (c->rxqt == -1)
+    assert(demi_pop(&c->rxqt, c->fd) == 0);
 
-  fprintf(stderr, "core_rx\n");
-  while (1)
+  if (c->rxqt != -1)
   {
-    fprintf(stderr, "inside core_rx loop\n");
-    assert(demi_pop(&qt, c->fd) == 0);
-    fprintf(stderr, "called pop\n");
-    ret = demi_wait(&c->res, qt, &timeout);
-    fprintf(stderr, "finished waiting rx\n");    
+    ret = demi_wait(&c->res, c->rxqt, &timeout);
     assert(ret == 0 || ret == ETIMEDOUT);
-   
-    if (ret != 0)
-      break;
-
-    assert(c->res.qr_opcode == DEMI_OPC_POP);
-    assert(c->res.qr_value.sga.segments[0].data_len_bytes == msize);   
-    ph = (struct payload_hdr *) c->res.qr_value.sga.segments[0].data_buf_ptr;
-    rtt_us = us_since_tsc(ph->tsc);
-    c->total_rx_pkts++;
-    __sync_fetch_and_add(&c->txb_tp_interval, msize);
-    __sync_fetch_and_add(&c->txp_tp_interval, 1);
-    hist_add(rtt_us);
+    
+    if (ret == 0)
+    {
+      assert(c->res.qr_opcode == DEMI_OPC_POP);
+      assert(c->res.qr_value.sga.sga_numsegs == 1);
+      assert(c->res.qr_value.sga.segments[0].data_len_bytes == msize);   
+      ph = (struct payload_hdr *) c->res.qr_value.sga.segments[0].data_buf_ptr;
+      rtt_us = us_since_tsc(ph->tsc);
+      hist_add(rtt_us);
+      __sync_fetch_and_add(&c->txb_tp_interval, msize);
+      __sync_fetch_and_add(&c->txp_tp_interval, 1);
+      c->total_rx_pkts++;
+      c->rxqt = -1;
+      demi_sgafree(&c->res.qr_value.sga);
+    }
   }
 }
 
@@ -532,16 +538,6 @@ static inline void prepare_cores()
     cores[i].rate = rate;
     cores[i].tokens = 0.0;
     cores[i].last_tsc = 0;
-
-    memset(&cores[i].dst, 0, sizeof(cores[i].dst));
-    cores[i].dst.sin_family = AF_INET;
-    cores[i].dst.sin_port   = htons((__u16) rem_port);
-    if (inet_pton(AF_INET, rem_ip, &cores[i].dst.sin_addr) != 1)
-    {
-      fprintf(stderr, "Invalid server_ip\n");
-      abort();
-    }
-    cores[i].dstlen = sizeof(cores[i].dst);
   }
 }
 
