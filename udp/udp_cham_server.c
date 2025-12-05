@@ -45,7 +45,7 @@ __u64 t_start_ns;
 __u64 t_last_report_ns, t_next_report_ns;
 
 int src_port;
-const char *rem_ip;
+const char *src_ip;
 static pthread_barrier_t start_barrier;
 static pthread_t *threads = NULL;
 static struct core *cores = NULL;
@@ -69,7 +69,7 @@ static inline int parse_args(int argc, char **argv)
     return -1;
   }
 
-  rem_ip = argv[1];
+  src_ip = argv[1];
   src_port = atoi(argv[2]);
   if (src_port <= 0 || src_port > 65535)
   {
@@ -288,7 +288,7 @@ static inline void prepare_cores()
     cores[i].id = i;
     memset(&cores[i].dst_addr, 0, sizeof(cores[i].dst_addr));
 
-    if (inet_pton(AF_INET, rem_ip, &src_addr.sin_addr) != 1)
+    if (inet_pton(AF_INET, src_ip, &src_addr.sin_addr) != 1)
     {
       fprintf(stderr, "Invalid server_ip\n");
       abort();
@@ -315,10 +315,10 @@ static inline void start_cores()
 
 static inline void init_server()
 {
-  src_addr.sin_family = AF_INET;
-  src_addr.sin_port = htons((__u16) src_port);
   memset(&src_addr, 0, sizeof(src_addr));
-  if (inet_pton(AF_INET, rem_ip, &src_addr.sin_addr) != 1)
+  src_addr.sin_family = AF_INET;
+  src_addr.sin_port   = htons((__u16) src_port);
+  if (inet_pton(AF_INET, src_ip, &src_addr.sin_addr) != 1)
   {
     fprintf(stderr, "Invalid bind_ip\n");
     abort();
@@ -368,14 +368,18 @@ int main(int argc, char **argv)
   prepare_cores();
   start_cores();
 
+  printf("UDP echo server listening on %s:%d (msize=%zu) (bsize=%zu) (ncores=%d)\n", 
+      src_ip, src_port, msize, bsize, ncores);
+  fflush(stdout);
+  
   /* Wait for work threads brefore continuing */
   printf("Initialized %d core(s). Waiting for barrier\n", ncores);
   fflush(stdout);
   pthread_barrier_wait(&start_barrier);
-
-  printf("UDP echo server listening on %s:%d (msize=%zu) (bsize=%zu) (ncores=%d)\n", 
-      rem_ip, src_port, msize, bsize, ncores);
+  
+  printf("Running\n");
   fflush(stdout);
+  
   
   /* Establish timebase and reporting windows */
   t_start_ns = now_ns();

@@ -324,10 +324,7 @@ static inline void start_cores()
 
 static inline void init_server()
 {
-  src_addr.sin_family = AF_INET;
-  src_addr.sin_port = htons((__u16) port);
   memset(&src_addr, 0, sizeof(src_addr));
-
   src_addr.sin_family = AF_INET;
   src_addr.sin_port   = htons((__u16)port);
   if (inet_pton(AF_INET, server_ip, &src_addr.sin_addr) != 1)
