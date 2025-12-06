@@ -186,7 +186,7 @@ static inline struct udp_context_lib * core_init(struct core *c)
       (struct sockaddr *) &src_addr, sizeof(src_addr));
   if (ret < 0)
   {
-    perror("bind");
+    fprintf(stderr, "failed to bind ip and port");
     abort();
   }
 

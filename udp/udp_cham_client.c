@@ -2,7 +2,7 @@
  * latency percentiles (p50, p99, p99.9) in microseconds.
  *
  * Usage:
- *   ./udp_cham_client <rem_ip> <rem_port>
+ *   ./udp_cham_client <src_ip> <src_port> <rem_ip> <rem_port>
  *     [--msize N] [--duration S] [--rate R] [--ncores N]
  *
  *   --msize Total UDP payload bytes.
@@ -35,8 +35,8 @@ struct core {
   int fd;
   __u8 *txbuf;
   __u8 *rxbuf;
-  struct sockaddr_in dst;
-  socklen_t dstlen;
+  struct sockaddr_in dst_addr;
+  socklen_t dst_len;
   __u64 txb_load_interval;
   __u64 txp_load_interval;
   __u64 txb_tp_interval;
@@ -55,6 +55,10 @@ double rate = 10.0;
 int ncores = 1;
 const char *rem_ip;
 int rem_port;
+const char *src_ip;
+int src_port;
+struct sockaddr_in src_addr;
+socklen_t src_len;
 
 /* Global time and stats variables */
 __u64 t_start_ns, t_end_ns;
@@ -212,21 +216,29 @@ static inline int parse_args(int argc, char **argv)
   if (argc < 3)
   {
     fprintf(stderr,
-        "Usage: %s <rem_ip> <rem_port> [--msize N]"
+        "Usage: %s <src_ip> <src_port> <rem_ip> <rem_port> [--msize N]"
         " [--duration S] [--rate R] [--ncores N]\n",
         argv[0]);
     return -1;
   }
 
-  rem_ip = argv[1];
-  rem_port = atoi(argv[2]);
-  if (rem_port <= 0 || rem_port > 65535)
+  src_ip = argv[1];
+  src_port = atoi(argv[2]);
+  if (src_port <= 0 || src_port > 65535)
   {
-    fprintf(stderr, "Invalid port\n");
+    fprintf(stderr, "Invalid src port\n");
     return -1;
   }
 
-  for (int i = 3; i < argc; i++)
+  rem_ip = argv[3];
+  rem_port = atoi(argv[4]);
+  if (rem_port <= 0 || rem_port > 65535)
+  {
+    fprintf(stderr, "Invalid remote port\n");
+    return -1;
+  }
+
+  for (int i = 5; i < argc; i++)
   {
     if ((strcmp(argv[i], "--msize") == 0) && i + 1 < argc)
     {
@@ -338,6 +350,7 @@ static inline void print_stats(__u64 now)
 
 static inline struct udp_context_lib * core_init(struct core *c)
 {
+  int ret;
   struct udp_context_lib *udp_ctx;
 
   /* Each core has its own UDP context and socket */
@@ -351,9 +364,17 @@ static inline struct udp_context_lib * core_init(struct core *c)
   c->fd = udp_socket(udp_ctx);
   if (c->fd < 0)
   {
-    perror("udp_socket");
+    fprintf(stderr, "failed to create udp socket");
     pthread_exit((void *) (intptr_t) -1);
   }
+  
+  ret = udp_bind(udp_ctx, c->fd, 
+      (struct sockaddr *) &src_addr, sizeof(src_addr));
+  if (ret < 0)
+  {
+    fprintf(stderr, "failed to bind src ip and port");
+    abort();
+  } 
 
   c->txbuf = (__u8 *) malloc(msize);
   c->rxbuf = (__u8 *) malloc(msize);
@@ -369,10 +390,10 @@ static inline struct udp_context_lib * core_init(struct core *c)
   if (c->id == 0)
   {
     udp_sendto(udp_ctx, c->fd, c->txbuf, msize, 
-        (struct sockaddr *) &c->dst, c->dstlen);
+        (struct sockaddr *) &c->dst_addr, c->dst_len);
     sleep(1);
     udp_sendto(udp_ctx, c->fd, c->txbuf, msize, 
-        (struct sockaddr *) &c->dst, c->dstlen);
+        (struct sockaddr *) &c->dst_addr, c->dst_len);
     sleep(1);
     while(udp_poll_fast(udp_ctx) == 0);
     while(udp_recvfrom(udp_ctx, c->fd, c->rxbuf, msize, NULL, 0) == 0);
@@ -400,7 +421,7 @@ static inline void core_tx(struct udp_context_lib *udp_ctx, struct core *c)
     ph->tsc = util_rdtsc();
 
     ntx = udp_sendto(udp_ctx, c->fd, c->txbuf, msize,
-                  (struct sockaddr *) &c->dst, c->dstlen);
+                  (struct sockaddr *) &c->dst_addr, c->dst_len);
     assert(ntx == msize || ntx <= 0);
     assert(c->tokens >= msize);
     
@@ -497,15 +518,15 @@ static inline void prepare_cores()
     cores[i].tokens = 0.0;
     cores[i].last_tsc = 0;
 
-    memset(&cores[i].dst, 0, sizeof(cores[i].dst));
-    cores[i].dst.sin_family = AF_INET;
-    cores[i].dst.sin_port   = htons((__u16) rem_port);
-    if (inet_pton(AF_INET, rem_ip, &cores[i].dst.sin_addr) != 1)
+    memset(&cores[i].dst_addr, 0, sizeof(cores[i].dst_addr));
+    cores[i].dst_addr.sin_family = AF_INET;
+    cores[i].dst_addr.sin_port   = htons((__u16) rem_port);
+    if (inet_pton(AF_INET, rem_ip, &cores[i].dst_addr.sin_addr) != 1)
     {
       fprintf(stderr, "Invalid server_ip\n");
       abort();
     }
-    cores[i].dstlen = sizeof(cores[i].dst);
+    cores[i].dst_len = sizeof(cores[i].dst_addr);
   }
 }
 
@@ -528,6 +549,14 @@ static inline void start_cores()
 
 static inline void init_client()
 {
+  src_addr.sin_family = AF_INET;
+  src_addr.sin_port = htons((__u16) src_port);
+  if (inet_pton(AF_INET, src_ip, &src_addr.sin_addr) != 1)
+  {
+    fprintf(stderr, "invalid bind_ip\n");
+    abort();
+  }
+  
   /* Calibrate tsc */
   calibrate_tsc();
 
