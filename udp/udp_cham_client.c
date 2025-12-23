@@ -224,7 +224,7 @@ static inline int parse_args(int argc, char **argv)
 
   src_ip = argv[1];
   src_port = atoi(argv[2]);
-  if (src_port <= 0 || src_port > 65535)
+  if (src_port < 0 || src_port > 65535)
   {
     fprintf(stderr, "Invalid src port\n");
     return -1;
@@ -367,14 +367,17 @@ static inline struct udp_context_lib * core_init(struct core *c)
     fprintf(stderr, "failed to create udp socket");
     pthread_exit((void *) (intptr_t) -1);
   }
-  
-  ret = udp_bind(udp_ctx, c->fd, 
-      (struct sockaddr *) &src_addr, sizeof(src_addr));
-  if (ret < 0)
+
+  if (src_port != 0)
   {
-    fprintf(stderr, "failed to bind src ip and port");
-    abort();
-  } 
+    ret = udp_bind(udp_ctx, c->fd, 
+        (struct sockaddr *) &src_addr, sizeof(src_addr));
+    if (ret < 0)
+    {
+      fprintf(stderr, "failed to bind src ip and port\n");
+      abort();
+    } 
+  }
 
   c->txbuf = (__u8 *) malloc(msize);
   c->rxbuf = (__u8 *) malloc(msize);

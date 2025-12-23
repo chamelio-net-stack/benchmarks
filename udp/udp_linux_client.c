@@ -225,7 +225,7 @@ static inline int parse_args(int argc, char **argv)
 
   src_ip = argv[1];
   src_port = atoi(argv[2]);
-  if (src_port <= 0 || src_port > 65535)
+  if (src_port < 0 || src_port > 65535)
   {
     fprintf(stderr, "Invalid src_port\n");
     return -1;
@@ -379,12 +379,15 @@ static inline void core_init(struct core *c)
   }
   set_nonblock(fd);
   
-  ret = bind(fd, (struct sockaddr *)&src_addr, sizeof(src_addr));
-  if (ret < 0)
+  if (src_port != 0)
   {
-    perror("bind");
-    abort();
-  } 
+    ret = bind(fd, (struct sockaddr *)&src_addr, sizeof(src_addr));
+    if (ret < 0)
+    {
+      perror("bind");
+      abort();
+    } 
+  }
   
   c->txbuf = (__u8 *) malloc(msize);
   c->rxbuf = (__u8 *) malloc(msize);
