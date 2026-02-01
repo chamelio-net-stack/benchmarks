@@ -3,12 +3,13 @@
  *
  * Usage:
  *   ./udp_cham_client <src_ip> <src_port> <rem_ip> <rem_port>
- *     [--msize N] [--duration S] [--rate R] [--ncores N]
+ *     [--msize N] [--duration S] [--rate R] [--ncores N] [--cores LIST]
  *
  *   --msize Total UDP payload bytes.
  *   --duration Duration in seconds to run benchmark
  *   --rate Per-core send rate in megabits per second
  *   --ncores Number of cores to use
+ *   --cores Comma-separated core list (main, thread0, thread1, ...)
  */
 
 #define _GNU_SOURCE
@@ -24,6 +25,7 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sched.h>
 
 struct payload_hdr {
   __u64 tsc;
@@ -53,6 +55,9 @@ size_t msize = 64;
 int duration = 30;
 double rate = 10.0;
 int ncores = 1;
+static char *cores_arg = NULL;
+static int *core_list = NULL;
+static int core_list_len = 0;
 const char *rem_ip;
 int rem_port;
 const char *src_ip;
@@ -79,6 +84,102 @@ static __u64 *rtt_hist = NULL;
 static pthread_barrier_t start_barrier;
 static pthread_t *threads = NULL;
 static struct core *cores = NULL;
+
+static inline int pin_thread_to_core(int core_id)
+{
+  cpu_set_t cpuset;
+  int ret;
+
+  CPU_ZERO(&cpuset);
+  CPU_SET(core_id, &cpuset);
+  ret = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+  if (ret != 0)
+  {
+    errno = ret;
+    perror("pthread_setaffinity_np");
+    return -1;
+  }
+
+  return 0;
+}
+
+static inline int parse_core_list(const char *arg, int expected_len)
+{
+  int count = 1;
+  const char *p = arg;
+  char *tmp, *tok, *end;
+  int idx = 0;
+
+  if (arg == NULL || *arg == '\0')
+    return -1;
+
+  while (*p)
+  {
+    if (*p == ',')
+      count++;
+    p++;
+  }
+
+  if (expected_len > 0 && count != expected_len)
+  {
+    fprintf(stderr, "cores list must have %d entries (main + %d threads)\n",
+        expected_len, expected_len - 1);
+    return -1;
+  }
+
+  core_list = (int *) calloc((size_t) count, sizeof(int));
+  if (!core_list)
+  {
+    perror("calloc core_list");
+    return -1;
+  }
+
+  tmp = strdup(arg);
+  if (!tmp)
+  {
+    perror("strdup cores");
+    free(core_list);
+    core_list = NULL;
+    return -1;
+  }
+
+  for (tok = strtok(tmp, ","); tok != NULL; tok = strtok(NULL, ","))
+  {
+    while (*tok == ' ' || *tok == '\t')
+      tok++;
+    if (*tok == '\0')
+    {
+      fprintf(stderr, "empty core id in list\n");
+      free(core_list);
+      core_list = NULL;
+      free(tmp);
+      return -1;
+    }
+    errno = 0;
+    core_list[idx] = (int) strtol(tok, &end, 10);
+    if (errno != 0 || end == tok || (*end != '\0' && *end != ' ' && *end != '\t'))
+    {
+      fprintf(stderr, "invalid core id: %s\n", tok);
+      free(core_list);
+      core_list = NULL;
+      free(tmp);
+      return -1;
+    }
+    if (core_list[idx] < 0 || core_list[idx] >= CPU_SETSIZE)
+    {
+      fprintf(stderr, "core id out of range: %d\n", core_list[idx]);
+      free(core_list);
+      core_list = NULL;
+      free(tmp);
+      return -1;
+    }
+    idx++;
+  }
+
+  free(tmp);
+  core_list_len = count;
+  return 0;
+}
 
 
 static inline __u64 util_rdtsc(void)
@@ -217,7 +318,7 @@ static inline int parse_args(int argc, char **argv)
   {
     fprintf(stderr,
         "Usage: %s <src_ip> <src_port> <rem_ip> <rem_port> [--msize N]"
-        " [--duration S] [--rate R] [--ncores N]\n",
+        " [--duration S] [--rate R] [--ncores N] [--cores LIST]\n",
         argv[0]);
     return -1;
   }
@@ -256,6 +357,10 @@ static inline int parse_args(int argc, char **argv)
     {
       ncores = atoi(argv[++i]);
     }
+    else if ((strcmp(argv[i], "--cores") == 0) && i + 1 < argc)
+    {
+      cores_arg = argv[++i];
+    }
     else
     {
       fprintf(stderr, "Unknown arg: %s\n", argv[i]);
@@ -278,6 +383,12 @@ static inline int parse_args(int argc, char **argv)
 
   if (ncores <= 0)
     ncores = 1;
+
+  if (cores_arg != NULL)
+  {
+    if (parse_core_list(cores_arg, ncores + 1) != 0)
+      return -1;
+  }
 
   return 0;
 }
@@ -469,6 +580,11 @@ static inline void * core_thread(void *arg)
   double bytes_per_us, delta_cycles, delta_us, max_tokens;
 
   c = (struct core *) arg;
+  if (core_list_len > 0)
+  {
+    if (pin_thread_to_core(core_list[c->id + 1]) != 0)
+      pthread_exit((void *) (intptr_t) -1);
+  }
   udp_ctx = core_init(c);
   
   /* Synchronize start with all other cores and main */
@@ -609,6 +725,12 @@ int main(int argc, char **argv)
   }
   
   init_client();
+  if (core_list_len > 0)
+  {
+    if (pin_thread_to_core(core_list[0]) != 0)
+      return EXIT_FAILURE;
+  }
+
   prepare_cores();
   start_cores();
   
@@ -680,6 +802,7 @@ int main(int argc, char **argv)
 
   free(cores);
   free(threads);
+  free(core_list);
   free(rtt_hist);
   pthread_barrier_destroy(&start_barrier);
 
