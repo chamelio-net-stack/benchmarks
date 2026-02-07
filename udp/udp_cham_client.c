@@ -99,7 +99,7 @@ static inline int pin_thread_to_core(int core_id)
     perror("pthread_setaffinity_np");
     return -1;
   }
-
+  
   return 0;
 }
 

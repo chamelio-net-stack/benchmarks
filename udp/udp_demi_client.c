@@ -364,14 +364,14 @@ static inline void core_init(struct core *c)
   int fd, ret;
   
   ret = demi_socket(&fd, AF_INET, SOCK_DGRAM, 0);
-  if (ret < 0) 
+  if (ret != 0) 
   {
     perror("socket");
     abort();
   }
   
   ret = demi_bind(fd, (struct sockaddr *)&src_addr, sizeof(src_addr));
-  if (ret < 0)
+  if (ret != 0)
   {
     perror("bind");
     abort();
