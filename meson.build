@@ -49,3 +49,4 @@ if cham_enabled
 endif
 
 subdir('udp')
+subdir('kvs')
