@@ -116,6 +116,8 @@ struct core {
     struct workload_core wlc;
     uint64_t id;
     pthread_t pthread;
+    double tokens;
+    uint64_t last_token_nanos;
 
     uint32_t msgs_pending;
     struct connection *q_first;
@@ -237,6 +239,36 @@ static inline uint64_t get_nanos(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     return (uint64_t) ts.tv_sec * 1000 * 1000 * 1000 + ts.tv_nsec;
+}
+
+static inline void refill_tokens(struct core *c)
+{
+    uint64_t now;
+    double elapsed_s;
+    double max_tokens;
+
+    if (settings.rate <= 0.0) {
+        return;
+    }
+
+    now = get_nanos();
+    if (c->last_token_nanos == 0) {
+        c->last_token_nanos = now;
+        return;
+    }
+
+    elapsed_s = (double) (now - c->last_token_nanos) / 1000000000.0;
+    c->tokens += elapsed_s * settings.rate;
+
+    max_tokens = settings.rate / 1000.0;
+    if (max_tokens < 1.0) {
+        max_tokens = 1.0;
+    }
+    if (c->tokens > max_tokens) {
+        c->tokens = max_tokens;
+    }
+
+    c->last_token_nanos = now;
 }
 
 static inline void record_latency(struct core *c, uint64_t nanos)
@@ -546,6 +578,8 @@ static void prepare_core(struct core *c)
     }
 
     c->msgs_pending = 0;
+    c->tokens = 0.0;
+    c->last_token_nanos = 0;
     c->q_first = c->q_last = NULL;
     for (i = 0; i < settings.conns; i++) {
         if ((buf = malloc(BUFSIZE * 2)) == NULL) {
@@ -671,7 +705,13 @@ static inline void send_pending(struct core *c)
     enum workload_op op = 0;
     struct key *k;
 
-    while (c->msgs_pending < settings.pending && c->q_first != NULL) {
+    refill_tokens(c);
+
+    while (c->q_first != NULL) {
+        if (settings.rate > 0.0 && c->tokens < 1.0) {
+            break;
+        }
+
         co = conn_q_pop(c);
 
         workload_op(&workload, &c->wlc, &k, &op);
@@ -690,6 +730,9 @@ static inline void send_pending(struct core *c)
 
         co->pending++;
         c->msgs_pending++;
+        if (settings.rate > 0.0) {
+            c->tokens -= 1.0;
+        }
     }
 }
 

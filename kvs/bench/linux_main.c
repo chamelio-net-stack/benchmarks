@@ -125,6 +125,8 @@ struct core {
     uint64_t id;
     pthread_t pthread;
     uint16_t conn_pending;
+    double tokens;
+    uint64_t last_token_nanos;
 
     uint32_t msgs_pending;
     struct connection *q_first;
@@ -136,6 +138,36 @@ static inline uint64_t get_nanos(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     return (uint64_t) ts.tv_sec * 1000 * 1000 * 1000 + ts.tv_nsec;
+}
+
+static inline void refill_tokens(struct core *c)
+{
+    uint64_t now;
+    double elapsed_s;
+    double max_tokens;
+
+    if (settings.rate <= 0.0) {
+        return;
+    }
+
+    now = get_nanos();
+    if (c->last_token_nanos == 0) {
+        c->last_token_nanos = now;
+        return;
+    }
+
+    elapsed_s = (double) (now - c->last_token_nanos) / 1000000000.0;
+    c->tokens += elapsed_s * settings.rate;
+
+    max_tokens = settings.rate / 1000.0;
+    if (max_tokens < 1.0) {
+        max_tokens = 1.0;
+    }
+    if (c->tokens > max_tokens) {
+        c->tokens = max_tokens;
+    }
+
+    c->last_token_nanos = now;
 }
 
 static inline void record_latency(struct core *c, uint64_t nanos)
@@ -491,6 +523,8 @@ static void prepare_core(struct core *c)
 
     /* Initiate connections */
     c->conn_pending = 0;
+    c->tokens = 0.0;
+    c->last_token_nanos = 0;
     c->msgs_pending = 0;
     c->q_first = c->q_last = NULL;
     for (i = 0; i < settings.conns; i++) {
@@ -687,8 +721,14 @@ static inline void send_pending(struct core *c)
     enum workload_op op = 0;
     struct key *k;
 
+    refill_tokens(c);
+
     /* send out new requests */
-    while (c->msgs_pending < settings.pending && c->q_first != NULL) {
+    while (c->q_first != NULL) {
+        if (settings.rate > 0.0 && c->tokens < 1.0) {
+            break;
+        }
+
         co = c->q_first;
         c->q_first = co->next;
         if (c->q_first == NULL)
@@ -715,6 +755,9 @@ static inline void send_pending(struct core *c)
 
         co->pending++;
         c->msgs_pending++;
+        if (settings.rate > 0.0) {
+            c->tokens -= 1.0;
+        }
     }
 }
 
@@ -776,8 +819,10 @@ static void *thread_run(void *arg)
     send_pending(c);
 
     while (phase == BENCHMARK_RUNNING) {
-        /* epoll, wait for events */
-        if ((ret = epoll_wait(ep, evs, num_evs, -1)) < 0) {
+        /* poll periodically when rate-limited so tokens can refill */
+        if ((ret = epoll_wait(ep, evs, num_evs,
+                settings.rate > 0.0 ? 1 : -1)) < 0)
+        {
             fprintf(stderr, "[%d] epoll_wait failed\n", cn);
             abort();
         }

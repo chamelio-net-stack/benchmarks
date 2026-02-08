@@ -49,7 +49,7 @@ void print_usage(void)
         "Options:\n"
         "  -t, --threads=COUNT   Number of sending threads [default 1].\n"
         "  -C, --connns=COUNT    # connections / thread    [default 1].\n"
-        "  -p, --pending=NUM     Number of pend. req/conn. [default 1].\n"
+        "      --rate=RPS        Request rate / thread      [default 0=max].\n"
         "  -k, --key-size=BYTES  Key size in bytes         [default 32].\n"
         "  -n, --key-num=COUNT   Number of keys            [default 1000].\n"
         "  -u, --key-uniform     Uniform key distribution  [default]\n"
@@ -76,7 +76,7 @@ void init_settings(struct settings *s)
     s->srcport = 0;
     s->threads = 1;
     s->conns = 1;
-    s->pending = 1;
+    s->rate = 0.0;
     s->keysize = 32;
     s->keynum = 1000;
     s->keydist = DIST_UNIFORM;
@@ -99,11 +99,12 @@ int parse_settings(int argc, char *argv[], struct settings *s)
         OPT_SRC_PORT,
         OPT_REMOTE_IP,
         OPT_REMOTE_PORT,
+        OPT_RATE,
     };
     static struct option long_opts[] = {
             {"threads",     required_argument, NULL, 't'},
             {"conns",       required_argument, NULL, 'C'},
-            {"pending",     required_argument, NULL, 'p'},
+            {"rate",        required_argument, NULL, OPT_RATE},
             {"key-size",    required_argument, NULL, 'k'},
             {"key-num",     required_argument, NULL, 'n'},
             {"key-uniform", no_argument,       NULL, 'u'},
@@ -123,7 +124,7 @@ int parse_settings(int argc, char *argv[], struct settings *s)
             {"op-seed",     required_argument, NULL, 'o'},
             {"keysteer",    no_argument,       NULL, 'K'},
         };
-    static const char *short_opts = "t:C:p:k:n:uz:v:g:d:w:c:s:o:r:K";
+    static const char *short_opts = "t:C:k:n:uz:v:g:d:w:c:s:o:r:K";
     int c, opt_idx, done = 0;
     char *end;
     unsigned long port_ul;
@@ -152,11 +153,11 @@ int parse_settings(int argc, char *argv[], struct settings *s)
                     return -1;
                 }
                 break;
-            case 'p':
-                s->pending = strtoul(optarg, &end, 10);
-                if (!*optarg || *end || s->pending < 1) {
-                    fprintf(stderr, "pending needs to be a positive "
-                            "integer\n");
+            case OPT_RATE:
+                s->rate = strtod(optarg, &end);
+                if (!*optarg || *end || s->rate < 0.0) {
+                    fprintf(stderr, "rate needs to be a non-negative "
+                            "number (requests/s)\n");
                     return -1;
                 }
                 break;

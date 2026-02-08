@@ -39,7 +39,7 @@ struct settings {
     uint16_t dstport;
     uint16_t threads;
     uint16_t conns;
-    uint16_t pending;
+    double rate;
 
     uint32_t keynum;
     union {
