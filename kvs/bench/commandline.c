@@ -57,7 +57,7 @@ void print_usage(void)
         "                        S is the zipf parameter.\n"
         "  -v, --val-size=BYTES  Value size in bytes       [default 1024].\n"
         "  -g, --get-prob=PROB   Probability of GET Reqs.  [default .9].\n"
-        "  -T, --time=SECS       Measurement time in [s].  [default 10].\n"
+        "  -d, --duration=SECS   Benchmark duration in [s] [default 0].\n"
         "  -w, --warmup=SECS     Warmup time [s].          [default 5].\n"
         "  -c, --cooldown=SECS   Cooldown time [s].        [default 5].\n"
         "  -s, --key-seed=SEED   Seed for key PRG.\n"
@@ -78,7 +78,7 @@ void init_settings(struct settings *s)
     s->get_prob = 0.9;
     s->warmup_time = 5;
     s->cooldown_time = 5;
-    s->run_time = 10;
+    s->run_time = 0;
     s->request_gap = 100 * 1000;
     s->key_seed = 0x123457890123ULL;
     s->op_seed =  0x987654321098ULL;
@@ -98,15 +98,14 @@ int parse_settings(int argc, char *argv[], struct settings *s)
             {"key-zipf",    required_argument, NULL, 'z'},
             {"val-size",    required_argument, NULL, 'v'},
             {"get-prob",    required_argument, NULL, 'g'},
-            {"time",        required_argument, NULL, 'T'},
+            {"duration",    required_argument, NULL, 'd'},
             {"warmup",      required_argument, NULL, 'w'},
             {"cooldown",    required_argument, NULL, 'c'},
-            {"delay",       required_argument, NULL, 'd'},
             {"key-seed",    required_argument, NULL, 's'},
             {"op-seed",     required_argument, NULL, 'o'},
             {"keysteer",    no_argument,       NULL, 'K'},
         };
-    static const char *short_opts = "t:C:p:k:n:uz:v:g:T:w:c:d:s:o:r:K";
+    static const char *short_opts = "t:C:p:k:n:uz:v:g:d:w:c:s:o:r:K";
     int c, opt_idx, done = 0;
     char *end;
 
@@ -183,10 +182,10 @@ int parse_settings(int argc, char *argv[], struct settings *s)
                     return -1;
                 }
                 break;
-            case 'T':
+            case 'd':
                 s->run_time = strtoul(optarg, &end, 10);
-                if (!*optarg || *end || s->run_time < 1) {
-                    fprintf(stderr, "Run time needs to be a positive "
+                if (!*optarg || *end) {
+                    fprintf(stderr, "Run time needs to be a non-negative "
                             "integer\n");
                     return -1;
                 }
@@ -203,14 +202,6 @@ int parse_settings(int argc, char *argv[], struct settings *s)
                 s->cooldown_time = strtoul(optarg, &end, 10);
                 if (!*optarg || *end) {
                     fprintf(stderr, "Cool down time needs to be a positive "
-                            "integer\n");
-                    return -1;
-                }
-                break;
-            case 'd':
-                s->request_gap = strtoul(optarg, &end, 10);
-                if (!*optarg || *end) {
-                    fprintf(stderr, "Delay needs to be a positive "
                             "integer\n");
                     return -1;
                 }

@@ -822,12 +822,19 @@ int main(int argc, char *argv[])
 {
     int i, j, num_threads;
     struct core *cs;
-    uint64_t t_prev, t_cur;
+    uint64_t t_prev, t_cur, t_start, t_end;
     long double *ttp, tp, tp_total;
-    uint32_t *hist, hx;
-    uint64_t msg_total;
+    uint32_t *hist, hx, sec_elapsed;
+    uint64_t msg_total, cnt_success;
+    uint64_t total_success = 0;
+    uint64_t total_tx_get = 0, total_tx_set = 0;
+    uint64_t total_rx_get = 0, total_rx_set = 0, total_rx_fail = 0;
+    uint64_t total_tx, total_rx;
+    double elapsed_s;
     double fracs[6] = { 0.5, 0.9, 0.95, 0.99, 0.999, 0.9999 };
     size_t fracs_pos[sizeof(fracs) / sizeof(fracs[0])];
+    double summary_fracs[3] = { 0.5, 0.99, 0.999 };
+    size_t summary_pos[sizeof(summary_fracs) / sizeof(summary_fracs[0])];
 
     setlocale(LC_NUMERIC, "");
 
@@ -878,16 +885,19 @@ int main(int argc, char *argv[])
     fflush(stdout);
     phase = BENCHMARK_RUNNING;
 
+    t_start = get_nanos();
+    t_prev = t_start;
 
-
-    t_prev = get_nanos();
     while (1) {
         sleep(1);
         t_cur = get_nanos();
         tp_total = 0;
         msg_total = 0;
+        sec_elapsed = (uint32_t) ((t_cur - t_start) / 1000000000ULL);
         for (i = 0; i < num_threads; i++) {
-            tp = read_cnt(&cs[i].rx_success);
+            cnt_success = read_cnt(&cs[i].rx_success);
+            total_success += cnt_success;
+            tp = cnt_success;
             tp /= (double) (t_cur - t_prev) / 1000000000.;
             ttp[i] = tp;
             tp_total += tp;
@@ -903,9 +913,10 @@ int main(int argc, char *argv[])
                 sizeof(fracs) / sizeof(fracs[0]));
 
 
-        printf("TP: total=%'.4Lf mops  50p=%d us  90p=%d us  95p=%d us  "
-                "99p=%d us  99.9p=%d us  99.99p=%d us  \n",
-                tp_total / 1000000.,
+        printf("[ %3us ] tp=%'.0Lf rps | tp=%'.4Lf mops | "
+                "p50=%d us  p90=%d us  p95=%d us  p99=%d us  "
+                "p99.9=%d us  p99.99=%d us\n",
+                sec_elapsed, tp_total, tp_total / 1000000.,
                 hist_value(fracs_pos[0]), hist_value(fracs_pos[1]),
                 hist_value(fracs_pos[2]), hist_value(fracs_pos[3]),
                 hist_value(fracs_pos[4]), hist_value(fracs_pos[5]));
@@ -949,7 +960,72 @@ int main(int argc, char *argv[])
         fflush(stdout);
         memset(hist, 0, sizeof(*hist) * HIST_BUCKETS);
 
+        if (settings.run_time > 0 &&
+                t_cur - t_start >= (uint64_t) settings.run_time * 1000000000ULL)
+        {
+            break;
+        }
+
         t_prev = t_cur;
     }
 
+    phase = BENCHMARK_DONE;
+    for (i = 0; i < num_threads; i++) {
+        pthread_join(cs[i].pthread, NULL);
+    }
+    t_end = get_nanos();
+
+    elapsed_s = (double) (t_end - t_start) / 1000000000.0;
+    if (elapsed_s <= 0.0) {
+        elapsed_s = 1.0;
+    }
+
+    for (i = 0; i < num_threads; i++) {
+        total_success += read_cnt(&cs[i].rx_success);
+        total_tx_get += read_cnt(&cs[i].tx_get);
+        total_tx_set += read_cnt(&cs[i].tx_set);
+        total_rx_get += read_cnt(&cs[i].rx_get);
+        total_rx_set += read_cnt(&cs[i].rx_set);
+        total_rx_fail += read_cnt(&cs[i].rx_fail);
+    }
+
+    memset(hist, 0, sizeof(*hist) * HIST_BUCKETS);
+    msg_total = 0;
+    for (i = 0; i < num_threads; i++) {
+        for (j = 0; j < HIST_BUCKETS; j++) {
+            hx = cs[i].hist[j];
+            msg_total += hx;
+            hist[j] += hx;
+        }
+    }
+    if (msg_total > 0) {
+        hist_fract_buckets(hist, msg_total, summary_fracs, summary_pos,
+                sizeof(summary_fracs) / sizeof(summary_fracs[0]));
+    } else {
+        memset(summary_pos, 0, sizeof(summary_pos));
+    }
+
+    total_tx = total_tx_get + total_tx_set;
+    total_rx = total_rx_get + total_rx_set;
+
+    printf("Cores               : %d\n", num_threads);
+    printf("Duration            : %.2f s\n", elapsed_s);
+    printf("TX requests         : %" PRIu64 "\n", total_tx);
+    printf("RX responses        : %" PRIu64 "\n", total_success);
+    printf("RX decoded ops      : %" PRIu64 "\n", total_rx);
+    printf("RX failures         : %" PRIu64 "\n", total_rx_fail);
+    printf("Avg Load            : %.0f rps %.4f mops\n",
+            (double) total_tx / elapsed_s, (double) total_tx / elapsed_s / 1000000.0);
+    printf("Avg Throughput      : %.0f rps %.4f mops\n",
+            (double) total_success / elapsed_s,
+            (double) total_success / elapsed_s / 1000000.0);
+    printf("Latency percentiles : p50=%d us  p99=%d us  p99.9=%d us\n",
+            hist_value(summary_pos[0]), hist_value(summary_pos[1]),
+            hist_value(summary_pos[2]));
+
+    free(hist);
+    free(ttp);
+    free(cs);
+
+    return 0;
 }
