@@ -47,6 +47,10 @@ struct settings {
     double clean_ratio;
     /** UDP port to listen on */
     uint16_t udpport;
+    /** Local/bind IPv4 in host order */
+    uint32_t srcip;
+    /** Local/bind UDP port */
+    uint16_t srcport;
     /** Verbosity for log messages. */
     uint8_t verbose;
     /** Number of cores */

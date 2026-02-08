@@ -33,6 +33,8 @@ enum key_dist {
 };
 
 struct settings {
+    uint32_t srcip;
+    uint16_t srcport;
     uint32_t dstip;
     uint16_t dstport;
     uint16_t threads;

@@ -83,7 +83,8 @@ static int open_listening(int cn)
 
     memset(&si, 0, sizeof(si));
     si.sin_family = AF_INET;
-    si.sin_port = htons(settings.udpport);
+    si.sin_addr.s_addr = htonl(settings.srcip);
+    si.sin_port = htons(settings.srcport);
 
     if ((ret = bind(fd, (struct sockaddr *) &si, sizeof(si))) < 0) {
         fprintf(stderr, "[%d] bind failed: %d\n", cn, ret);

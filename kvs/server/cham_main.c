@@ -72,7 +72,8 @@ static int open_listening(struct network_state *ns, int cn)
 
     memset(&si, 0, sizeof(si));
     si.sin_family = AF_INET;
-    si.sin_port = htons(settings.udpport);
+    si.sin_addr.s_addr = htonl(settings.srcip);
+    si.sin_port = htons(settings.srcport);
 
     ret = udp_bind(ns->ctx, fd, (struct sockaddr *) &si, sizeof(si));
     if (ret != 0) {

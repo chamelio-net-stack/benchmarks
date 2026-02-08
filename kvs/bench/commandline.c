@@ -58,6 +58,10 @@ void print_usage(void)
         "  -v, --val-size=BYTES  Value size in bytes       [default 1024].\n"
         "  -g, --get-prob=PROB   Probability of GET Reqs.  [default .9].\n"
         "  -d, --duration=SECS   Benchmark duration in [s] [default 0].\n"
+        "      --src-ip=IP       Source/bind IPv4 address  [default 0.0.0.0].\n"
+        "      --src-port=PORT   Source/bind UDP port      [default 0].\n"
+        "      --rem-ip=IP       Remote IPv4 address (alt to dst-ip:dst-port).\n"
+        "      --rem-port=P      Remote UDP port (alt to dst-ip:dst-port).\n"
         "  -w, --warmup=SECS     Warmup time [s].          [default 5].\n"
         "  -c, --cooldown=SECS   Cooldown time [s].        [default 5].\n"
         "  -s, --key-seed=SEED   Seed for key PRG.\n"
@@ -68,6 +72,8 @@ void print_usage(void)
 
 void init_settings(struct settings *s)
 {
+    s->srcip = 0;
+    s->srcport = 0;
     s->threads = 1;
     s->conns = 1;
     s->pending = 1;
@@ -88,6 +94,12 @@ void init_settings(struct settings *s)
 
 int parse_settings(int argc, char *argv[], struct settings *s)
 {
+    enum {
+        OPT_SRC_IP = 1000,
+        OPT_SRC_PORT,
+        OPT_REMOTE_IP,
+        OPT_REMOTE_PORT,
+    };
     static struct option long_opts[] = {
             {"threads",     required_argument, NULL, 't'},
             {"conns",       required_argument, NULL, 'C'},
@@ -99,6 +111,12 @@ int parse_settings(int argc, char *argv[], struct settings *s)
             {"val-size",    required_argument, NULL, 'v'},
             {"get-prob",    required_argument, NULL, 'g'},
             {"duration",    required_argument, NULL, 'd'},
+            {"src-ip",      required_argument, NULL, OPT_SRC_IP},
+            {"src-port",    required_argument, NULL, OPT_SRC_PORT},
+            {"rem-ip",      required_argument, NULL, OPT_REMOTE_IP},
+            {"rem-port",    required_argument, NULL, OPT_REMOTE_PORT},
+            {"remote-ip",   required_argument, NULL, OPT_REMOTE_IP},
+            {"remote-port", required_argument, NULL, OPT_REMOTE_PORT},
             {"warmup",      required_argument, NULL, 'w'},
             {"cooldown",    required_argument, NULL, 'c'},
             {"key-seed",    required_argument, NULL, 's'},
@@ -108,6 +126,12 @@ int parse_settings(int argc, char *argv[], struct settings *s)
     static const char *short_opts = "t:C:p:k:n:uz:v:g:d:w:c:s:o:r:K";
     int c, opt_idx, done = 0;
     char *end;
+    unsigned long port_ul;
+    uint32_t srcip = 0, dstip = 0;
+    uint16_t srcport = 0, dstport = 0;
+    int have_src_ip = 0, have_src_port = 0;
+    int have_dst_ip = 0, have_dst_port = 0;
+    int opt_dst_ip = 0, opt_dst_port = 0;
 
     while (!done) {
         c = getopt_long(argc, argv, short_opts, long_opts, &opt_idx);
@@ -190,6 +214,40 @@ int parse_settings(int argc, char *argv[], struct settings *s)
                     return -1;
                 }
                 break;
+            case OPT_SRC_IP:
+                if (parse_ipv4_addr(optarg, &srcip) != 0) {
+                    fprintf(stderr, "Parsing source ip address failed\n");
+                    return -1;
+                }
+                have_src_ip = 1;
+                break;
+            case OPT_SRC_PORT:
+                port_ul = strtoul(optarg, &end, 10);
+                if (!*optarg || *end || port_ul == 0 || port_ul > 65535) {
+                    fprintf(stderr, "Source port needs to be an integer.\n");
+                    return -1;
+                }
+                srcport = (uint16_t) port_ul;
+                have_src_port = 1;
+                break;
+            case OPT_REMOTE_IP:
+                if (parse_ipv4_addr(optarg, &dstip) != 0) {
+                    fprintf(stderr, "Parsing remote ip address failed\n");
+                    return -1;
+                }
+                have_dst_ip = 1;
+                opt_dst_ip = 1;
+                break;
+            case OPT_REMOTE_PORT:
+                port_ul = strtoul(optarg, &end, 10);
+                if (!*optarg || *end || port_ul == 0 || port_ul > 65535) {
+                    fprintf(stderr, "Remote port needs to be an integer.\n");
+                    return -1;
+                }
+                dstport = (uint16_t) port_ul;
+                have_dst_port = 1;
+                opt_dst_port = 1;
+                break;
             case 'w':
                 s->warmup_time = strtoul(optarg, &end, 10);
                 if (!*optarg || *end) {
@@ -233,26 +291,48 @@ int parse_settings(int argc, char *argv[], struct settings *s)
         }
     }
 
-    if (optind + 1 != argc) {
+    if (optind + 1 == argc) {
+        if (opt_dst_ip || opt_dst_port) {
+            fprintf(stderr, "cannot mix positional dst-ip:dst-port with "
+                    "--remote-ip/--remote-port\n");
+            return -1;
+        }
+        /* separate ip and port at colon */
+        if ((end = strchr(argv[optind], ':')) == NULL) {
+            fprintf(stderr, "Colon separating IP and port not found\n");
+            return -1;
+        }
+        *end = '\0';
+        end++;
+
+        if (parse_ipv4_addr(argv[optind], &dstip) != 0) {
+            fprintf(stderr, "Parsing ip address failed\n");
+            return -1;
+        }
+        port_ul = strtoul(end, &end, 10);
+        if (*end != '\0' || port_ul == 0 || port_ul > 65535) {
+            fprintf(stderr, "Parsing remote port failed\n");
+            return -1;
+        }
+        dstport = (uint16_t) port_ul;
+        have_dst_ip = have_dst_port = 1;
+    } else if (optind != argc) {
         return -1;
     }
 
-    /* separate ip and port at colon */
-    if ((end = strchr(argv[optind], ':')) == NULL) {
-        fprintf(stderr, "Colon separating IP and port not found\n");
+    if (!have_dst_ip || !have_dst_port) {
+        fprintf(stderr, "remote endpoint required (dst-ip:dst-port or "
+                "--rem-ip/--rem-port)\n");
         return -1;
     }
-    *end = '\0';
-    end++;
-
-    /* parse ip */
-    if (parse_ipv4_addr(argv[optind], &s->dstip) != 0) {
-        fprintf(stderr, "Parsing ip address failed\n");
+    if ((have_src_ip && !have_src_port) || (!have_src_ip && have_src_port)) {
+        fprintf(stderr, "source endpoint needs both --src-ip and --src-port\n");
         return -1;
     }
-
-    /* parse port */
-    s->dstport = strtoul(end, NULL, 10);
+    s->srcip = srcip;
+    s->srcport = srcport;
+    s->dstip = dstip;
+    s->dstport = dstport;
 
     // TODO: ensure key size / key num combination is valid
 

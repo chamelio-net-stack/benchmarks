@@ -177,9 +177,12 @@ static inline struct connection *conn_q_pop(struct core *c)
 }
 
 /* Open connection */
-static inline void conn_connect(struct core *c, struct connection *co)
+static inline void conn_connect(struct core *c, struct connection *co,
+        uint32_t idx)
 {
-    int fd, cn;
+    int fd, cn, ret;
+    uint32_t port_idx, bind_port;
+    struct sockaddr_in src_addr;
 
     cn = c->id;
     CONN_DEBUG(c, co, "Opening new connection\n");
@@ -188,6 +191,36 @@ static inline void conn_connect(struct core *c, struct connection *co)
     if (fd < 0) {
         fprintf(stderr, "[%d] udp_socket failed\n", cn);
         abort();
+    }
+
+    if (settings.srcport != 0) {
+        if (settings.conns != 0 &&
+                c->id > (UINT32_MAX - idx) / settings.conns)
+        {
+            fprintf(stderr, "[%d] source port index overflow\n", cn);
+            abort();
+        }
+
+        port_idx = c->id * settings.conns + idx;
+        bind_port = (uint32_t) settings.srcport + port_idx;
+        if (bind_port > 65535) {
+            fprintf(stderr, "[%d] source port overflow: base=%u idx=%u\n", cn,
+                    (unsigned) settings.srcport, (unsigned) port_idx);
+            abort();
+        }
+
+        memset(&src_addr, 0, sizeof(src_addr));
+        src_addr.sin_family = AF_INET;
+        src_addr.sin_addr.s_addr = htonl(settings.srcip);
+        src_addr.sin_port = htons((uint16_t) bind_port);
+
+        ret = udp_bind(c->udp_ctx, fd, (struct sockaddr *) &src_addr,
+                sizeof(src_addr));
+        if (ret != 0) {
+            fprintf(stderr, "[%d] udp_bind failed on client socket port=%u\n",
+                    cn, (unsigned) bind_port);
+            abort();
+        }
     }
 
     co->fd = fd;
@@ -421,7 +454,7 @@ static void prepare_core(struct core *c)
         c->conns[i].rx_buf = buf;
         c->conns[i].tx_buf = buf + BUFSIZE;
         c->conns[i].fd = -1;
-        conn_connect(c, &c->conns[i]);
+        conn_connect(c, &c->conns[i], i);
     }
 
     warmup_route(c);

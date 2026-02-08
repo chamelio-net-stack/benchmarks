@@ -25,25 +25,44 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <string.h>
+#include <arpa/inet.h>
 
 #include "iokvs.h"
 
 struct settings settings;
 
+static int parse_ipv4_addr(const char *addr_s, uint32_t *addr_out)
+{
+    struct in_addr addr;
+
+    if (inet_pton(AF_INET, addr_s, &addr) != 1) {
+        return -1;
+    }
+
+    *addr_out = ntohl(addr.s_addr);
+    return 0;
+}
+
 int settings_init(int argc, char *argv[])
 {
     char *end;
-    unsigned long n;
+    unsigned long n, p;
+    int i;
+    int have_src_port = 0;
 
     settings.udpport = 11211;
+    settings.srcip = 0;
+    settings.srcport = 11211;
     settings.verbose = 1;
     settings.segsize = 256 * 1024;
     settings.segmaxnum = 4096;
     settings.segcqsize = 32 * 1024;
     settings.clean_ratio = 0.8;
 
-    if (argc != 2 && argc != 3) {
-        fprintf(stderr, "Usage: flexkvs THREADS [PORT]\n");
+    if (argc < 2) {
+        fprintf(stderr, "Usage: flexkvs THREADS [PORT] "
+                "[--ip IP --port PORT]\n");
         return -1;
     }
 
@@ -55,16 +74,52 @@ int settings_init(int argc, char *argv[])
     }
     settings.numcores = (uint8_t) n;
 
-    if (argc == 3) {
-        errno = 0;
-        n = strtoul(argv[2], &end, 10);
-        if (errno != 0 || argv[2][0] == '\0' || *end != '\0' ||
-                n == 0 || n > 65535)
-        {
-            fprintf(stderr, "Invalid UDP port: %s\n", argv[2]);
+    for (i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "--ip")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--ip requires an argument\n");
+                return -1;
+            }
+            if (parse_ipv4_addr(argv[++i], &settings.srcip) != 0) {
+                fprintf(stderr, "Invalid server IPv4 address: %s\n", argv[i]);
+                return -1;
+            }
+        } else if (!strcmp(argv[i], "--port")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--port requires an argument\n");
+                return -1;
+            }
+            errno = 0;
+            p = strtoul(argv[++i], &end, 10);
+            if (errno != 0 || argv[i][0] == '\0' || *end != '\0' ||
+                    p == 0 || p > 65535)
+            {
+                fprintf(stderr, "Invalid server UDP port: %s\n", argv[i]);
+                return -1;
+            }
+            settings.srcport = (uint16_t) p;
+            settings.udpport = settings.srcport;
+            have_src_port = 1;
+        } else if (i == 2 && argv[i][0] != '-') {
+            errno = 0;
+            n = strtoul(argv[i], &end, 10);
+            if (errno != 0 || argv[i][0] == '\0' || *end != '\0' ||
+                    n == 0 || n > 65535)
+            {
+                fprintf(stderr, "Invalid UDP port: %s\n", argv[i]);
+                return -1;
+            }
+            settings.udpport = (uint16_t) n;
+            settings.srcport = settings.udpport;
+            have_src_port = 1;
+        } else {
+            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
             return -1;
         }
-        settings.udpport = (uint16_t) n;
+    }
+
+    if (!have_src_port) {
+        settings.srcport = settings.udpport;
     }
 
     return 0;
