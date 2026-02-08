@@ -325,9 +325,11 @@ int parse_settings(int argc, char *argv[], struct settings *s)
                 "--rem-ip/--rem-port)\n");
         return -1;
     }
-    if ((have_src_ip && !have_src_port) || (!have_src_ip && have_src_port)) {
-        fprintf(stderr, "source endpoint needs both --src-ip and --src-port\n");
-        return -1;
+    if (!have_src_ip) {
+        srcip = 0;
+    }
+    if (!have_src_port) {
+        srcport = 0;
     }
     s->srcip = srcip;
     s->srcport = srcport;

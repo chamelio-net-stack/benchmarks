@@ -179,7 +179,7 @@ static inline struct connection *conn_q_pop(struct core *c)
 
 static void resolve_arp(struct core *c)
 {
-    static const uint8_t probe[1] = { 0 };
+    static const uint8_t probe[64] = { 0 };
     uint8_t probe_buf[BUFSIZE];
     struct connection *co;
 
@@ -196,7 +196,7 @@ static void resolve_arp(struct core *c)
         (struct sockaddr *) &c->dst_addr, sizeof(c->dst_addr));
     sleep(1);
     while(udp_poll_fast(c->udp_ctx) == 0);
-    udp_recvfrom(c->udp_ctx, co->fd, probe_buf, sizeof(probe_buf), NULL, 0);
+    while(udp_recvfrom(c->udp_ctx, co->fd, probe_buf, sizeof(probe_buf), NULL, 0) == 0);
     fprintf(stderr, "Resolved ARP\n");
 }
 
@@ -217,20 +217,23 @@ static inline void conn_connect(struct core *c, struct connection *co,
         abort();
     }
 
-    if (settings.srcport != 0) {
-        if (settings.conns != 0 &&
-                c->id > (UINT32_MAX - idx) / settings.conns)
-        {
-            fprintf(stderr, "[%d] source port index overflow\n", cn);
-            abort();
-        }
+    if (settings.srcip != 0 || settings.srcport != 0) {
+        bind_port = 0;
+        if (settings.srcport != 0) {
+            if (settings.conns != 0 &&
+                    c->id > (UINT32_MAX - idx) / settings.conns)
+            {
+                fprintf(stderr, "[%d] source port index overflow\n", cn);
+                abort();
+            }
 
-        port_idx = c->id * settings.conns + idx;
-        bind_port = (uint32_t) settings.srcport + port_idx;
-        if (bind_port > 65535) {
-            fprintf(stderr, "[%d] source port overflow: base=%u idx=%u\n", cn,
-                    (unsigned) settings.srcport, (unsigned) port_idx);
-            abort();
+            port_idx = c->id * settings.conns + idx;
+            bind_port = (uint32_t) settings.srcport + port_idx;
+            if (bind_port > 65535) {
+                fprintf(stderr, "[%d] source port overflow: base=%u idx=%u\n", cn,
+                        (unsigned) settings.srcport, (unsigned) port_idx);
+                abort();
+            }
         }
 
         memset(&src_addr, 0, sizeof(src_addr));
@@ -241,8 +244,8 @@ static inline void conn_connect(struct core *c, struct connection *co,
         ret = udp_bind(c->udp_ctx, fd, (struct sockaddr *) &src_addr,
                 sizeof(src_addr));
         if (ret != 0) {
-            fprintf(stderr, "[%d] udp_bind failed on client socket port=%u\n",
-                    cn, (unsigned) bind_port);
+            fprintf(stderr, "[%d] udp_bind failed on client socket ip=%u port=%u\n",
+                    cn, (unsigned) settings.srcip, (unsigned) bind_port);
             abort();
         }
     }
