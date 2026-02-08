@@ -510,7 +510,8 @@ static inline struct udp_context_lib * core_init(struct core *c)
         (struct sockaddr *) &c->dst_addr, c->dst_len);
     sleep(1);
     while(udp_poll_fast(udp_ctx) == 0);
-    while(udp_recvfrom(udp_ctx, c->fd, c->rxbuf, msize, NULL, 0) == 0);
+    while(udp_recvfrom(udp_ctx, c->fd, c->rxbuf, 
+        msize, NULL, 0) == 0);
     fprintf(stderr, "Resolved ARP\n");
   }
 
