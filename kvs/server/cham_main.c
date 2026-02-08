@@ -85,6 +85,21 @@ static int open_listening(struct network_state *ns, int cn)
     return 0;
 }
 
+static void resolve_arp(struct network_state *ns)
+{
+    static const uint8_t probe[1] = { 0 };
+    uint8_t probe_buf[MAX_MSGSIZE];
+    struct sockaddr_in src_addr;
+
+    while(udp_poll_fast(ns->ctx) == 0) {}
+
+    udp_recvfrom(ns->ctx, ns->fd, probe_buf, sizeof(probe_buf),
+            (struct sockaddr *) &src_addr, sizeof(src_addr));
+    udp_sendto(ns->ctx, ns->fd, probe, sizeof(probe),
+            (struct sockaddr *) &src_addr, sizeof(src_addr));
+    fprintf(stderr, "ARP initialized\n");
+}
+
 static int process_request(struct item_allocator *ia, const uint8_t *req_buf,
         size_t req_len, uint8_t *tx_buf, size_t *tx_len)
 {
@@ -277,6 +292,7 @@ static size_t clean_log(struct item_allocator *ia, bool idle)
 
 static struct item_allocator **iallocs;
 static volatile size_t n_ready = 0;
+static volatile uint8_t arp_ready = 0;
 
 static void *processing_thread(void *data)
 {
@@ -292,11 +308,22 @@ static void *processing_thread(void *data)
     ialloc_init_allocator(&ia);
     q = __sync_fetch_and_add(&qcounter, 1);
 
+    if (q != 0) {
+        while (__sync_fetch_and_add(&arp_ready, 0) == 0) {
+            usleep(10);
+        }
+    }
+
     open_listening(&ns, q);
+
+    if (q == 0) {
+        resolve_arp(&ns);
+        __sync_fetch_and_add(&arp_ready, 1);
+    }
 
     iallocs[q] = &ia;
     __sync_fetch_and_add(&n_ready, 1);
-
+    
     printf("Worker starting\n");
 
     while (1) {

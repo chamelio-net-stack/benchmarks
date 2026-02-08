@@ -79,6 +79,7 @@ struct settings settings;
 static struct workload workload;
 static volatile enum benchmark_phase phase;
 static volatile uint16_t init_count = 0;
+static volatile uint8_t arp_ready = 0;
 
 struct connection {
     int fd;
@@ -176,6 +177,29 @@ static inline struct connection *conn_q_pop(struct core *c)
     return co;
 }
 
+static void resolve_arp(struct core *c)
+{
+    static const uint8_t probe[1] = { 0 };
+    uint8_t probe_buf[BUFSIZE];
+    struct connection *co;
+
+    if (c->id != 0 || settings.conns == 0) {
+        return;
+    }
+
+    co = &c->conns[0];
+
+    udp_sendto(c->udp_ctx, co->fd, probe, sizeof(probe),
+        (struct sockaddr *) &c->dst_addr, sizeof(c->dst_addr));
+    sleep(1);
+    udp_sendto(c->udp_ctx, co->fd, probe, sizeof(probe),
+        (struct sockaddr *) &c->dst_addr, sizeof(c->dst_addr));
+    sleep(1);
+    while(udp_poll_fast(c->udp_ctx) == 0);
+    udp_recvfrom(c->udp_ctx, co->fd, probe_buf, sizeof(probe_buf), NULL, 0);
+    fprintf(stderr, "Resolved ARP\n");
+}
+
 /* Open connection */
 static inline void conn_connect(struct core *c, struct connection *co,
         uint32_t idx)
@@ -222,7 +246,7 @@ static inline void conn_connect(struct core *c, struct connection *co,
             abort();
         }
     }
-
+        
     co->fd = fd;
     co->pending = 0;
     co->rx_len = 0;
@@ -375,47 +399,6 @@ static inline void get_request(struct core *c, struct connection *co,
     co->tx_len = sizeof(*get) + k->keylen;
 }
 
-/* Prime ARP / route resolution to avoid stalling on first preload packet. */
-static void warmup_route(struct core *c)
-{
-    struct connection *co;
-    struct key *k;
-    enum workload_op op;
-    uint16_t err;
-    uint32_t opaque;
-    uint64_t t_start;
-
-    if (settings.conns == 0 || workload.keys_num == 0) {
-        return;
-    }
-
-    co = &c->conns[0];
-    k = &workload.keys[c->id % workload.keys_num];
-
-    get_request(c, co, k, 0);
-    t_start = get_nanos();
-    while (co->tx_len != 0) {
-        udp_poll_fast(c->udp_ctx);
-        conn_send(c, co);
-        if (get_nanos() - t_start > 2000000000ULL) {
-            fprintf(stderr, "[%d] warmup send timeout\n", (int) c->id);
-            abort();
-        }
-    }
-
-    t_start = get_nanos();
-    while (get_nanos() - t_start < 2000000000ULL) {
-        udp_poll_fast(c->udp_ctx);
-        if (conn_recv(c, co, &op, &err, &opaque) == 0) {
-            return;
-        }
-        sched_yield();
-    }
-
-    fprintf(stderr, "[%d] warmup recv timeout\n", (int) c->id);
-    abort();
-}
-
 /* initialize core */
 static void prepare_core(struct core *c)
 {
@@ -457,7 +440,14 @@ static void prepare_core(struct core *c)
         conn_connect(c, &c->conns[i], i);
     }
 
-    warmup_route(c);
+    if (c->id == 0) {
+        resolve_arp(c);
+        __sync_fetch_and_add(&arp_ready, 1);
+    } else {
+        while (__sync_fetch_and_add(&arp_ready, 0) == 0) {
+            sched_yield();
+        }
+    }
 
     for (i = 0; i < settings.conns; i++) {
         conn_q_push(c, &c->conns[i]);
