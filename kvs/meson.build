@@ -25,8 +25,8 @@ if librt.found()
   kvs_deps += librt
 endif
 
-flxkvs_linux = executable(
-  'flxkvs_linux',
+flexkvs_linux = executable(
+  'flexkvs_linux',
   kvs_server_common + files('server/linux_main.c'),
   include_directories: kvs_inc,
   dependencies: kvs_deps,
@@ -39,9 +39,9 @@ kvsbench_linux = executable(
   dependencies: kvs_deps,
 )
 
-alias_target('kvs', [flxkvs_linux, kvsbench_linux])
-alias_target('kvs_linux', [flxkvs_linux, kvsbench_linux])
-
+alias_target('kvs', [flexkvs_linux, kvsbench_linux])
+alias_target('kvs_linux', [flexkvs_linux, kvsbench_linux])
+flexkvs_linux
 if cham_enabled
   kvs_cham_deps = kvs_deps + [cham_deps]
 

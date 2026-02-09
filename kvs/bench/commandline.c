@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <getopt.h>
 #include <arpa/inet.h>
 
@@ -50,6 +51,7 @@ void print_usage(void)
         "  -t, --threads=COUNT   Number of sending threads [default 1].\n"
         "  -C, --connns=COUNT    # connections / thread    [default 1].\n"
         "      --rate=RPS        Request rate / thread      [default 0=max].\n"
+        "  -b, --batch-size=N    Max in-flight reqs / conn [default 32].\n"
         "  -k, --key-size=BYTES  Key size in bytes         [default 32].\n"
         "  -n, --key-num=COUNT   Number of keys            [default 1000].\n"
         "  -u, --key-uniform     Uniform key distribution  [default]\n"
@@ -105,6 +107,7 @@ int parse_settings(int argc, char *argv[], struct settings *s)
             {"threads",     required_argument, NULL, 't'},
             {"conns",       required_argument, NULL, 'C'},
             {"rate",        required_argument, NULL, OPT_RATE},
+            {"batch-size",  required_argument, NULL, 'b'},
             {"key-size",    required_argument, NULL, 'k'},
             {"key-num",     required_argument, NULL, 'n'},
             {"key-uniform", no_argument,       NULL, 'u'},
@@ -124,7 +127,7 @@ int parse_settings(int argc, char *argv[], struct settings *s)
             {"op-seed",     required_argument, NULL, 'o'},
             {"keysteer",    no_argument,       NULL, 'K'},
         };
-    static const char *short_opts = "t:C:k:n:uz:v:g:d:w:c:s:o:r:K";
+    static const char *short_opts = "t:C:b:k:n:uz:v:g:d:w:c:s:o:r:K";
     int c, opt_idx, done = 0;
     char *end;
     unsigned long port_ul;
@@ -161,6 +164,16 @@ int parse_settings(int argc, char *argv[], struct settings *s)
                     return -1;
                 }
                 break;
+            case 'b': {
+                unsigned long bs = strtoul(optarg, &end, 10);
+                if (!*optarg || *end || bs < 1 || bs > UINT8_MAX) {
+                    fprintf(stderr, "batch-size needs to be an integer in "
+                            "[1, %u]\n", UINT8_MAX);
+                    return -1;
+                }
+                s->batchsize = (uint8_t) bs;
+                break;
+            }
 
             case 'k':
                 s->keysize = strtoul(optarg, &end, 10);

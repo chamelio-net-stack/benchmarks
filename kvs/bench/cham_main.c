@@ -124,116 +124,6 @@ struct core {
     struct connection *q_last;
 } __attribute__((aligned(64)));
 
-enum udp_bump_type_local {
-    UDP_BUMP_EMPTY_LOCAL = 0,
-    UDP_BUMP_APP_TX_LOCAL = 11,
-    UDP_BUMP_APP_RX_LOCAL = 12,
-};
-
-struct udp_bump_app_tx_local {
-    __u64 opaque;
-    __u32 tx_head;
-} __attribute__((packed));
-
-struct udp_bump_app_rx_local {
-    __u64 opaque;
-    __u16 rx_port;
-    __u32 rx_ip;
-    __u32 rx_avail;
-} __attribute__((packed));
-
-struct udp_bump_entry_local {
-    volatile __u8 type;
-    union {
-        struct udp_bump_app_tx_local bump_app_tx;
-        struct udp_bump_app_rx_local bump_app_rx;
-        __u8 raw[63];
-    } __attribute__((packed)) data;
-} __attribute__((packed));
-
-_Static_assert(sizeof(struct udp_bump_entry_local) == 64,
-        "unexpected UDP bump entry size");
-
-static inline struct udp_bump_entry_local *bump_q_head(struct dqueue *q)
-{
-    struct udp_bump_entry_local *qe;
-
-    qe = (struct udp_bump_entry_local *) ((uint8_t *) q->entries + q->head);
-    if (qe->type == UDP_BUMP_EMPTY_LOCAL) {
-        return NULL;
-    }
-
-    return qe;
-}
-
-static inline void bump_q_dequeue(struct dqueue *q,
-        struct udp_bump_entry_local *qe)
-{
-    __u32 head;
-
-    head = q->head + q->elsize;
-    if (head >= (q->elsize * q->nelems)) {
-        head = 0;
-    }
-    q->head = head;
-
-    __sync_synchronize();
-    qe->type = UDP_BUMP_EMPTY_LOCAL;
-}
-
-/*
- * Keep RX bump handling to one entry at a time.
- * This prevents batching multiple packets into one recvfrom view.
- */
-static int udp_poll_fast_one(struct udp_context_lib *ctx)
-{
-    int i;
-    __u32 new_head;
-    struct dqueue *q;
-    struct udp_bump_entry_local *qe;
-    struct udp_socket_lib *sock;
-
-    for (i = 0; i < ctx->ncores; i++) {
-        q = ctx->fast_app_qs[i];
-        qe = bump_q_head(q);
-        if (qe == NULL) {
-            continue;
-        }
-
-        switch (qe->type) {
-            case UDP_BUMP_APP_TX_LOCAL:
-                sock = (struct udp_socket_lib *) (uintptr_t)
-                        qe->data.bump_app_tx.opaque;
-                new_head = sock->tx_head + qe->data.bump_app_tx.tx_head;
-                if (new_head >= sock->tx_len) {
-                    new_head -= sock->tx_len;
-                }
-                sock->tx_head = new_head;
-                sock->tx_avail -= qe->data.bump_app_tx.tx_head;
-                break;
-
-            case UDP_BUMP_APP_RX_LOCAL:
-                sock = (struct udp_socket_lib *) (uintptr_t)
-                        qe->data.bump_app_rx.opaque;
-                __builtin_prefetch((const void *)
-                        ((uintptr_t) sock->rx_buf + sock->rx_head), 0, 0);
-                sock->rx_avail += qe->data.bump_app_rx.rx_avail;
-                sock->rx_port = qe->data.bump_app_rx.rx_port;
-                sock->rx_ip = qe->data.bump_app_rx.rx_ip;
-                break;
-
-            default:
-                fprintf(stderr, "unexpected UDP bump type=%u\n", qe->type);
-                abort();
-        }
-
-        bump_q_dequeue(q, qe);
-        return 1;
-    }
-
-    return 0;
-}
-
 static inline uint64_t get_nanos(void)
 {
     struct timespec ts;
@@ -337,7 +227,7 @@ static void resolve_arp(struct core *c)
     udp_sendto(c->udp_ctx, co->fd, probe, sizeof(probe),
         (struct sockaddr *) &c->dst_addr, sizeof(c->dst_addr));
     sleep(1);
-    while (udp_poll_fast_one(c->udp_ctx) == 0) {}
+    while (udp_poll_fast(c->udp_ctx) == 0) {}
     while(udp_recvfrom(c->udp_ctx, co->fd, probe_buf, 
         sizeof(probe_buf), NULL, 0) == 0);
     fprintf(stderr, "Resolved ARP\n");
@@ -425,24 +315,25 @@ static inline int conn_recv(struct core *c, struct connection *co,
         }
         co->rx_len = ret;
 
-        /* Ignore non-KVS datagrams (e.g., ARP warmup probes). */
         if (co->rx_len < sizeof(*res)) {
-            fprintf(stderr, "[%d] dropping short datagram: %u bytes\n", cn,
-                    co->rx_len);
-            continue;
+            fprintf(stderr, "[%d] short response: %u\n", cn, co->rx_len);
+            abort();
+            return -1;
         }
 
         if (res->response.magic != PROTOCOL_BINARY_RES) {
-            fprintf(stderr, "[%d] dropping datagram with invalid magic: %x\n",
-                    cn, res->response.magic);
-            continue;
+            fprintf(stderr, "[%d] invalid magic on response: %x\n", cn,
+                    res->response.magic);
+            abort();
+            return -1;
         }
 
         reqlen = sizeof(*res) + ntohl(res->response.bodylen);
         if (co->rx_len < reqlen) {
-            fprintf(stderr, "[%d] dropping truncated response: got %u need %zu\n",
-                    cn, co->rx_len, reqlen);
-            continue;
+            fprintf(stderr, "[%d] truncated response: got %u need %zu\n", cn,
+                    co->rx_len, reqlen);
+            abort();
+            return -1;
         }
 
         if (res->response.opcode == PROTOCOL_BINARY_CMD_GET) {
@@ -492,6 +383,8 @@ static inline int conn_send(struct core *c, struct connection *co)
         return 1;
     }
 
+    fprintf(stderr, "[%d] udp_sendto returned 0 with tx_len=%u\n", cn, co->tx_len);
+    abort();
     return -1;
 }
 
@@ -623,7 +516,7 @@ static void load_keys(struct core *c)
     i = cn;
     pending = 0;
     while (i < workload.keys_num || pending > 0) {
-        udp_poll_fast_one(c->udp_ctx);
+        udp_poll_fast(c->udp_ctx);
 
         for (j = 0; j < settings.conns; j++) {
             co = &c->conns[j];
@@ -770,7 +663,7 @@ static void *thread_run(void *arg)
     send_pending(c);
 
     while (phase == BENCHMARK_RUNNING) {
-        n = udp_poll_fast_one(c->udp_ctx);
+        n = udp_poll_fast(c->udp_ctx);
         progress_conns(c);
         send_pending(c);
 

@@ -370,9 +370,14 @@ int main(int argc, char *argv[])
     char name[32];
     unsigned num_threads, i;
     pthread_t *pts;
+    int ret;
 
-    if (settings_init(argc, argv) != 0) {
-      return EXIT_FAILURE;
+    ret = settings_init(argc, argv);
+    if (ret == SETTINGS_INIT_HELP) {
+        return EXIT_SUCCESS;
+    }
+    if (ret != SETTINGS_INIT_OK) {
+        return EXIT_FAILURE;
     }
     num_threads = settings.numcores;
 

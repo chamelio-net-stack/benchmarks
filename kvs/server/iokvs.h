@@ -60,6 +60,12 @@ struct settings {
 /** Global settings */
 extern struct settings settings;
 
+enum settings_init_result {
+    SETTINGS_INIT_OK = 0,
+    SETTINGS_INIT_ERR = -1,
+    SETTINGS_INIT_HELP = 1,
+};
+
 /** Initialize global settings from command-line. */
 int settings_init(int argc, char *argv[]);
 
