@@ -46,6 +46,7 @@
 #include <protocol_binary.h>
 
 #include "benchmark.h"
+#include "../../utils/clock.h"
 
 #define MIN(a,b) ((b) < (a) ? (b) : (a))
 
@@ -135,9 +136,7 @@ struct core {
 
 static inline uint64_t get_nanos(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-    return (uint64_t) ts.tv_sec * 1000 * 1000 * 1000 + ts.tv_nsec;
+    return now_ns();
 }
 
 static inline void refill_tokens(struct core *c)

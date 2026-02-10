@@ -1,4 +1,5 @@
 kvs_inc = include_directories('common/include')
+clock_util_src = files('../utils/clock.c')
 
 kvs_server_common = files(
   'server/hashtable.c',
@@ -34,7 +35,7 @@ flexkvs_linux = executable(
 
 kvsbench_linux = executable(
   'kvsbench_linux',
-  kvs_bench_common + files('bench/linux_main.c'),
+  kvs_bench_common + files('bench/linux_main.c') + clock_util_src,
   include_directories: kvs_inc,
   dependencies: kvs_deps,
 )
@@ -54,7 +55,7 @@ if cham_enabled
 
   kvsbench_cham = executable(
     'kvsbench_cham',
-    kvs_bench_common + files('bench/cham_main.c'),
+    kvs_bench_common + files('bench/cham_main.c') + clock_util_src,
     include_directories: kvs_inc,
     dependencies: kvs_cham_deps,
   )

@@ -45,6 +45,7 @@
 #include <protocol_binary.h>
 
 #include "benchmark.h"
+#include "../../utils/clock.h"
 
 #define MIN(a,b) ((b) < (a) ? (b) : (a))
 
@@ -83,12 +84,13 @@ static volatile uint8_t arp_ready = 0;
 
 struct connection {
     int fd;
-    uint32_t pending;
     uint32_t tx_len;
     uint32_t tx_off;
     uint32_t rx_len;
     void *rx_buf;
     void *tx_buf;
+    double tokens;
+    uint64_t last_token_tsc;
     struct connection *next;
 #ifdef PRINT_STATS
     uint64_t cnt;
@@ -116,49 +118,14 @@ struct core {
     struct workload_core wlc;
     uint64_t id;
     pthread_t pthread;
-    double tokens;
-    uint64_t last_token_nanos;
 
-    uint32_t msgs_pending;
     struct connection *q_first;
     struct connection *q_last;
 } __attribute__((aligned(64)));
 
 static inline uint64_t get_nanos(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-    return (uint64_t) ts.tv_sec * 1000 * 1000 * 1000 + ts.tv_nsec;
-}
-
-static inline void refill_tokens(struct core *c)
-{
-    uint64_t now;
-    double elapsed_s;
-    double max_tokens;
-
-    if (settings.rate <= 0.0) {
-        return;
-    }
-
-    now = get_nanos();
-    if (c->last_token_nanos == 0) {
-        c->last_token_nanos = now;
-        return;
-    }
-
-    elapsed_s = (double) (now - c->last_token_nanos) / 1000000000.0;
-    c->tokens += elapsed_s * settings.rate;
-
-    max_tokens = settings.rate / 1000.0;
-    if (max_tokens < 1.0) {
-        max_tokens = 1.0;
-    }
-    if (c->tokens > max_tokens) {
-        c->tokens = max_tokens;
-    }
-
-    c->last_token_nanos = now;
+    return now_ns();
 }
 
 static inline void record_latency(struct core *c, uint64_t nanos)
@@ -284,7 +251,6 @@ static inline void conn_connect(struct core *c, struct connection *co,
     }
         
     co->fd = fd;
-    co->pending = 0;
     co->rx_len = 0;
     co->tx_len = 0;
     co->tx_off = 0;
@@ -355,37 +321,16 @@ static inline int conn_recv(struct core *c, struct connection *co,
 /* send out request on connection */
 static inline int conn_send(struct core *c, struct connection *co)
 {
-    int cn;
     ssize_t ret;
 
     assert(co->tx_len > 0);
     assert(co->tx_off == 0);
 
-    cn = c->id;
-
     ret = udp_sendto(c->udp_ctx, co->fd, co->tx_buf, co->tx_len,
             (struct sockaddr *) &c->dst_addr, sizeof(c->dst_addr));
-    if (ret == (ssize_t) co->tx_len) {
-        co->tx_off = 0;
-        co->tx_len = 0;
-        return 0;
-    } else if (ret > 0) {
-        fprintf(stderr, "[%d] partial udp send: %zd of %u\n", cn, ret, co->tx_len);
-        abort();
-        return -1;
-    } else if (ret < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-        fprintf(stderr, "[%d] send failed: %d errno=%d\n", cn, (int) ret, errno);
-        abort();
-        return -1;
-    } else if (ret < 0 &&
-            (errno == EAGAIN || errno == EWOULDBLOCK))
-    {
-        return 1;
-    }
-
-    fprintf(stderr, "[%d] udp_sendto returned 0 with tx_len=%u\n", cn, co->tx_len);
-    abort();
-    return -1;
+    assert(ret == co->tx_len || ret <= 0);
+        
+    return 0;
 }
 
 static inline void set_request(struct core *c, struct connection *co,
@@ -470,9 +415,6 @@ static void prepare_core(struct core *c)
         abort();
     }
 
-    c->msgs_pending = 0;
-    c->tokens = 0.0;
-    c->last_token_nanos = 0;
     c->q_first = c->q_last = NULL;
     for (i = 0; i < settings.conns; i++) {
         if ((buf = malloc(BUFSIZE * 2)) == NULL) {
@@ -482,6 +424,8 @@ static void prepare_core(struct core *c)
         c->conns[i].rx_buf = buf;
         c->conns[i].tx_buf = buf + BUFSIZE;
         c->conns[i].fd = -1;
+        c->conns[i].tokens = 0;
+        c->conns[i].last_token_tsc = util_rdtsc();
         conn_connect(c, &c->conns[i], i);
     }
 
@@ -505,7 +449,7 @@ static void prepare_core(struct core *c)
 static void load_keys(struct core *c)
 {
     int cn;
-    size_t i, j, pending;
+    size_t i, j;
     struct key *k;
     struct connection *co;
     uint32_t opaque;
@@ -514,26 +458,17 @@ static void load_keys(struct core *c)
 
     cn = c->id;
     i = cn;
-    pending = 0;
-    while (i < workload.keys_num || pending > 0) {
+    while (i < workload.keys_num) {
         udp_poll_fast(c->udp_ctx);
 
         for (j = 0; j < settings.conns; j++) {
             co = &c->conns[j];
 
-            while (co->pending > 0 && conn_recv(c, co, &op, &err, &opaque) == 0) {
+            while (conn_recv(c, co, &op, &err, &opaque) == 0) {
                 if (err != 0) {
                     fprintf(stderr, "[%d] load_keys set failed:%x\n", cn, err);
                 }
-                pending--;
-                co->pending--;
-                if (co->pending == 0) {
-                    conn_q_push(c, co);
-                }
-            }
-
-            if (co->tx_len != 0) {
-                conn_send(c, co);
+                conn_q_push(c, co);
             }
         }
 
@@ -543,9 +478,6 @@ static void load_keys(struct core *c)
             set_request(c, co, k, 0);
 
             conn_send(c, co);
-            co->pending++;
-            pending++;
-
             i += settings.threads;
         }
     }
@@ -553,6 +485,7 @@ static void load_keys(struct core *c)
 
 static inline void progress_conns(struct core *c)
 {
+    int n;
     size_t j;
     struct connection *co;
     uint32_t opaque;
@@ -561,8 +494,12 @@ static inline void progress_conns(struct core *c)
 
     for (j = 0; j < settings.conns; j++) {
         co = &c->conns[j];
+        
+        n = udp_poll_fast(c->udp_ctx);
+        if (n == 0)
+            break;
 
-        while (co->pending > 0 && conn_recv(c, co, &op, &err, &opaque) == 0) {
+        while (conn_recv(c, co, &op, &err, &opaque) == 0) {
             record_latency(c, (uint32_t) get_nanos() - opaque);
 
             STATS_ADD(co, cnt, 1);
@@ -577,54 +514,59 @@ static inline void progress_conns(struct core *c)
                 STATS_ADD(c, rx_fail, 1);
                 fprintf(stderr, "[%d] request failed:%x\n", (int) c->id, err);
             }
-            co->pending--;
-            c->msgs_pending--;
 
-            if (co->pending == 0) {
-                conn_q_push(c, co);
-            }
-        }
-
-        if (co->tx_len != 0) {
-            conn_send(c, co);
+            conn_q_push(c, co);
         }
     }
 }
 
 static inline void send_pending(struct core *c)
 {
+    int n;
     struct connection *co;
     uint32_t opaque;
     enum workload_op op = 0;
     struct key *k;
+    __u64 tsc_now;
+    double ops_per_us, delta_cycles, delta_us, max_tokens;
 
-    refill_tokens(c);
-
-    while (c->q_first != NULL) {
-        if (settings.rate > 0.0 && c->tokens < 1.0) {
+    while (c->q_first != NULL) {        
+        n = udp_poll_fast(c->udp_ctx);
+        if (n == 0)
             break;
-        }
 
         co = conn_q_pop(c);
 
-        workload_op(&workload, &c->wlc, &k, &op);
+        /* Update token bucket using TSC */
+        tsc_now = util_rdtsc();
+        delta_cycles = (double) (tsc_now - co->last_token_tsc);
+        delta_us = delta_cycles / clock_tsc_per_us();
+        assert(delta_us >= 0);
+        ops_per_us = settings.rate;
+        co->tokens += delta_us * ops_per_us;
 
-        opaque = get_nanos();
+        /* Cap bucket to 1 ms worth of traffic to avoid unbounded bursts */
+        max_tokens = ops_per_us * 1000;
+        if (co->tokens > max_tokens)
+            co->tokens = max_tokens;
+        co->last_token_tsc = tsc_now;
 
-        if (op == WL_OP_GET) {
-            get_request(c, co, k, opaque);
-            STATS_ADD(c, tx_get, 1);
-        } else {
-            set_request(c, co, k, opaque);
-            STATS_ADD(c, tx_set, 1);
-        }
-
-        conn_send(c, co);
-
-        co->pending++;
-        c->msgs_pending++;
-        if (settings.rate > 0.0) {
-            c->tokens -= 1.0;
+        while (co->tokens >= 1)
+        {
+            workload_op(&workload, &c->wlc, &k, &op);
+    
+            opaque = get_nanos();
+    
+            if (op == WL_OP_GET) {
+                get_request(c, co, k, opaque);
+                STATS_ADD(c, tx_get, 1);
+            } else {
+                set_request(c, co, k, opaque);
+                STATS_ADD(c, tx_set, 1);
+            }
+    
+            conn_send(c, co);
+            co->tokens -= 1;
         }
     }
 }
@@ -667,7 +609,7 @@ static void *thread_run(void *arg)
         progress_conns(c);
         send_pending(c);
 
-        if (n == 0 && c->msgs_pending == 0) {
+        if (n == 0) {
             sched_yield();
         }
     }
@@ -733,6 +675,7 @@ int main(int argc, char *argv[])
     num_threads = settings.threads;
 
     workload_init(&workload);
+    calibrate_tsc();
 
     assert(sizeof(*cs) % 64 == 0);
     cs = calloc(num_threads, sizeof(*cs));

@@ -224,6 +224,7 @@ static size_t process_datagrams(struct item_allocator *ia,
     while (1) {
         ret = udp_recvfrom(ns->ctx, ns->fd, rx_buf, sizeof(rx_buf),
                 (struct sockaddr *) &src_addr, sizeof(src_addr));
+        
         if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             break;
         } else if (ret < 0) {

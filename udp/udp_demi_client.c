@@ -25,6 +25,8 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <linux/types.h>
+#include "../utils/clock.h"
+#include "../utils/hist.h"
 
 #include <demi/libos.h>
 #include <demi/sga.h>
@@ -74,151 +76,13 @@ __u64 t_last_report_ns, t_next_report_ns;
 __u64 txb_load_interval_total, txp_load_interval_total;
 __u64 txb_tp_interval_total, txp_tp_interval_total;
 
-/* Cycles per microsecond */
-static double tsc_per_us = 0.0;
-
-/* Total received samples across all cores */
-static __u64 total_rx = 0;
-static __u64 *rtt_hist = NULL;
-
 /* Clamp histogram at 1 second */
 #define MAX_RTT_US 1000000u
 
 static pthread_barrier_t start_barrier;
 static pthread_t *threads = NULL;
 static struct core *cores = NULL;
-struct sockaddr_in src_addr;
-
-
-static inline __u64 util_rdtsc(void)
-{
-  __u32 eax, edx;
-  asm volatile ("rdtsc" : "=a" (eax), "=d" (edx));
-  return ((__u64)edx << 32) | eax;
-}
-
-static inline void calibrate_tsc(void)
-{
-  struct timespec ts_before, ts_after;
-  __u64 t0, t1;
-  __u64 us_before, us_after;
-  __u64 dt_cycles, dt_us;
-  
-  if (tsc_per_us != 0.0) 
-    return;
-
-  if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts_before) != 0)
-  {
-    perror("calibrate_tsc: clock_gettime before");
-    exit(EXIT_FAILURE);
-  }
-
-  t0 = util_rdtsc();
-  usleep(10000);
-  t1 = util_rdtsc();
-
-  if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts_after) != 0)
-  {
-    perror("calibrate_tsc: clock_gettime after");
-    exit(EXIT_FAILURE);
-  }
-
-  dt_cycles = t1 - t0;
-  us_before = (__u64) ts_before.tv_sec * 1000000ULL
-      + (__u64) (ts_before.tv_nsec / 1000ULL);
-  us_after  = (__u64) ts_after.tv_sec  * 1000000ULL
-      + (__u64) (ts_after.tv_nsec  / 1000ULL);
-  dt_us = us_after - us_before;
-
-  if (dt_us == 0)
-    dt_us = 1;
-
-  tsc_per_us = (double) dt_cycles / (double) dt_us;
-  if (tsc_per_us <= 0.0)
-  {
-    fprintf(stderr, "calibrate_tsc: invalid tsc_per_us: %f\n", tsc_per_us);
-    exit(EXIT_FAILURE);
-  }
-}
-
-static inline __u64 us_since_tsc(__u64 tsc_then)
-{
-  __u64 tsc_now = util_rdtsc();
-  double delta = (double) (tsc_now - tsc_then);
-  assert(delta >= 0);
-  double us = delta / tsc_per_us;
-  assert(us >= 0);
-  
-  return (__u64) us;
-}
-
-static inline __u64 now_ns(void)
-{
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-  return (__u64) ts.tv_sec * 1000000000ULL + (__u64) ts.tv_nsec;
-}
-
-static inline void hist_add(__u64 rtt_us)
-{
-  if (rtt_us > MAX_RTT_US) 
-    rtt_us = MAX_RTT_US;
-
-  __sync_fetch_and_add(&rtt_hist[rtt_us], 1);
-  __sync_fetch_and_add(&total_rx, 1);
-}
-
-static inline bool hist_percentiles(__u64 *p50, __u64 *p99, __u64 *p999)
-{
-  __u32 i;
-  __u64 samples, N, c;
-  __u64 t50, t99, t999;
-  __u64 acc = 0;
-  __u64 v50 = 0, v99 = 0, v999 = 0;
-  __u8 got50 = 0, got99 = 0, got999 = 0;
-  
-  samples = __sync_fetch_and_add(&total_rx, 0);
-  if (samples == 0) 
-    return 0;
-
-  N = samples;
-  t50  = (N * 50  + 100 - 1) / 100;
-  t99  = (N * 99  + 100 - 1) / 100;
-  t999 = (N * 999 + 1000 - 1) / 1000;
-
-  for (i = 0; i <= MAX_RTT_US; i++)
-  {
-    c = __sync_fetch_and_add(&rtt_hist[i], 0);
-    if (c == 0)
-      continue;
-
-    acc += c;
-
-    if (!got50 && acc >= t50)
-    {
-      v50 = i;
-      got50 = 1;
-    }
-
-    if (!got99 && acc >= t99)
-    {
-      v99 = i;
-      got99 = 1;
-    }
-
-    if (!got999 && acc >= t999)
-    {
-      v999 = i;
-      got999 = 1;
-    }
-
-    if (got50 && got99 && got999)
-      break;
-  }
-
-  *p50 = v50; *p99 = v99; *p999 = v999;
-  return 1;
-}
+static struct hist_state rtt_hist = { 0 };
 
 static inline int parse_args(int argc, char **argv)
 {
@@ -293,18 +157,6 @@ static inline int parse_args(int argc, char **argv)
   return 0;
 }
 
-static inline int init_hist(void)
-{
-  rtt_hist = (__u64 *) calloc((size_t) MAX_RTT_US + 1, sizeof(__u64));
-  if (!rtt_hist)
-  {
-    perror("calloc rtt_hist");
-    return -1;
-  }
-
-  return 0;
-}
-
 static inline void print_stats(__u64 now)
 {
   double interval_s, rps_load, mbps_load, rps_tp, mbps_tp;
@@ -338,7 +190,7 @@ static inline void print_stats(__u64 now)
   rps_tp  = (double) txp_tp_interval_total / interval_s;
   mbps_tp = ((double) txb_tp_interval_total * 8.0 / 1e6) / interval_s;
 
-  hist_percentiles(&p50, &p99, &p999);
+  hist_percentiles(&rtt_hist, &p50, &p99, &p999);
 
   printf("[ %3lus ] load=%lld rps | load=%.2f Mb/s | tp=%lld rps | tp=%.2f Mb/s | ",
           (unsigned long)((t_next_report_ns - t_start_ns) / 1000000000ULL),
@@ -459,7 +311,7 @@ static inline void core_rx(struct core *c)
       assert(c->res.qr_value.sga.segments[0].data_len_bytes == msize);   
       ph = (struct payload_hdr *) c->res.qr_value.sga.segments[0].data_buf_ptr;
       rtt_us = us_since_tsc(ph->tsc);
-      hist_add(rtt_us);
+      hist_add(&rtt_hist, rtt_us);
       __sync_fetch_and_add(&c->txb_tp_interval, msize);
       __sync_fetch_and_add(&c->txp_tp_interval, 1);
       c->total_rx_pkts++;
@@ -506,7 +358,7 @@ static inline void * core_thread(void *arg)
     /* Update token bucket using TSC */
     tsc_now = util_rdtsc();
     delta_cycles = (double) (tsc_now - c->last_tsc);
-    delta_us = delta_cycles / tsc_per_us;
+    delta_us = delta_cycles / clock_tsc_per_us();
     assert(delta_us >= 0);
     bytes_per_us = (c->rate / 8.0);
     c->tokens += delta_us * bytes_per_us;
@@ -605,7 +457,7 @@ int main(int argc, char **argv)
     return EXIT_FAILURE;
   }
 
-  ret = init_hist();
+  ret = init_hist(&rtt_hist, MAX_RTT_US);
   if (ret != 0)
   {
     fprintf(stderr, "failed to init hist\n");
@@ -651,7 +503,7 @@ int main(int argc, char **argv)
 
   /* Final summary */
   __u64 p50 = 0, p99 = 0, p999 = 0;
-  hist_percentiles(&p50, &p99, &p999);
+  hist_percentiles(&rtt_hist, &p50, &p99, &p999);
 
   /* Sum total sent packets across cores */
   __u64 totalp_tx = 0, totalp_rx = 0;
@@ -677,7 +529,7 @@ int main(int argc, char **argv)
 
   free(cores);
   free(threads);
-  free(rtt_hist);
+  hist_cleanup(&rtt_hist);
   pthread_barrier_destroy(&start_barrier);
 
   return 0;

@@ -24,6 +24,7 @@
 #include <demi/libos.h>
 #include <demi/sga.h>
 #include <demi/wait.h>
+#include "../utils/clock.h"
 
 struct core {
   int id;
@@ -61,13 +62,6 @@ struct sockaddr_in src_addr;
 int rem_port;
 const char *rem_ip;
 struct timespec timeout;
-
-static inline __u64 now_ns(void)
-{
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-  return (__u64) ts.tv_sec * 1000000000ULL + (__u64) ts.tv_nsec;
-}
 
 static inline int parse_args(int argc, char **argv)
 {

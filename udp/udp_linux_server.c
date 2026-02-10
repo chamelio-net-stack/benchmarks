@@ -21,6 +21,7 @@
 #include <assert.h>
 #include <fcntl.h>
 #include <linux/types.h>
+#include "../utils/clock.h"
 
 struct core {
   int id;
@@ -52,13 +53,6 @@ static pthread_barrier_t start_barrier;
 static pthread_t *threads = NULL;
 static struct core *cores = NULL;
 struct sockaddr_in src_addr;
-
-static inline __u64 now_ns(void)
-{
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-  return (__u64) ts.tv_sec * 1000000000ULL + (__u64) ts.tv_nsec;
-}
 
 static inline int parse_args(int argc, char **argv)
 {
