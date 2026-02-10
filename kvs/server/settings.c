@@ -40,7 +40,7 @@ static void settings_print_usage(const char *prog)
         "  THREADS: worker threads (1..255)\n"
         "  --ip IPv4 | --ip=IPv4\n"
         "  --port PORT | --port=PORT\n"
-        "  --max-msize BYTES | --max-msize=BYTES\n"
+        "  --msize BYTES | --msize=BYTES\n"
         "  --max-conns COUNT | --max-conns=COUNT\n"
         "  --segsize BYTES | --segsize=BYTES\n"
         "  --segmaxnum COUNT | --segmaxnum=COUNT\n"
@@ -108,7 +108,7 @@ int settings_init(int argc, char *argv[])
 
     settings.udpport = 11211;
     settings.bindip = htonl(INADDR_ANY);
-    settings.max_msg_size = 128;
+    settings.max_msg_size = 2048;
     settings.max_conns = 128 * 1024;
     settings.verbose = 1;
     settings.segsize = 256 * 1024;
@@ -178,17 +178,19 @@ int settings_init(int argc, char *argv[])
         }
 
         val = NULL;
-        if (strcmp(arg, "--max-msize") == 0) {
+        if (strcmp(arg, "--msize") == 0 || strcmp(arg, "--max-msize") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "--max-msize requires a value\n");
+                fprintf(stderr, "%s requires a value\n", arg);
                 return -1;
             }
             val = argv[++i];
-        } else if (strncmp(arg, "--max-msize=", 8) == 0) {
+        } else if (strncmp(arg, "--msize=", 8) == 0) {
             val = arg + 8;
+        } else if (strncmp(arg, "--max-msize=", 12) == 0) {
+            val = arg + 12;
         }
         if (val != NULL) {
-            if (parse_u32_arg("max-msize", val, 64, UINT32_MAX, &tmp_u32) != 0) {
+            if (parse_u32_arg("msize", val, 64, UINT32_MAX, &tmp_u32) != 0) {
                 return -1;
             }
             settings.max_msg_size = tmp_u32;

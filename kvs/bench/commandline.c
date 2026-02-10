@@ -39,8 +39,6 @@ void print_usage(void)
         "./benchmark [options] dst-ip:dst-port\n"
         "Options:\n"
         "  -t, --threads=COUNT   Number of sending threads [default 1].\n"
-        "  -C, --connns=COUNT    # connections / thread    [default 1].\n"
-        "  -p, --pending=NUM     Number of pend. req/conn. [default 1].\n"
         "  -k, --key-size=BYTES  Key size in bytes         [default 32].\n"
         "  -n, --key-num=COUNT   Number of keys            [default 1000].\n"
         "  -u, --key-uniform     Uniform key distribution  [default]\n"
@@ -60,8 +58,6 @@ void print_usage(void)
 void init_settings(struct settings *s)
 {
     s->threads = 1;
-    s->conns = 1;
-    s->pending = 1;
     s->keysize = 32;
     s->keynum = 1000;
     s->keydist = DIST_UNIFORM;
@@ -81,8 +77,6 @@ int parse_settings(int argc, char *argv[], struct settings *s)
 {
     static struct option long_opts[] = {
             {"threads",     required_argument, NULL, 't'},
-            {"conns",       required_argument, NULL, 'C'},
-            {"pending",     required_argument, NULL, 'p'},
             {"key-size",    required_argument, NULL, 'k'},
             {"key-num",     required_argument, NULL, 'n'},
             {"key-uniform", no_argument,       NULL, 'u'},
@@ -97,7 +91,7 @@ int parse_settings(int argc, char *argv[], struct settings *s)
             {"op-seed",     required_argument, NULL, 'o'},
             {"keysteer",    no_argument,       NULL, 'K'},
         };
-    static const char *short_opts = "t:C:p:k:n:uz:v:g:T:w:c:d:s:o:r:K";
+    static const char *short_opts = "t:k:n:uz:v:g:T:w:c:d:s:o:r:K";
     int c, opt_idx, done = 0;
     char *end;
 
@@ -112,23 +106,6 @@ int parse_settings(int argc, char *argv[], struct settings *s)
                     return -1;
                 }
                 break;
-            case 'C':
-                s->conns = strtoul(optarg, &end, 10);
-                if (!*optarg || *end || s->conns < 1) {
-                    fprintf(stderr, "conns needs to be a positive "
-                            "integer\n");
-                    return -1;
-                }
-                break;
-            case 'p':
-                s->pending = strtoul(optarg, &end, 10);
-                if (!*optarg || *end || s->pending < 1) {
-                    fprintf(stderr, "pending needs to be a positive "
-                            "integer\n");
-                    return -1;
-                }
-                break;
-
             case 'k':
                 s->keysize = strtoul(optarg, &end, 10);
                 if (!*optarg || *end || s->keysize < 1) {
