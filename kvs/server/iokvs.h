@@ -47,6 +47,12 @@ struct settings {
     double clean_ratio;
     /** UDP port to listen on */
     uint16_t udpport;
+    /** IPv4 address to bind in network byte order */
+    uint32_t bindip;
+    /** Maximum message size for RX/TX buffers */
+    uint32_t max_msg_size;
+    /** Maximum connection count used to size epoll */
+    int max_conns;
     /** Verbosity for log messages. */
     uint8_t verbose;
     /** Number of cores */

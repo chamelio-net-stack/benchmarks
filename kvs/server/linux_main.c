@@ -27,7 +27,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <limits.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -45,14 +44,8 @@
 #define BATCH_MAX 1
 #endif
 
-#define MAX_MSGSIZE 128
-#define MAX_CONNS (128 * 1024)
 #define LISTEN_BACKLOG 128
 #define EPOLL_EVENTS 16
-#define LISTEN_PORT 11211
-
-static struct in_addr listen_addr = { .s_addr = INADDR_ANY };
-static uint16_t listen_port = LISTEN_PORT;
 
 enum conn_status {
   CONN_RECV,
@@ -62,14 +55,14 @@ enum conn_status {
 struct connection {
   struct item *it;
   int fd;
-  uint16_t rx_len;
-  uint16_t rx_off;
-  uint16_t tx_len;
-  uint16_t tx_off;
+  uint32_t rx_len;
+  uint32_t rx_off;
+  uint32_t tx_len;
+  uint32_t tx_off;
   uint8_t epoll_wr;
   uint8_t req_done;
-  uint8_t rx_buf[MAX_MSGSIZE];
-  uint8_t tx_buf[MAX_MSGSIZE];
+  uint8_t *rx_buf;
+  uint8_t *tx_buf;
 };
 
 static int open_listening(int cn)
@@ -96,8 +89,8 @@ static int open_listening(int cn)
 
     memset(&si, 0, sizeof(si));
     si.sin_family = AF_INET;
-    si.sin_addr = listen_addr;
-    si.sin_port = htons(listen_port);
+    si.sin_addr.s_addr = settings.bindip;
+    si.sin_port = htons(settings.udpport);
 
     /* bind socket */
     if ((ret = bind(fd, (struct sockaddr *) &si, sizeof(si)))
@@ -116,80 +109,6 @@ static int open_listening(int cn)
     return fd;
 }
 
-static void print_usage(const char *prog)
-{
-    fprintf(stderr,
-        "Usage: %s [--ip IPv4] [--port PORT] <existing-args>\n",
-        prog);
-}
-
-static int parse_bind_args(int argc, char *argv[], int *out_argc, char **out_argv)
-{
-    int i;
-    int dst = 1;
-
-    out_argv[0] = argv[0];
-
-    for (i = 1; i < argc; i++) {
-        const char *arg = argv[i];
-        const char *val = NULL;
-
-        if (strcmp(arg, "--ip") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "--ip requires a value\n");
-                return -1;
-            }
-            val = argv[++i];
-            if (inet_pton(AF_INET, val, &listen_addr) != 1) {
-                fprintf(stderr, "invalid IPv4 address: %s\n", val);
-                return -1;
-            }
-            continue;
-        } else if (strncmp(arg, "--ip=", 5) == 0) {
-            val = arg + 5;
-            if (inet_pton(AF_INET, val, &listen_addr) != 1) {
-                fprintf(stderr, "invalid IPv4 address: %s\n", val);
-                return -1;
-            }
-            continue;
-        } else if (strcmp(arg, "--port") == 0) {
-            char *end;
-            unsigned long p;
-
-            if (i + 1 >= argc) {
-                fprintf(stderr, "--port requires a value\n");
-                return -1;
-            }
-            val = argv[++i];
-            errno = 0;
-            p = strtoul(val, &end, 10);
-            if (errno != 0 || *val == '\0' || *end != '\0' || p == 0 || p > 65535) {
-                fprintf(stderr, "invalid port: %s\n", val);
-                return -1;
-            }
-            listen_port = (uint16_t) p;
-            continue;
-        } else if (strncmp(arg, "--port=", 7) == 0) {
-            char *end;
-            unsigned long p;
-
-            val = arg + 7;
-            errno = 0;
-            p = strtoul(val, &end, 10);
-            if (errno != 0 || *val == '\0' || *end != '\0' || p == 0 || p > 65535) {
-                fprintf(stderr, "invalid port: %s\n", val);
-                return -1;
-            }
-            listen_port = (uint16_t) p;
-            continue;
-        }
-
-        out_argv[dst++] = argv[i];
-    }
-
-    *out_argc = dst;
-    return 0;
-}
 
 static void network_init(int *p_epfd, int *p_lfd, int cn)
 {
@@ -200,7 +119,7 @@ static void network_init(int *p_epfd, int *p_lfd, int cn)
     lfd = open_listening(cn);
 
     /* prepare epoll */
-    if ((epfd = epoll_create(MAX_CONNS + 1)) < 0) {
+    if ((epfd = epoll_create(settings.max_conns + 1)) < 0) {
         fprintf(stderr, "[%d] epoll_create failed\n", cn);
         abort();
     }
@@ -243,6 +162,13 @@ static void accept_connections(int epfd, int lfd, int cn)
             close(cfd);
             break;
         }
+        if ((c->rx_buf = malloc((size_t) settings.max_msg_size * 2)) == NULL) {
+            fprintf(stderr, "[%d] connection buffer alloc failed\n", cn);
+            close(cfd);
+            free(c);
+            break;
+        }
+        c->tx_buf = c->rx_buf + settings.max_msg_size;
 
         c->fd = cfd;
 
@@ -262,6 +188,7 @@ static void conn_close(struct connection *c)
     if (c->it != NULL) {
         item_unref(c->it);
     }
+    free(c->rx_buf);
     free(c);
 }
 
@@ -291,7 +218,7 @@ static inline int conn_req_iscomp(struct connection *c)
 {
     protocol_binary_request_header *req =
             (protocol_binary_request_header *) (c->rx_buf + c->rx_off);
-    uint16_t avail = c->rx_len - c->rx_off;
+    uint32_t avail = c->rx_len - c->rx_off;
     if (avail < sizeof(*req)) {
         return 0;
     }
@@ -307,7 +234,14 @@ static inline int conn_recv(int epfd, struct connection *c)
 
     /* read until request is complete (or no more data) */
     do {
-        res = read(c->fd, c->rx_buf + c->rx_len, MAX_MSGSIZE -
+        if (c->rx_len == settings.max_msg_size) {
+            fprintf(stderr, "Closing connection on oversized request (> %u bytes)\n",
+                    settings.max_msg_size);
+            conn_close(c);
+            return -1;
+        }
+
+        res = read(c->fd, c->rx_buf + c->rx_len, settings.max_msg_size -
                 c->rx_len);
         if (res == 0) {
             fprintf(stderr, "Closing connection on EOF\n");
@@ -402,7 +336,13 @@ static inline int conn_req_process(struct item_allocator *ia,
         }
 
         /* check whether we have sufficient tx buffer space available */
-        if (MAX_MSGSIZE - c->tx_len < rsl) {
+        if (rsl > settings.max_msg_size) {
+            fprintf(stderr, "Closing connection on oversized response (> %u bytes)\n",
+                    settings.max_msg_size);
+            conn_close(c);
+            return -1;
+        }
+        if (settings.max_msg_size - c->tx_len < rsl) {
             /* not enough space, start sending out */
             return 1;
         }
@@ -456,7 +396,13 @@ static inline int conn_req_process(struct item_allocator *ia,
 
         /* check whether we have sufficient tx buffer space available */
         rsl = sizeof(protocol_binary_response_set);
-        if (MAX_MSGSIZE - c->tx_len < rsl) {
+        if (rsl > settings.max_msg_size) {
+            fprintf(stderr, "Closing connection on oversized response (> %u bytes)\n",
+                    settings.max_msg_size);
+            conn_close(c);
+            return -1;
+        }
+        if (settings.max_msg_size - c->tx_len < rsl) {
             /* not enough space, start sending out */
             return 1;
         }
@@ -655,28 +601,13 @@ static void maintenance(void)
 int main(int argc, char *argv[])
 {
     char name[32];
-    int parsed_argc;
     unsigned num_threads, i;
-    char **parsed_argv;
     pthread_t *pts;
 
-    parsed_argv = calloc((size_t) argc, sizeof(*parsed_argv));
-    if (parsed_argv == NULL) {
-        fprintf(stderr, "calloc failed for argument parsing\n");
-        return EXIT_FAILURE;
-    }
-
-    if (parse_bind_args(argc, argv, &parsed_argc, parsed_argv) != 0) {
-        print_usage(argv[0]);
-        free(parsed_argv);
-        return EXIT_FAILURE;
-    }
-
-    if (settings_init(parsed_argc, parsed_argv) != 0) {
-      free(parsed_argv);
+    if (settings_init(argc, argv) != 0) {
       return EXIT_FAILURE;
     }
-    free(parsed_argv);
+
     num_threads = settings.numcores;
 
     hasht_init();
