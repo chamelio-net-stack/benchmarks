@@ -30,52 +30,61 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <stdint.h>
-#include <fcntl.h>
-#include <sys/types.h>
-#include <sys/socket.h>
+#include <inttypes.h>
 #include <sys/epoll.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>  
 
 #include <protocol_binary.h>
 
 #include "iokvs.h"
+#include "sock.h"
 
-#define MAX_MSGSIZE 2048
+#ifndef BATCH_MAX
+#define BATCH_MAX 1
+#endif
+
+#define MAX_MSGSIZE 128
+#define MAX_CONNS (128 * 1024)
+#define LISTEN_BACKLOG 128
 #define EPOLL_EVENTS 16
+#define LISTEN_PORT 11211
 
-static inline int set_nonblock(int fd)
-{
-    int flag;
+enum conn_status {
+  CONN_RECV,
+  CONN_SEND,
+};
 
-    if ((flag = fcntl(fd, F_GETFL, 0)) == -1) {
-        return -1;
-    }
-    flag |= O_NONBLOCK;
-    return fcntl(fd, F_SETFL, flag);
-}
-
-static inline int set_reuseport(int fd)
-{
-    int flag = 1;
-    return setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof(flag));
-}
+struct connection {
+  struct item *it;
+  int fd;
+  uint16_t rx_len;
+  uint16_t rx_off;
+  uint16_t tx_len;
+  uint16_t tx_off;
+  uint8_t epoll_wr;
+  uint8_t req_done;
+  uint8_t rx_buf[MAX_MSGSIZE];
+  uint8_t tx_buf[MAX_MSGSIZE];
+};
 
 static int open_listening(int cn)
 {
     int fd, ret;
     struct sockaddr_in si;
 
-    if ((fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0) {
+    if ((fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
         fprintf(stderr, "[%d] socket failed\n", cn);
         abort();
     }
 
+    /* set reuse port (for linux to open multiple listening sockets) */
     if (set_reuseport(fd) != 0) {
         fprintf(stderr, "[%d] set reuseport failed\n", cn);
         abort();
     }
 
+    /* set non blocking */
     if ((ret = set_nonblock(fd)) < 0) {
         fprintf(stderr, "[%d] setsock_nonblock failed: %d\n", cn, ret);
         abort();
@@ -83,11 +92,19 @@ static int open_listening(int cn)
 
     memset(&si, 0, sizeof(si));
     si.sin_family = AF_INET;
-    si.sin_addr.s_addr = htonl(settings.srcip);
-    si.sin_port = htons(settings.srcport);
+    si.sin_port = htons(LISTEN_PORT);
 
-    if ((ret = bind(fd, (struct sockaddr *) &si, sizeof(si))) < 0) {
+    /* bind socket */
+    if ((ret = bind(fd, (struct sockaddr *) &si, sizeof(si)))
+            < 0)
+    {
         fprintf(stderr, "[%d] bind failed: %d\n", cn, ret);
+        abort();
+    }
+
+    /* listen on socket */
+    if ((ret = listen(fd, LISTEN_BACKLOG)) < 0) {
+        fprintf(stderr, "[%d] listen failed: %d\n", cn, ret);
         abort();
     }
 
@@ -99,17 +116,20 @@ static void network_init(int *p_epfd, int *p_lfd, int cn)
     int lfd, epfd;
     struct epoll_event ev;
 
+    /* prepare listening socket */
     lfd = open_listening(cn);
 
-    if ((epfd = epoll_create(4)) < 0) {
+    /* prepare epoll */
+    if ((epfd = epoll_create(MAX_CONNS + 1)) < 0) {
         fprintf(stderr, "[%d] epoll_create failed\n", cn);
         abort();
     }
 
+    /* add listening socket to epoll */
     ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
     ev.data.ptr = NULL;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &ev) < 0) {
-        fprintf(stderr, "[%d] epoll_ctl failed on listener\n", cn);
+        fprintf(stderr, "[%d] mtcp_epoll_ctl\n", cn);
         abort();
     }
 
@@ -117,155 +137,333 @@ static void network_init(int *p_epfd, int *p_lfd, int cn)
     *p_lfd = lfd;
 }
 
-static int process_request(struct item_allocator *ia, const uint8_t *req_buf,
-        size_t req_len, uint8_t *tx_buf, size_t *tx_len)
+static void accept_connections(int epfd, int lfd, int cn)
 {
-    const protocol_binary_request_header *req;
-    protocol_binary_response_header *res;
-    protocol_binary_response_get *gres;
-    struct item *it;
-    const uint8_t *k, *v;
-    uint8_t op;
-    uint16_t kl;
-    uint32_t bl, vl, h;
-    size_t body_off;
+    int cfd;
+    struct connection *c;
+    struct epoll_event ev;
 
-    if (req_len < sizeof(protocol_binary_request_header)) {
-        return -1;
+    while (1) {
+        if ((cfd = accept(lfd, NULL, NULL)) < 0) {
+            if (errno == EAGAIN) {
+                break;
+            }
+
+            fprintf(stderr, "[%d] accept failed: %d\n", cn, cfd);
+            abort();
+        }
+
+        if (set_nonblock(cfd) < 0) {
+            fprintf(stderr, "[%d] set nonblock failed\n", cn);
+            abort();
+        }
+
+        if ((c = calloc(1, sizeof(*c))) == NULL) {
+            fprintf(stderr, "[%d] connection calloc failed\n", cn);
+            close(cfd);
+            break;
+        }
+
+        c->fd = cfd;
+
+        /* add socket to epoll */
+        ev.data.ptr = c;
+        ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &ev) < 0) {
+            fprintf(stderr, "[%d] epoll_ctl CA\n", cn);
+            abort();
+        }
+    }
+}
+
+static void conn_close(struct connection *c)
+{
+    close(c->fd);
+    if (c->it != NULL) {
+        item_unref(c->it);
+    }
+    free(c);
+}
+
+static inline int conn_upepoll(int epfd, struct connection *c,
+        uint8_t wr)
+{
+    struct epoll_event ev;
+
+    if (c->epoll_wr == wr) {
+        return 0;
     }
 
-    req = (const protocol_binary_request_header *) req_buf;
-    res = (protocol_binary_response_header *) tx_buf;
-    gres = (protocol_binary_response_get *) tx_buf;
+    printf("conn_epupdate(%p, %d)\n", c, wr);
+
+    ev.data.ptr = c;
+    ev.events = (wr ? EPOLLOUT : EPOLLIN) | EPOLLERR | EPOLLHUP;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd, &ev) < 0) {
+        fprintf(stderr, "epoll_ctl in conn_upepoll failed\n");
+        abort();
+    }
+    c->epoll_wr = wr;
+
+    return 0;
+}
+
+static inline int conn_req_iscomp(struct connection *c)
+{
+    protocol_binary_request_header *req =
+            (protocol_binary_request_header *) (c->rx_buf + c->rx_off);
+    uint16_t avail = c->rx_len - c->rx_off;
+    if (avail < sizeof(*req)) {
+        return 0;
+    }
+    if (avail < sizeof(*req) + ntohl(req->request.bodylen)) {
+        return 0;
+    }
+    return 1;
+}
+
+static inline int conn_recv(int epfd, struct connection *c)
+{
+    ssize_t res;
+
+    /* read until request is complete (or no more data) */
+    do {
+        res = read(c->fd, c->rx_buf + c->rx_len, MAX_MSGSIZE -
+                c->rx_len);
+        if (res == 0) {
+            fprintf(stderr, "Closing connection on EOF\n");
+            conn_close(c);
+            return -1;
+        } else if (res < 0 && errno == EAGAIN) {
+            /* request is not complete yet */
+            conn_upepoll(epfd, c, 0);
+            return 1;
+        } else if (res < 0) {
+            perror("Closing connection on read error");
+            conn_close(c);
+            return -1;
+        }
+
+        c->rx_len += res;
+    } while (!conn_req_iscomp(c));
+
+    return 0;
+}
+
+static inline int conn_send(int epfd, struct connection *c)
+{
+    ssize_t res;
+
+    /* write until tx buffer is empty (or can't send) */
+    do {
+        res = write(c->fd, c->tx_buf + c->tx_off,
+                c->tx_len - c->tx_off);
+        if (res == 0) {
+            fprintf(stderr, "Closing connection on TX EOF\n");
+            conn_close(c);
+            return -1;
+        } else if (res < 0 && errno == EAGAIN) {
+            /* request is not complete yet */
+            conn_upepoll(epfd, c, 1);
+            return 1;
+        } else if (res < 0) {
+            perror("Closing connection on write error");
+            conn_close(c);
+            return -1;
+        }
+
+        c->tx_off += res;
+    } while (c->tx_off < c->tx_len);
+
+    c->tx_off = 0;
+    c->tx_len = 0;
+    return 0;
+}
+
+static inline int conn_req_process(struct item_allocator *ia,
+        struct connection *c)
+{
+    assert(ia != NULL);
+    protocol_binary_request_header *req =
+            (protocol_binary_request_header *) (c->rx_buf + c->rx_off);
+    protocol_binary_request_set *seth =
+            (protocol_binary_request_set *) req;
+    protocol_binary_response_header *res =
+        (protocol_binary_response_header *) (c->tx_buf + c->tx_len);
+    protocol_binary_response_get *gres =
+        (protocol_binary_response_get *) (c->tx_buf + c->tx_len);
+
+    uint8_t op = req->request.opcode;
+    uint16_t kl = ntohs(req->request.keylen);
+    uint32_t h, bl = ntohl(req->request.bodylen), vl, rql, rsl;
+    void *k, *v;
 
     if (req->request.magic != PROTOCOL_BINARY_REQ) {
+        fprintf(stderr, "Closing connection on invalid magic: %x\n",
+                req->request.magic);
+        conn_close(c);
         return -1;
     }
 
-    op = req->request.opcode;
-    kl = ntohs(req->request.keylen);
-    bl = ntohl(req->request.bodylen);
-    body_off = sizeof(*req) + req->request.extlen;
-
-    if (req_len != sizeof(*req) + bl || body_off > req_len ||
-            body_off + kl > req_len)
-    {
-        return -1;
-    }
-
-    k = req_buf + body_off;
+    rql = sizeof(*req) + bl;
 
     if (op == PROTOCOL_BINARY_CMD_GET) {
-        h = jenkins_hash(k, kl);
-        it = hasht_get(k, kl, h);
+        /* lookup item */
+        if (!c->req_done) {
+            k = req + 1;
+            h = jenkins_hash(k, kl);
+            c->it = hasht_get(k, kl, h);
+            c->req_done = 1;
+        }
 
+        /* calculate response length */
+        rsl = sizeof(protocol_binary_response_get);
+        if (c->it != NULL) {
+            rsl += c->it->vallen;
+        }
+
+        /* check whether we have sufficient tx buffer space available */
+        if (MAX_MSGSIZE - c->tx_len < rsl) {
+            /* not enough space, start sending out */
+            return 1;
+        }
+
+        /* build response header */
         res->response.magic = PROTOCOL_BINARY_RES;
         res->response.opcode = PROTOCOL_BINARY_CMD_GET;
         res->response.keylen = htons(0);
         res->response.extlen = 4;
         res->response.datatype = 0;
-        res->response.opaque = req->request.opaque;
-        gres->message.body.flags = htonl(0);
-
-        *tx_len = sizeof(*gres);
-        if (it != NULL) {
-            if (*tx_len + it->vallen > MAX_MSGSIZE) {
-                res->response.status = htons(PROTOCOL_BINARY_RESPONSE_E2BIG);
-                res->response.bodylen = htonl(4);
-                item_unref(it);
-                return 0;
-            }
-
+        if (c->it != NULL) {
             res->response.status = htons(PROTOCOL_BINARY_RESPONSE_SUCCESS);
-            res->response.bodylen = htonl(4 + it->vallen);
-            memcpy(gres + 1, item_value(it), it->vallen);
-            *tx_len += it->vallen;
-            item_unref(it);
+            res->response.bodylen = htonl(4 + c->it->vallen);
         } else {
             res->response.status = htons(PROTOCOL_BINARY_RESPONSE_KEY_ENOENT);
             res->response.bodylen = htonl(4);
         }
+        res->response.opaque = req->request.opaque;
+        gres->message.body.flags = htonl(0);
 
-        return 0;
+        /* add item value */
+        if (c->it != NULL) {
+            memcpy(gres + 1, item_value(c->it), c->it->vallen);
+            item_unref(c->it);
+        }
     } else if (op == PROTOCOL_BINARY_CMD_SET) {
-        if (bl < req->request.extlen + kl) {
-            return -1;
+        k = seth + 1;
+        v = (uint8_t *) k + kl;
+        vl = bl - kl - req->request.extlen;
+        if (!c->req_done) {
+            /* allocate item */
+            assert(ia != NULL);
+            c->it = ialloc_alloc(ia, sizeof(struct item) + kl + vl, false);
+
+            /* if successfull, initialize then add to hash table */
+            if (c->it != NULL) {
+                h = jenkins_hash(k, kl);
+
+                c->it->hv = h;
+                c->it->vallen = vl;
+                c->it->keylen = kl;
+                memcpy(item_key(c->it), k, kl);
+                memcpy(item_value(c->it), v, vl);
+
+                hasht_put(c->it, NULL);
+                item_unref(c->it);
+            }
+
+            c->req_done = 1;
         }
 
-        vl = bl - req->request.extlen - kl;
-        v = k + kl;
-        if ((size_t) (v - req_buf) + vl > req_len) {
-            return -1;
+        /* check whether we have sufficient tx buffer space available */
+        rsl = sizeof(protocol_binary_response_set);
+        if (MAX_MSGSIZE - c->tx_len < rsl) {
+            /* not enough space, start sending out */
+            return 1;
         }
 
-        it = ialloc_alloc(ia, sizeof(struct item) + kl + vl, false);
-        if (it != NULL) {
-            h = jenkins_hash(k, kl);
-
-            it->hv = h;
-            it->vallen = vl;
-            it->keylen = kl;
-            memcpy(item_key(it), k, kl);
-            memcpy(item_value(it), v, vl);
-
-            hasht_put(it, NULL);
-            item_unref(it);
-        }
-
+        /* build response header */
         res->response.magic = PROTOCOL_BINARY_RES;
         res->response.opcode = PROTOCOL_BINARY_CMD_SET;
         res->response.keylen = htons(0);
         res->response.extlen = 0;
         res->response.datatype = 0;
-        res->response.status = htons(it == NULL ? PROTOCOL_BINARY_RESPONSE_ENOMEM :
-                PROTOCOL_BINARY_RESPONSE_SUCCESS);
+        if (c->it != NULL) {
+            res->response.status = htons(PROTOCOL_BINARY_RESPONSE_SUCCESS);
+        } else {
+            res->response.status = htons(PROTOCOL_BINARY_RESPONSE_ENOMEM);
+        }
         res->response.bodylen = htonl(0);
         res->response.opaque = req->request.opaque;
-
-        *tx_len = sizeof(protocol_binary_response_set);
-        return 0;
+    } else {
+        fprintf(stderr, "Closing connection on invalid request opcode: %x\n",
+                op);
+        conn_close(c);
+        return -1;
     }
 
-    return -1;
+    /* done with request */
+    c->rx_off += rql;
+    c->tx_len += rsl;
+    c->req_done = 0;
+    return 0;
 }
 
-static size_t process_datagrams(struct item_allocator *ia, int lfd)
+static void conn_events(struct item_allocator *ia, int epfd,
+        struct connection *c, uint32_t events)
 {
-    uint8_t rx_buf[MAX_MSGSIZE];
-    uint8_t tx_buf[MAX_MSGSIZE];
-    size_t tx_len, handled;
-    struct sockaddr_storage src_addr;
-    socklen_t src_len;
-    ssize_t ret;
+    int ret;
 
-    handled = 0;
-    while (1) {
-        src_len = sizeof(src_addr);
-        ret = recvfrom(lfd, rx_buf, sizeof(rx_buf), 0,
-                (struct sockaddr *) &src_addr, &src_len);
-        if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            break;
-        } else if (ret < 0) {
-            perror("recvfrom failed");
-            abort();
+    assert(ia != NULL);
+
+    /* connection */
+    if ((events & ~(EPOLLIN | EPOLLOUT))) {
+        fprintf(stderr, "Closing connection on EP error\n");
+        conn_close(c);
+        return;
+    }
+
+    /* more data available to be received */
+    if ((events & EPOLLIN) == EPOLLIN) {
+        /* receive requests */
+        if (conn_recv(epfd, c) != 0) {
+            return;
         }
+    } else if ((events & EPOLLOUT) == EPOLLOUT) {
+        assert(c->tx_off < c->tx_len);
 
-        handled++;
-        if (process_request(ia, rx_buf, ret, tx_buf, &tx_len) != 0) {
-            continue;
-        }
-
-        ret = sendto(lfd, tx_buf, tx_len, 0, (struct sockaddr *) &src_addr,
-                src_len);
-        if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            continue;
-        } else if (ret < 0) {
-            perror("sendto failed");
-            abort();
+        /* send out tx buffer */
+        if (conn_send(epfd, c) != 0) {
+            return;
         }
     }
 
-    return handled;
+    /* process request(s) */
+    while (conn_req_iscomp(c)) {
+        assert(ia != NULL);
+        ret = conn_req_process(ia, c);
+        if (ret == -1) {
+            /* request failed and connection was closed */
+            return;
+        } else if (c->tx_len != 0) {
+            /* not enough tx buffer space, send out */
+            if (conn_send(epfd, c) != 0) {
+                return;
+            }
+        }
+    }
+
+    /* move up rx buffer contents, if any */
+    if (c->rx_off != 0) {
+        if (c->rx_off == c->rx_len) {
+            c->rx_len = 0;
+        } else {
+            memmove(c->rx_buf, c->rx_buf + c->rx_off, c->rx_len - c->rx_off);
+            c->rx_len = c->rx_len - c->rx_off;
+        }
+        c->rx_off = 0;
+    }
+
+    conn_upepoll(epfd, c, 0);
 }
 
 static size_t clean_log(struct item_allocator *ia, bool idle)
@@ -301,6 +499,7 @@ static size_t clean_log(struct item_allocator *ia, bool idle)
     return n;
 }
 
+
 static struct item_allocator **iallocs;
 static volatile size_t n_ready = 0;
 
@@ -312,6 +511,7 @@ static void *processing_thread(void *data)
     static uint16_t qcounter;
     uint16_t q;
     struct epoll_event *evs;
+    struct connection *c;
 
     ialloc_init_allocator(&ia);
     q = __sync_fetch_and_add(&qcounter, 1);
@@ -323,6 +523,7 @@ static void *processing_thread(void *data)
         fprintf(stderr, "Allocating event buffer failed\n");
         abort();
     }
+
 
     iallocs[q] = &ia;
     __sync_fetch_and_add(&n_ready, 1);
@@ -336,20 +537,25 @@ static void *processing_thread(void *data)
         }
 
         for (i = 0; i < n; i++) {
-            if ((evs[i].events & (EPOLLERR | EPOLLHUP)) != 0) {
-                fprintf(stderr, "[%u] epoll error on listener\n", q);
-                abort();
-            }
-            if ((evs[i].events & EPOLLIN) == EPOLLIN) {
-                total_reqs += process_datagrams(&ia, lfd);
+            c = evs[i].data.ptr;
+            if (c == NULL) {
+                /* the listening socket */
+                if ((evs[i].events != EPOLLIN)) {
+                    fprintf(stderr, "Error on listening socket\n");
+                    abort();
+                }
+
+                accept_connections(epfd, lfd, q);
+            } else {
+                conn_events(&ia, epfd, c, evs[i].events);
             }
         }
 
-        total_clean += clean_log(&ia, n == 0);
-        (void) total_clean;
+        total_clean += clean_log(&ia, 1);
+        total_reqs += n;
     }
 
-    return NULL;
+    return 0;
 }
 
 static void maintenance(void)
@@ -365,19 +571,15 @@ static void maintenance(void)
     }
 }
 
+
 int main(int argc, char *argv[])
 {
     char name[32];
     unsigned num_threads, i;
     pthread_t *pts;
-    int ret;
 
-    ret = settings_init(argc, argv);
-    if (ret == SETTINGS_INIT_HELP) {
-        return EXIT_SUCCESS;
-    }
-    if (ret != SETTINGS_INIT_OK) {
-        return EXIT_FAILURE;
+    if (settings_init(argc, argv) != 0) {
+      return EXIT_FAILURE;
     }
     num_threads = settings.numcores;
 

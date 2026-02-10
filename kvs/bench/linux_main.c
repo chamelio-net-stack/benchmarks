@@ -30,23 +30,26 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
-#include <sys/epoll.h>
 #include <string.h>
 #include <pthread.h>
-#include <sched.h>
 #include <signal.h>
 #include <netdb.h>
 #include <errno.h>
 #include <assert.h>
 #include <locale.h>
 #include <inttypes.h>
+#include <sched.h>
+#include <sys/epoll.h>
 
 #include <protocol_binary.h>
 
 #include "benchmark.h"
-#include "../../utils/clock.h"
+#include "sock.h"
+
+# include <sys/epoll.h>
 
 #define MIN(a,b) ((b) < (a) ? (b) : (a))
 
@@ -126,8 +129,6 @@ struct core {
     uint64_t id;
     pthread_t pthread;
     uint16_t conn_pending;
-    double tokens;
-    uint64_t last_token_nanos;
 
     uint32_t msgs_pending;
     struct connection *q_first;
@@ -136,37 +137,9 @@ struct core {
 
 static inline uint64_t get_nanos(void)
 {
-    return now_ns();
-}
-
-static inline void refill_tokens(struct core *c)
-{
-    uint64_t now;
-    double elapsed_s;
-    double max_tokens;
-
-    if (settings.rate <= 0.0) {
-        return;
-    }
-
-    now = get_nanos();
-    if (c->last_token_nanos == 0) {
-        c->last_token_nanos = now;
-        return;
-    }
-
-    elapsed_s = (double) (now - c->last_token_nanos) / 1000000000.0;
-    c->tokens += elapsed_s * settings.rate;
-
-    max_tokens = settings.rate / 1000.0;
-    if (max_tokens < 1.0) {
-        max_tokens = 1.0;
-    }
-    if (c->tokens > max_tokens) {
-        c->tokens = max_tokens;
-    }
-
-    c->last_token_nanos = now;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return (uint64_t) ts.tv_sec * 1000 * 1000 * 1000 + ts.tv_nsec;
 }
 
 static inline void record_latency(struct core *c, uint64_t nanos)
@@ -188,17 +161,6 @@ static inline uint64_t read_cnt(uint64_t *p)
 }
 #endif
 
-static inline int set_nonblock(int fd)
-{
-    int flag;
-
-    if ((flag = fcntl(fd, F_GETFL, 0)) == -1) {
-        return -1;
-    }
-    flag |= O_NONBLOCK;
-    return fcntl(fd, F_SETFL, flag);
-}
-
 /* Open connection */
 static inline void conn_connect(struct core *c, struct connection *co)
 {
@@ -210,7 +172,7 @@ static inline void conn_connect(struct core *c, struct connection *co)
     CONN_DEBUG(c, co, "Opening new connection\n");
 
     /* create socket */
-    if ((fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP))
+    if ((fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP))
         < 0)
     {
         perror("creating socket failed");
@@ -228,9 +190,7 @@ static inline void conn_connect(struct core *c, struct connection *co)
     ev.data.ptr = co;
     ev.events = EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLERR;
     if (epoll_ctl(c->ep, EPOLL_CTL_ADD, fd, &ev) < 0) {
-        perror("epoll_ctl add failed");
-        fprintf(stderr, "[%d] adding to epoll failed\n", cn);
-        abort();
+      fprintf(stderr, "[%d] adding to epoll failed\n", cn);
     }
 
     /* initialize address of socket */
@@ -250,8 +210,7 @@ static inline void conn_connect(struct core *c, struct connection *co)
         co->state = CONN_CONNECTING;
     } else {
         /* opening connection failed */
-        perror("connect failed");
-        fprintf(stderr, "[%d] connect failed: %d errno=%d\n", cn, ret, errno);
+        fprintf(stderr, "[%d] connect failed: %d\n", cn, ret);
         abort();
     }
 
@@ -298,22 +257,27 @@ static inline int conn_recv(struct core *c, struct connection *co,
     size_t reqlen;
     ssize_t ret;
 
-    ret = recv(co->fd, co->rx_buf, BUFSIZE, 0);
-    if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        return 1;
-    } else if (ret <= 0) {
-        fprintf(stderr, "[%d] recv failed: %d\n", cn, (int) ret);
-        abort();
-        return -1;
+    /* while response incomplete: receive more */
+    while (co->rx_len < sizeof(*res) ||
+            co->rx_len < sizeof(*res) + ntohl(res->response.bodylen))
+    {
+        ret = read(co->fd, (uint8_t *) co->rx_buf + co->rx_len,
+            BUFSIZE - co->rx_len);
+
+        if (ret > 0) {
+            co->rx_len += ret;
+        } else if (ret < 0 && errno == EAGAIN) {
+            /* nothing to receive */
+            return 1;
+        } else {
+            /* errror, close connection */
+            fprintf(stderr, "[%d] read failed: %d\n", cn, (int) ret);
+            abort();
+            return -1;
+        }
     }
-    co->rx_len = ret;
 
     /* response is complete now */
-    if (co->rx_len < sizeof(*res)) {
-        fprintf(stderr, "[%d] short response: %u\n", cn, co->rx_len);
-        return -1;
-    }
-
     if (res->response.magic != PROTOCOL_BINARY_RES) {
         fprintf(stderr, "[%d] invalid magic on response: %x\n", cn,
                 res->response.magic);
@@ -321,11 +285,6 @@ static inline int conn_recv(struct core *c, struct connection *co,
     }
 
     reqlen = sizeof(*res) + ntohl(res->response.bodylen);
-    if (co->rx_len < reqlen) {
-        fprintf(stderr, "[%d] truncated response: got %u need %zu\n", cn,
-                co->rx_len, reqlen);
-        return -1;
-    }
 
     if (res->response.opcode == PROTOCOL_BINARY_CMD_GET) {
         *op = WL_OP_GET;
@@ -338,7 +297,11 @@ static inline int conn_recv(struct core *c, struct connection *co,
     *err = ntohs(res->response.status);
     *opaque = res->response.opaque;
 
-    co->rx_len = 0;
+    if (co->rx_len > reqlen) {
+        memmove(co->rx_buf, (uint8_t *) co->rx_buf + reqlen,
+                co->rx_len - reqlen);
+    }
+    co->rx_len -= reqlen;
     return 0;
 }
 
@@ -347,33 +310,31 @@ static inline int conn_send(struct core *c, struct connection *co)
 {
     int cn;
     ssize_t ret;
-    //uint64_t tsc;
 
     assert(co->tx_len > 0);
-    assert(co->tx_off == 0);
+    assert(co->tx_off < co->tx_len);
 
     cn = c->id;
 
-    //tsc = get_nanos();
-    ret = send(co->fd, co->tx_buf, co->tx_len, 0);
-    //STATS_ADD(c, tx_nanos, get_nanos() - tsc);
-    //STATS_ADD(c, tx_calls, 1);
-    if (ret == (ssize_t) co->tx_len) {
-        co->tx_off = 0;
-        co->tx_len = 0;
-        return 0;
-    } else if (ret > 0) {
-        fprintf(stderr, "[%d] partial udp send: %zd of %u\n", cn, ret, co->tx_len);
-        abort();
-        return -1;
-    } else if (ret < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+    ret = write(co->fd, (uint8_t *) co->tx_buf + co->tx_off,
+            co->tx_len - co->tx_off);
+
+    if (ret > 0) {
+        co->tx_off += ret;
+        if (co->tx_off == co->tx_len) {
+            /* sent whole message */
+            co->tx_off = 0;
+            co->tx_len = 0;
+            return 0;
+        } else {
+            return 1;
+        }
+    } else if (ret < 0 && errno != EAGAIN) {
         /* send failed */
-        fprintf(stderr, "[%d] send failed: %d\n", cn, (int) ret);
+        fprintf(stderr, "[%d] write failed: %d\n", cn, (int) ret);
         abort();
         return -1;
-    } else if (ret < 0 &&
-            (errno == EAGAIN || errno == EWOULDBLOCK))
-    {
+    } else if (ret < 0 && errno == EAGAIN) {
         /* send would block */
         return 1;
     }
@@ -458,7 +419,9 @@ static void poll_conns(struct core *c, int timeout)
         /* we only exepect events for connections that are currently
          * connecting. */
         if (co->state != CONN_CONNECTING) {
-            continue;
+            fprintf(stderr, "[%d] wait_conns event on non-connecting "
+                    "connection\n", cn);
+            abort();
         }
 
         /* check for errors on the connection */
@@ -469,7 +432,8 @@ static void poll_conns(struct core *c, int timeout)
 
         /* check connection state */
         slen = sizeof(status);
-        if (getsockopt(co->fd, SOL_SOCKET, SO_ERROR, &status, &slen) < 0)
+        if (getsockopt(co->fd, SOL_SOCKET, SO_ERROR,
+                    &status, &slen) < 0)
         {
             fprintf(stderr, "[%d] wait_conns getsockopt failed\n", cn);
             abort();
@@ -522,8 +486,6 @@ static void prepare_core(struct core *c)
 
     /* Initiate connections */
     c->conn_pending = 0;
-    c->tokens = 0.0;
-    c->last_token_nanos = 0;
     c->msgs_pending = 0;
     c->q_first = c->q_last = NULL;
     for (i = 0; i < settings.conns; i++) {
@@ -534,21 +496,8 @@ static void prepare_core(struct core *c)
         c->conns[i].tx_buf = buf + BUFSIZE;
         c->conns[i].state = CONN_CONNECTING;
         c->conns[i].fd = -1;
+        c->conn_pending++;
         conn_connect(c, &c->conns[i]);
-        if (c->conns[i].state == CONN_CONNECTING) {
-            c->conn_pending++;
-        } else {
-            conn_epupdate(c, &c->conns[i], 0);
-            c->conns[i].next = NULL;
-            if (c->q_last == NULL) {
-                c->q_last = &c->conns[i];
-                c->q_first = &c->conns[i];
-            } else {
-                c->q_last->next = &c->conns[i];
-                c->q_last = &c->conns[i];
-            }
-        }
-
         while (c->conn_pending >= 16) {
             poll_conns(c, 0);
         }
@@ -720,14 +669,8 @@ static inline void send_pending(struct core *c)
     enum workload_op op = 0;
     struct key *k;
 
-    refill_tokens(c);
-
     /* send out new requests */
-    while (c->q_first != NULL) {
-        if (settings.rate > 0.0 && c->tokens < 1.0) {
-            break;
-        }
-
+    while (c->msgs_pending < settings.pending && c->q_first != NULL) {
         co = c->q_first;
         c->q_first = co->next;
         if (c->q_first == NULL)
@@ -754,9 +697,6 @@ static inline void send_pending(struct core *c)
 
         co->pending++;
         c->msgs_pending++;
-        if (settings.rate > 0.0) {
-            c->tokens -= 1.0;
-        }
     }
 }
 
@@ -818,10 +758,8 @@ static void *thread_run(void *arg)
     send_pending(c);
 
     while (phase == BENCHMARK_RUNNING) {
-        /* poll periodically when rate-limited so tokens can refill */
-        if ((ret = epoll_wait(ep, evs, num_evs,
-                settings.rate > 0.0 ? 1 : -1)) < 0)
-        {
+        /* epoll, wait for events */
+        if ((ret = epoll_wait(ep, evs, num_evs, -1)) < 0) {
             fprintf(stderr, "[%d] epoll_wait failed\n", cn);
             abort();
         }
@@ -866,19 +804,12 @@ int main(int argc, char *argv[])
 {
     int i, j, num_threads;
     struct core *cs;
-    uint64_t t_prev, t_cur, t_start, t_end;
+    uint64_t t_prev, t_cur;
     long double *ttp, tp, tp_total;
-    uint32_t *hist, hx, sec_elapsed;
-    uint64_t msg_total, cnt_success;
-    uint64_t total_success = 0;
-    uint64_t total_tx_get = 0, total_tx_set = 0;
-    uint64_t total_rx_get = 0, total_rx_set = 0, total_rx_fail = 0;
-    uint64_t total_tx, total_rx;
-    double elapsed_s;
+    uint32_t *hist, hx;
+    uint64_t msg_total;
     double fracs[6] = { 0.5, 0.9, 0.95, 0.99, 0.999, 0.9999 };
     size_t fracs_pos[sizeof(fracs) / sizeof(fracs[0])];
-    double summary_fracs[3] = { 0.5, 0.99, 0.999 };
-    size_t summary_pos[sizeof(summary_fracs) / sizeof(summary_fracs[0])];
 
     setlocale(LC_NUMERIC, "");
 
@@ -917,9 +848,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    //sleep(10);
     phase = BENCHMARK_PRELOAD;
-    //sleep(10);
     phase = BENCHMARK_WARMUP;
 
     while (init_count < num_threads) {
@@ -929,19 +858,16 @@ int main(int argc, char *argv[])
     fflush(stdout);
     phase = BENCHMARK_RUNNING;
 
-    t_start = get_nanos();
-    t_prev = t_start;
 
+
+    t_prev = get_nanos();
     while (1) {
         sleep(1);
         t_cur = get_nanos();
         tp_total = 0;
         msg_total = 0;
-        sec_elapsed = (uint32_t) ((t_cur - t_start) / 1000000000ULL);
         for (i = 0; i < num_threads; i++) {
-            cnt_success = read_cnt(&cs[i].rx_success);
-            total_success += cnt_success;
-            tp = cnt_success;
+            tp = read_cnt(&cs[i].rx_success);
             tp /= (double) (t_cur - t_prev) / 1000000000.;
             ttp[i] = tp;
             tp_total += tp;
@@ -957,10 +883,9 @@ int main(int argc, char *argv[])
                 sizeof(fracs) / sizeof(fracs[0]));
 
 
-        printf("[ %3us ] tp=%'.0Lf rps | tp=%'.4Lf mops | "
-                "p50=%d us  p90=%d us  p95=%d us  p99=%d us  "
-                "p99.9=%d us  p99.99=%d us\n",
-                sec_elapsed, tp_total, tp_total / 1000000.,
+        printf("TP: total=%'.4Lf mops  50p=%d us  90p=%d us  95p=%d us  "
+                "99p=%d us  99.9p=%d us  99.99p=%d us  \n",
+                tp_total / 1000000.,
                 hist_value(fracs_pos[0]), hist_value(fracs_pos[1]),
                 hist_value(fracs_pos[2]), hist_value(fracs_pos[3]),
                 hist_value(fracs_pos[4]), hist_value(fracs_pos[5]));
@@ -1004,72 +929,6 @@ int main(int argc, char *argv[])
         fflush(stdout);
         memset(hist, 0, sizeof(*hist) * HIST_BUCKETS);
 
-        if (settings.run_time > 0 &&
-                t_cur - t_start >= (uint64_t) settings.run_time * 1000000000ULL)
-        {
-            break;
-        }
-
         t_prev = t_cur;
     }
-
-    phase = BENCHMARK_DONE;
-    for (i = 0; i < num_threads; i++) {
-        pthread_join(cs[i].pthread, NULL);
-    }
-    t_end = get_nanos();
-
-    elapsed_s = (double) (t_end - t_start) / 1000000000.0;
-    if (elapsed_s <= 0.0) {
-        elapsed_s = 1.0;
-    }
-
-    for (i = 0; i < num_threads; i++) {
-        total_success += read_cnt(&cs[i].rx_success);
-        total_tx_get += read_cnt(&cs[i].tx_get);
-        total_tx_set += read_cnt(&cs[i].tx_set);
-        total_rx_get += read_cnt(&cs[i].rx_get);
-        total_rx_set += read_cnt(&cs[i].rx_set);
-        total_rx_fail += read_cnt(&cs[i].rx_fail);
-    }
-
-    memset(hist, 0, sizeof(*hist) * HIST_BUCKETS);
-    msg_total = 0;
-    for (i = 0; i < num_threads; i++) {
-        for (j = 0; j < HIST_BUCKETS; j++) {
-            hx = cs[i].hist[j];
-            msg_total += hx;
-            hist[j] += hx;
-        }
-    }
-    if (msg_total > 0) {
-        hist_fract_buckets(hist, msg_total, summary_fracs, summary_pos,
-                sizeof(summary_fracs) / sizeof(summary_fracs[0]));
-    } else {
-        memset(summary_pos, 0, sizeof(summary_pos));
-    }
-
-    total_tx = total_tx_get + total_tx_set;
-    total_rx = total_rx_get + total_rx_set;
-
-    printf("Cores               : %d\n", num_threads);
-    printf("Duration            : %.2f s\n", elapsed_s);
-    printf("TX requests         : %" PRIu64 "\n", total_tx);
-    printf("RX responses        : %" PRIu64 "\n", total_success);
-    printf("RX decoded ops      : %" PRIu64 "\n", total_rx);
-    printf("RX failures         : %" PRIu64 "\n", total_rx_fail);
-    printf("Avg Load            : %.0f rps %.4f mops\n",
-            (double) total_tx / elapsed_s, (double) total_tx / elapsed_s / 1000000.0);
-    printf("Avg Throughput      : %.0f rps %.4f mops\n",
-            (double) total_success / elapsed_s,
-            (double) total_success / elapsed_s / 1000000.0);
-    printf("Latency percentiles : p50=%d us  p99=%d us  p99.9=%d us\n",
-            hist_value(summary_pos[0]), hist_value(summary_pos[1]),
-            hist_value(summary_pos[2]));
-
-    free(hist);
-    free(ttp);
-    free(cs);
-
-    return 0;
 }

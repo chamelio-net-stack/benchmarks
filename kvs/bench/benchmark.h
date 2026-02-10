@@ -57,6 +57,7 @@ struct settings {
     uint32_t run_time;
     uint16_t keysize;
     uint16_t valuesize;
+    uint32_t pending;
 
     uint8_t batchsize;
 

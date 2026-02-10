@@ -1,5 +1,5 @@
-#ifndef CHAMELIO_BENCH_HIST_H
-#define CHAMELIO_BENCH_HIST_H
+#ifndef UTILS_HIST_H_
+#define UTILS_HIST_H_
 
 #include <stdbool.h>
 #include <linux/types.h>

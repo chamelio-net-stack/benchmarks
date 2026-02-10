@@ -1,5 +1,5 @@
-#ifndef CHAMELIO_BENCH_CLOCK_H
-#define CHAMELIO_BENCH_CLOCK_H
+#ifndef UTILS_CLOCK_H_
+#define UTILS_CLOCK_H_
 
 #include <linux/types.h>
 
