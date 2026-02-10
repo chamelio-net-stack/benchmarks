@@ -44,23 +44,3 @@ kvsbench_linux = executable(
 
 alias_target('kvs', [flexkvs_linux, kvsbench_linux])
 alias_target('kvs_linux', [flexkvs_linux, kvsbench_linux])
-flexkvs_linux
-if cham_enabled
-  kvs_cham_deps = kvs_deps + [cham_deps]
-
-  flexkvs_cham = executable(
-    'flexkvs_cham',
-    kvs_server_common + files('server/cham_main.c'),
-    include_directories: [kvs_inc, utils_inc],
-    dependencies: kvs_cham_deps,
-  )
-
-  kvsbench_cham = executable(
-    'kvsbench_cham',
-    kvs_bench_common + files('bench/cham_main.c') + clock_util_src,
-    include_directories: [kvs_inc, utils_inc],
-    dependencies: kvs_cham_deps,
-  )
-
-  alias_target('kvs_cham', [flexkvs_cham, kvsbench_cham])
-endif

@@ -47,24 +47,16 @@ struct settings {
     double clean_ratio;
     /** UDP port to listen on */
     uint16_t udpport;
-    /** Local/bind IPv4 in host order */
-    uint32_t srcip;
-    /** Local/bind UDP port */
-    uint16_t srcport;
     /** Verbosity for log messages. */
     uint8_t verbose;
     /** Number of cores */
     uint8_t numcores;
+    /** Config file */
+    char *config_file;
 };
 
 /** Global settings */
 extern struct settings settings;
-
-enum settings_init_result {
-    SETTINGS_INIT_OK = 0,
-    SETTINGS_INIT_ERR = -1,
-    SETTINGS_INIT_HELP = 1,
-};
 
 /** Initialize global settings from command-line. */
 int settings_init(int argc, char *argv[]);

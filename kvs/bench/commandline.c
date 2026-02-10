@@ -25,23 +25,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
 #include <getopt.h>
 #include <arpa/inet.h>
+#include <stdint.h>
 
 #include "benchmark.h"
 
-static int parse_ipv4_addr(const char *addr_s, uint32_t *addr_out)
-{
-    struct in_addr addr;
-
-    if (inet_pton(AF_INET, addr_s, &addr) != 1) {
-        return -1;
-    }
-
-    *addr_out = ntohl(addr.s_addr);
-    return 0;
-}
+static int parse_ipv4(const char *s, uint32_t *ip);
 
 void print_usage(void)
 {
@@ -50,8 +40,7 @@ void print_usage(void)
         "Options:\n"
         "  -t, --threads=COUNT   Number of sending threads [default 1].\n"
         "  -C, --connns=COUNT    # connections / thread    [default 1].\n"
-        "      --rate=RPS        Request rate / thread      [default 0=max].\n"
-        "  -b, --batch-size=N    Max in-flight reqs / conn [default 32].\n"
+        "  -p, --pending=NUM     Number of pend. req/conn. [default 1].\n"
         "  -k, --key-size=BYTES  Key size in bytes         [default 32].\n"
         "  -n, --key-num=COUNT   Number of keys            [default 1000].\n"
         "  -u, --key-uniform     Uniform key distribution  [default]\n"
@@ -59,11 +48,7 @@ void print_usage(void)
         "                        S is the zipf parameter.\n"
         "  -v, --val-size=BYTES  Value size in bytes       [default 1024].\n"
         "  -g, --get-prob=PROB   Probability of GET Reqs.  [default .9].\n"
-        "  -d, --duration=SECS   Benchmark duration in [s] [default 0].\n"
-        "      --src-ip=IP       Source/bind IPv4 address  [default 0.0.0.0].\n"
-        "      --src-port=PORT   Source/bind UDP port      [default 0].\n"
-        "      --rem-ip=IP       Remote IPv4 address (alt to dst-ip:dst-port).\n"
-        "      --rem-port=P      Remote UDP port (alt to dst-ip:dst-port).\n"
+        "  -T, --time=SECS       Measurement time in [s].  [default 10].\n"
         "  -w, --warmup=SECS     Warmup time [s].          [default 5].\n"
         "  -c, --cooldown=SECS   Cooldown time [s].        [default 5].\n"
         "  -s, --key-seed=SEED   Seed for key PRG.\n"
@@ -74,11 +59,9 @@ void print_usage(void)
 
 void init_settings(struct settings *s)
 {
-    s->srcip = 0;
-    s->srcport = 0;
     s->threads = 1;
     s->conns = 1;
-    s->rate = 0.0;
+    s->pending = 1;
     s->keysize = 32;
     s->keynum = 1000;
     s->keydist = DIST_UNIFORM;
@@ -86,7 +69,7 @@ void init_settings(struct settings *s)
     s->get_prob = 0.9;
     s->warmup_time = 5;
     s->cooldown_time = 5;
-    s->run_time = 0;
+    s->run_time = 10;
     s->request_gap = 100 * 1000;
     s->key_seed = 0x123457890123ULL;
     s->op_seed =  0x987654321098ULL;
@@ -96,46 +79,27 @@ void init_settings(struct settings *s)
 
 int parse_settings(int argc, char *argv[], struct settings *s)
 {
-    enum {
-        OPT_SRC_IP = 1000,
-        OPT_SRC_PORT,
-        OPT_REMOTE_IP,
-        OPT_REMOTE_PORT,
-        OPT_RATE,
-    };
     static struct option long_opts[] = {
             {"threads",     required_argument, NULL, 't'},
             {"conns",       required_argument, NULL, 'C'},
-            {"rate",        required_argument, NULL, OPT_RATE},
-            {"batch-size",  required_argument, NULL, 'b'},
+            {"pending",     required_argument, NULL, 'p'},
             {"key-size",    required_argument, NULL, 'k'},
             {"key-num",     required_argument, NULL, 'n'},
             {"key-uniform", no_argument,       NULL, 'u'},
             {"key-zipf",    required_argument, NULL, 'z'},
             {"val-size",    required_argument, NULL, 'v'},
             {"get-prob",    required_argument, NULL, 'g'},
-            {"duration",    required_argument, NULL, 'd'},
-            {"src-ip",      required_argument, NULL, OPT_SRC_IP},
-            {"src-port",    required_argument, NULL, OPT_SRC_PORT},
-            {"rem-ip",      required_argument, NULL, OPT_REMOTE_IP},
-            {"rem-port",    required_argument, NULL, OPT_REMOTE_PORT},
-            {"remote-ip",   required_argument, NULL, OPT_REMOTE_IP},
-            {"remote-port", required_argument, NULL, OPT_REMOTE_PORT},
+            {"time",        required_argument, NULL, 'T'},
             {"warmup",      required_argument, NULL, 'w'},
             {"cooldown",    required_argument, NULL, 'c'},
+            {"delay",       required_argument, NULL, 'd'},
             {"key-seed",    required_argument, NULL, 's'},
             {"op-seed",     required_argument, NULL, 'o'},
             {"keysteer",    no_argument,       NULL, 'K'},
         };
-    static const char *short_opts = "t:C:b:k:n:uz:v:g:d:w:c:s:o:r:K";
+    static const char *short_opts = "t:C:p:k:n:uz:v:g:T:w:c:d:s:o:r:K";
     int c, opt_idx, done = 0;
     char *end;
-    unsigned long port_ul;
-    uint32_t srcip = 0, dstip = 0;
-    uint16_t srcport = 0, dstport = 0;
-    int have_src_ip = 0, have_src_port = 0;
-    int have_dst_ip = 0, have_dst_port = 0;
-    int opt_dst_ip = 0, opt_dst_port = 0;
 
     while (!done) {
         c = getopt_long(argc, argv, short_opts, long_opts, &opt_idx);
@@ -156,24 +120,14 @@ int parse_settings(int argc, char *argv[], struct settings *s)
                     return -1;
                 }
                 break;
-            case OPT_RATE:
-                s->rate = strtod(optarg, &end);
-                if (!*optarg || *end || s->rate < 0.0) {
-                    fprintf(stderr, "rate needs to be a non-negative "
-                            "number (requests/s)\n");
+            case 'p':
+                s->pending = strtoul(optarg, &end, 10);
+                if (!*optarg || *end || s->pending < 1) {
+                    fprintf(stderr, "pending needs to be a positive "
+                            "integer\n");
                     return -1;
                 }
                 break;
-            case 'b': {
-                unsigned long bs = strtoul(optarg, &end, 10);
-                if (!*optarg || *end || bs < 1 || bs > UINT8_MAX) {
-                    fprintf(stderr, "batch-size needs to be an integer in "
-                            "[1, %u]\n", UINT8_MAX);
-                    return -1;
-                }
-                s->batchsize = (uint8_t) bs;
-                break;
-            }
 
             case 'k':
                 s->keysize = strtoul(optarg, &end, 10);
@@ -220,47 +174,13 @@ int parse_settings(int argc, char *argv[], struct settings *s)
                     return -1;
                 }
                 break;
-            case 'd':
+            case 'T':
                 s->run_time = strtoul(optarg, &end, 10);
-                if (!*optarg || *end) {
-                    fprintf(stderr, "Run time needs to be a non-negative "
+                if (!*optarg || *end || s->run_time < 1) {
+                    fprintf(stderr, "Run time needs to be a positive "
                             "integer\n");
                     return -1;
                 }
-                break;
-            case OPT_SRC_IP:
-                if (parse_ipv4_addr(optarg, &srcip) != 0) {
-                    fprintf(stderr, "Parsing source ip address failed\n");
-                    return -1;
-                }
-                have_src_ip = 1;
-                break;
-            case OPT_SRC_PORT:
-                port_ul = strtoul(optarg, &end, 10);
-                if (!*optarg || *end || port_ul == 0 || port_ul > 65535) {
-                    fprintf(stderr, "Source port needs to be an integer.\n");
-                    return -1;
-                }
-                srcport = (uint16_t) port_ul;
-                have_src_port = 1;
-                break;
-            case OPT_REMOTE_IP:
-                if (parse_ipv4_addr(optarg, &dstip) != 0) {
-                    fprintf(stderr, "Parsing remote ip address failed\n");
-                    return -1;
-                }
-                have_dst_ip = 1;
-                opt_dst_ip = 1;
-                break;
-            case OPT_REMOTE_PORT:
-                port_ul = strtoul(optarg, &end, 10);
-                if (!*optarg || *end || port_ul == 0 || port_ul > 65535) {
-                    fprintf(stderr, "Remote port needs to be an integer.\n");
-                    return -1;
-                }
-                dstport = (uint16_t) port_ul;
-                have_dst_port = 1;
-                opt_dst_port = 1;
                 break;
             case 'w':
                 s->warmup_time = strtoul(optarg, &end, 10);
@@ -274,6 +194,14 @@ int parse_settings(int argc, char *argv[], struct settings *s)
                 s->cooldown_time = strtoul(optarg, &end, 10);
                 if (!*optarg || *end) {
                     fprintf(stderr, "Cool down time needs to be a positive "
+                            "integer\n");
+                    return -1;
+                }
+                break;
+            case 'd':
+                s->request_gap = strtoul(optarg, &end, 10);
+                if (!*optarg || *end) {
+                    fprintf(stderr, "Delay needs to be a positive "
                             "integer\n");
                     return -1;
                 }
@@ -305,52 +233,39 @@ int parse_settings(int argc, char *argv[], struct settings *s)
         }
     }
 
-    if (optind + 1 == argc) {
-        if (opt_dst_ip || opt_dst_port) {
-            fprintf(stderr, "cannot mix positional dst-ip:dst-port with "
-                    "--remote-ip/--remote-port\n");
-            return -1;
-        }
-        /* separate ip and port at colon */
-        if ((end = strchr(argv[optind], ':')) == NULL) {
-            fprintf(stderr, "Colon separating IP and port not found\n");
-            return -1;
-        }
-        *end = '\0';
-        end++;
-
-        if (parse_ipv4_addr(argv[optind], &dstip) != 0) {
-            fprintf(stderr, "Parsing ip address failed\n");
-            return -1;
-        }
-        port_ul = strtoul(end, &end, 10);
-        if (*end != '\0' || port_ul == 0 || port_ul > 65535) {
-            fprintf(stderr, "Parsing remote port failed\n");
-            return -1;
-        }
-        dstport = (uint16_t) port_ul;
-        have_dst_ip = have_dst_port = 1;
-    } else if (optind != argc) {
+    if (optind + 1 != argc) {
         return -1;
     }
 
-    if (!have_dst_ip || !have_dst_port) {
-        fprintf(stderr, "remote endpoint required (dst-ip:dst-port or "
-                "--rem-ip/--rem-port)\n");
+    /* separate ip and port at colon */
+    if ((end = strchr(argv[optind], ':')) == NULL) {
+        fprintf(stderr, "Colon separating IP and port not found\n");
         return -1;
     }
-    if (!have_src_ip) {
-        srcip = 0;
+    *end = '\0';
+    end++;
+
+    /* parse ip */
+    if (parse_ipv4(argv[optind], &s->dstip) != 0) {
+        fprintf(stderr, "Parsing ip address failed\n");
+        return -1;
     }
-    if (!have_src_port) {
-        srcport = 0;
-    }
-    s->srcip = srcip;
-    s->srcport = srcport;
-    s->dstip = dstip;
-    s->dstport = dstport;
+
+    /* parse port */
+    s->dstport = strtoul(end, NULL, 10);
 
     // TODO: ensure key size / key num combination is valid
 
     return 0;
+}
+
+static int parse_ipv4(const char *s, uint32_t *ip)
+{
+  if (inet_pton(AF_INET, s, ip) != 1) 
+  {
+    return -1;
+  }
+  
+  *ip = htonl(*ip);
+  return 0;
 }

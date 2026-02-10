@@ -33,13 +33,11 @@ enum key_dist {
 };
 
 struct settings {
-    uint32_t srcip;
-    uint16_t srcport;
     uint32_t dstip;
     uint16_t dstport;
     uint16_t threads;
     uint16_t conns;
-    double rate;
+    uint16_t pending;
 
     uint32_t keynum;
     union {
@@ -57,7 +55,6 @@ struct settings {
     uint32_t run_time;
     uint16_t keysize;
     uint16_t valuesize;
-    uint32_t pending;
 
     uint8_t batchsize;
 
