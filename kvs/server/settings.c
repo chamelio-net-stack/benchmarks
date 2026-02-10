@@ -24,6 +24,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 
 #include "iokvs.h"
 
@@ -31,6 +32,9 @@ struct settings settings;
 
 int settings_init(int argc, char *argv[])
 {
+    char *end;
+    unsigned long n;
+
     settings.udpport = 11211;
     settings.verbose = 1;
     settings.segsize = 256 * 1024;
@@ -38,11 +42,22 @@ int settings_init(int argc, char *argv[])
     settings.segcqsize = 32 * 1024;
     settings.clean_ratio = 0.8;
 
-    if (argc != 3) {
-        fprintf(stderr, "Usage: flexkvs THREADS\n");
+    if (argc != 2) {
+        fprintf(stderr,
+            "Usage: flexkvs THREADS [--ip IPv4] [--port PORT]\n"
+            "  THREADS: number of worker threads (1..255)\n"
+            "  --ip: bind IPv4 address (default 0.0.0.0)\n"
+            "  --port: bind TCP port (default 11211)\n");
         return -1;
     }
 
-    settings.numcores = atoi(argv[2]);
+    errno = 0;
+    n = strtoul(argv[1], &end, 10);
+    if (errno != 0 || argv[1][0] == '\0' || *end != '\0' || n == 0 || n > 255) {
+        fprintf(stderr, "Invalid THREADS value: %s\n", argv[1]);
+        return -1;
+    }
+
+    settings.numcores = (uint8_t) n;
     return 0;
 }
