@@ -39,11 +39,10 @@ int settings_init(int argc, char *argv[])
     settings.clean_ratio = 0.8;
 
     if (argc != 3) {
-        fprintf(stderr, "Usage: flexkvs CONFIG THREADS\n");
+        fprintf(stderr, "Usage: flexkvs THREADS\n");
         return -1;
     }
 
     settings.numcores = atoi(argv[2]);
-    settings.config_file = argv[1];
     return 0;
 }
