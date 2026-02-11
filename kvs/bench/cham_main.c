@@ -167,6 +167,22 @@ static void prepare_core(struct core *c)
     addr->sin_addr.s_addr = htonl(settings.dstip);
     addr->sin_port = htons(settings.dstport);
 
+    /* Core 0 resolves ARP */
+    int arp_size = 8;
+    if (c->id == 0)
+    {
+        udp_sendto(c->ctx, c->fd, c->tx_buf, arp_size, 
+            (struct sockaddr *) &c->addr, sizeof(c->addr));
+        sleep(1);
+        udp_sendto(c->ctx, c->fd, c->tx_buf, arp_size, 
+            (struct sockaddr *) &c->addr, sizeof(c->addr));
+        sleep(1);
+        while(udp_poll_fast(c->ctx) == 0);
+        while(udp_recvfrom(c->ctx, c->fd, c->rx_buf, 
+            arp_size, NULL, 0) == 0);
+        fprintf(stderr, "Resolved ARP\n");
+    }
+
     reqs_per_s = (double) settings.rate * 1000.0;
     c->reqs_per_us = reqs_per_s / 1000000.0;
     c->token_cap = reqs_per_s;
@@ -219,6 +235,10 @@ static int core_rx(struct core *c, enum workload_op *op, uint16_t *err,
         perror("recv failed");
         return -1;
     }
+
+    /* Nothing to receive */
+    if (ret == 0)
+        return 0;
 
     if (ret < (ssize_t) sizeof(*res)) {
         fprintf(stderr, "[%"PRIu64"] short response\n", c->id);

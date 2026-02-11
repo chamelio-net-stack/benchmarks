@@ -60,13 +60,20 @@ static volatile size_t n_ready = 0;
 static int core_socket(struct core *c)
 {
     uint16_t id;
-    int fd;
+    int fd, ret;
     struct sockaddr_in si;
 
     id = c->id;
     if ((fd = udp_socket(c->ctx)) < 0) {
         fprintf(stderr, "[%u] socket failed\n", id);
         return -1;
+    }
+
+    ret = udp_setsockopt(c->ctx, fd, SO_REUSEPORT);
+    if (ret < 0)
+    {
+        fprintf(stderr, "failed to set sockopt\n");
+        abort();
     }
 
     memset(&si, 0, sizeof(si));
@@ -78,6 +85,18 @@ static int core_socket(struct core *c)
         perror("bind failed");
         fprintf(stderr, "[%u] bind failed\n", id);
         return -1;
+    }
+
+    /* Core 0 resolves ARP */
+    int arp_size = 8;
+    if (c->id == 0)
+    {
+        while(udp_poll_fast(c->ctx) == 0){}
+        udp_recvfrom(c->ctx, c->fd, c->rx_buf, arp_size, 
+            (struct sockaddr *) &c->peer_addr, sizeof(c->peer_addr_len));
+        udp_sendto(c->ctx, c->fd, c->tx_buf, arp_size, 
+            (struct sockaddr *) &c->peer_addr, sizeof(c->peer_addr_len));
+        printf("ARP initialized\n");
     }
 
     return fd;
