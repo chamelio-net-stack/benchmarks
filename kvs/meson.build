@@ -40,7 +40,7 @@ flexkvs_linux = executable(
   include_directories: [kvs_inc, utils_inc],
   dependencies: kvs_deps,
 )
-alias_target('kvs_linux', [flexkvs_linux, kvsbench_linux])
+alias_target('kvs_linux', [kvsbench_linux, flexkvs_linux])
 
 if cham_enabled
   kvsbench_cham = executable(
@@ -55,5 +55,5 @@ if cham_enabled
     include_directories: [kvs_inc, utils_inc],
     dependencies : [kvs_deps, cham_deps],
   )
-  alias_target('kvs_cham', [udp_cham_client, udp_cham_server])
+  alias_target('kvs_cham', [kvsbench_cham, flexkvs_cham])
 endif
