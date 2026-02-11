@@ -91,11 +91,15 @@ static int core_socket(struct core *c)
     int arp_size = 8;
     if (c->id == 0)
     {
-        while(udp_poll_fast(c->ctx) == 0){}
-        udp_recvfrom(c->ctx, c->fd, c->rx_buf, arp_size, 
-            (struct sockaddr *) &c->peer_addr, sizeof(c->peer_addr_len));
-        udp_sendto(c->ctx, c->fd, c->tx_buf, arp_size, 
-            (struct sockaddr *) &c->peer_addr, sizeof(c->peer_addr_len));
+        ssize_t n;
+        while (udp_poll_fast(c->ctx) == 0) {
+        }
+        n = udp_recvfrom(c->ctx, fd, c->rx_buf, arp_size,
+            (struct sockaddr *) &c->peer_addr, sizeof(c->peer_addr));
+        if (n > 0) {
+            udp_sendto(c->ctx, fd, c->rx_buf, (size_t) n,
+                (struct sockaddr *) &c->peer_addr, sizeof(c->peer_addr));
+        }
         printf("ARP initialized\n");
     }
 
@@ -129,26 +133,30 @@ static int core_tx(struct core *c, size_t tx_len)
 {
     ssize_t ret;
 
-    udp_poll_fast(c->ctx);
-    ret = udp_sendto(c->ctx, c->fd, c->tx_buf, tx_len,
-        (const struct sockaddr *) &c->peer_addr, c->peer_addr_len);
-    if (ret == (ssize_t) tx_len || ret == 0) {
-        return 0;
-    }
+    while (1) {
+        udp_poll_fast(c->ctx);
+        ret = udp_sendto(c->ctx, c->fd, c->tx_buf, tx_len,
+            (const struct sockaddr *) &c->peer_addr, c->peer_addr_len);
+        if (ret == (ssize_t) tx_len) {
+            return 0;
+        }
 
+        if (ret == 0 ||
+            (ret < 0 &&
+             (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)))
+        {
+            sched_yield();
+            continue;
+        }
 
-    if (ret < 0) {
-      fprintf(stderr, "sendto failed\n");
-      return -1;
-    }
+        if (ret > 0) {
+            fprintf(stderr, "[%u] short sendto: %zd of %zu\n", c->id, ret, tx_len);
+            return -1;
+        }
 
-    if (ret >= 0) {
-        fprintf(stderr, "[%u] short sendto: %zd of %zu\n", c->id, ret, tx_len);
-    } else {
         perror("sendto failed");
+        return -1;
     }
-
-    return -1;
 }
 
 static size_t process_request(struct core *c, ssize_t rx_len)

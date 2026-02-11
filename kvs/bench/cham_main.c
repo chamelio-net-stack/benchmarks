@@ -69,6 +69,7 @@ struct settings settings;
 static struct workload workload;
 static volatile enum benchmark_phase phase;
 static volatile uint16_t init_count = 0;
+static volatile uint16_t arp_ready = 0;
 
 struct core {
 #ifdef PRINT_STATS
@@ -146,6 +147,7 @@ static void prepare_core(struct core *c)
         fprintf(stderr, "[%"PRIu64"] allocating rx/tx buffer failed\n", c->id);
         abort();
     }
+    memset(c->rx_buf, 0, BUFSIZE * 2);
     c->tx_buf = c->rx_buf + BUFSIZE;
 
     c->hist = calloc(HIST_BUCKETS, sizeof(*c->hist));
@@ -181,6 +183,11 @@ static void prepare_core(struct core *c)
         while(udp_recvfrom(c->ctx, c->fd, c->rx_buf, 
             arp_size, NULL, 0) == 0);
         fprintf(stderr, "Resolved ARP\n");
+        __sync_fetch_and_add(&arp_ready, 1);
+    } else {
+        while (__sync_fetch_and_add(&arp_ready, 0) == 0) {
+            sched_yield();
+        }
     }
 
     reqs_per_s = (double) settings.rate * 1000.0;
@@ -200,22 +207,29 @@ static int core_tx(struct core *c)
     assert(c->tx_len > 0);
 
     while (1) {
+        udp_poll_fast(c->ctx);
         ret = udp_sendto(c->ctx, c->fd, c->tx_buf, c->tx_len, 
             (struct sockaddr *) &c->addr, sizeof(c->addr));
+
         if (ret == (ssize_t) c->tx_len) {
             c->tx_len = 0;
             return 0;
         }
 
-        if (ret < 0 && errno == EINTR) {
+        if (ret == 0 ||
+            (ret < 0 &&
+             (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)))
+        {
+            sched_yield();
             continue;
         }
 
-        if (ret >= 0) {
+        if (ret > 0) {
             fprintf(stderr, "[%"PRIu64"] short send: %zd of %zu\n", c->id, ret, c->tx_len);
-        } else {
-            perror("send failed");
+            return -1;
         }
+
+        perror("send failed");
         return -1;
     }
 }
@@ -227,6 +241,7 @@ static int core_rx(struct core *c, enum workload_op *op, uint16_t *err,
     ssize_t ret;
     size_t reqlen;
 
+    udp_poll_fast(c->ctx);
     ret = udp_recvfrom(c->ctx, c->fd, c->rx_buf, BUFSIZE, NULL, 0);
     if (ret < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
@@ -395,7 +410,6 @@ static void *thread_run(void *arg)
     }
 
     while (phase == BENCHMARK_RUNNING) {
-        uint32_t budget;
         uint32_t sent = 0;
         uint32_t received = 0;
         enum workload_op rx_op;
@@ -406,9 +420,8 @@ static void *thread_run(void *arg)
         int rx_ret;
 
         refill_tokens(c);
-        budget = (uint32_t) c->tokens;
 
-        while (sent < budget && phase == BENCHMARK_RUNNING) {
+        while (c->tokens >= 1.0 && phase == BENCHMARK_RUNNING) {
             struct key *k;
             enum workload_op tx_op;
 
@@ -427,11 +440,11 @@ static void *thread_run(void *arg)
                 abort();
             }
 
+            c->tokens -= 1.0;
             sent++;
         }
-        c->tokens -= (double) sent;
 
-        while (1) {
+        while (phase == BENCHMARK_RUNNING) {
             rx_ret = core_rx(c, &rx_op, &err, &opaque);
             if (rx_ret < 0) {
                 abort();
