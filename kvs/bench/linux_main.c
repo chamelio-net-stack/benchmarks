@@ -42,6 +42,8 @@
 #include <protocol_binary.h>
 
 #include "benchmark.h"
+#include "clock.h"
+#include "sock.h"
 
 #define PRINT_STATS
 #ifdef PRINT_STATS
@@ -59,6 +61,7 @@ enum benchmark_phase {
     BENCHMARK_INIT,
     BENCHMARK_PRELOAD,
     BENCHMARK_RUNNING,
+    BENCHMARK_DONE,
 };
 
 struct settings settings;
@@ -80,10 +83,16 @@ struct core {
     uint8_t *rx_buf;
     uint8_t *tx_buf;
     size_t tx_len;
+    uint64_t last_tsc;
+    double tokens;
+    double reqs_per_us;
+    double token_cap;
     struct workload_core wlc;
     uint64_t id;
     pthread_t pthread;
 } __attribute__((aligned(64)));
+
+static double tsc_per_us;
 
 static inline uint64_t get_nanos(void)
 {
@@ -117,6 +126,7 @@ static inline uint64_t read_cnt(uint64_t *p)
 static void prepare_core(struct core *c)
 {
     struct sockaddr_in addr;
+    double reqs_per_s;
 
     c->rx_buf = malloc(BUFSIZE * 2);
     if (c->rx_buf == NULL) {
@@ -148,6 +158,21 @@ static void prepare_core(struct core *c)
         fprintf(stderr, "[%"PRIu64"] connect failed\n", c->id);
         abort();
     }
+
+    if (set_nonblock(c->fd) != 0) {
+        perror("set_nonblock failed");
+        fprintf(stderr, "[%"PRIu64"] set_nonblock failed\n", c->id);
+        abort();
+    }
+
+    reqs_per_s = (double) settings.rate * 1000.0;
+    c->reqs_per_us = reqs_per_s / 1000000.0;
+    c->token_cap = reqs_per_s;
+    if (c->token_cap < 1.0) {
+        c->token_cap = 1.0;
+    }
+    c->tokens = 0.0;
+    c->last_tsc = util_rdtsc();
 }
 
 static int core_tx(struct core *c)
@@ -183,15 +208,11 @@ static int core_rx(struct core *c, enum workload_op *op, uint16_t *err,
     ssize_t ret;
     size_t reqlen;
 
-    while (1) {
-        ret = recv(c->fd, c->rx_buf, BUFSIZE, 0);
-        if (ret < 0 && errno == EINTR) {
-            continue;
-        }
-        break;
-    }
-
+    ret = recv(c->fd, c->rx_buf, BUFSIZE, 0);
     if (ret < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return 0;
+        }
         perror("recv failed");
         return -1;
     }
@@ -226,7 +247,7 @@ static int core_rx(struct core *c, enum workload_op *op, uint16_t *err,
 
     *err = ntohs(res->response.status);
     *opaque = res->response.opaque;
-    return 0;
+    return 1;
 }
 
 static inline void set_request(struct core *c, struct key *k, uint32_t opaque)
@@ -289,6 +310,7 @@ static void preload_keys(struct core *c)
     uint16_t err;
     uint32_t opaque;
     size_t i;
+    int rx_ret;
 
     for (i = c->id; i < workload.keys_num; i += settings.threads) {
         set_request(c, &workload.keys[i], 0);
@@ -296,8 +318,15 @@ static void preload_keys(struct core *c)
             abort();
         }
 
-        if (core_rx(c, &op, &err, &opaque) != 0) {
-            abort();
+        while (1) {
+            rx_ret = core_rx(c, &op, &err, &opaque);
+            if (rx_ret < 0) {
+                abort();
+            }
+            if (rx_ret > 0) {
+                break;
+            }
+            sched_yield();
         }
 
         if (op != WL_OP_SET || err != 0) {
@@ -305,6 +334,23 @@ static void preload_keys(struct core *c)
                 c->id, (int) op, err);
             abort();
         }
+    }
+}
+
+static inline void refill_tokens(struct core *c)
+{
+    uint64_t now_tsc;
+    uint64_t delta_tsc;
+    double elapsed_us;
+
+    now_tsc = util_rdtsc();
+    delta_tsc = now_tsc - c->last_tsc;
+    c->last_tsc = now_tsc;
+
+    elapsed_us = (double) delta_tsc / tsc_per_us;
+    c->tokens += elapsed_us * c->reqs_per_us;
+    if (c->tokens > c->token_cap) {
+        c->tokens = c->token_cap;
     }
 }
 
@@ -326,45 +372,72 @@ static void *thread_run(void *arg)
     }
 
     while (phase == BENCHMARK_RUNNING) {
-        struct key *k;
-        enum workload_op tx_op;
+        uint32_t budget;
+        uint32_t sent = 0;
+        uint32_t received = 0;
         enum workload_op rx_op;
         uint16_t err;
         uint32_t opaque;
-        uint64_t now;
+        uint32_t now_us;
+        uint32_t delta_us;
+        int rx_ret;
 
-        workload_op(&workload, &c->wlc, &k, &tx_op);
-        opaque = (uint32_t) get_nanos();
+        refill_tokens(c);
+        budget = (uint32_t) c->tokens;
 
-        if (tx_op == WL_OP_GET) {
-            get_request(c, k, opaque);
-            STATS_ADD(c, tx_get, 1);
-        } else {
-            set_request(c, k, opaque);
-            STATS_ADD(c, tx_set, 1);
+        while (sent < budget && phase == BENCHMARK_RUNNING) {
+            struct key *k;
+            enum workload_op tx_op;
+
+            workload_op(&workload, &c->wlc, &k, &tx_op);
+            opaque = (uint32_t) (get_nanos() / 1000);
+
+            if (tx_op == WL_OP_GET) {
+                get_request(c, k, opaque);
+                STATS_ADD(c, tx_get, 1);
+            } else {
+                set_request(c, k, opaque);
+                STATS_ADD(c, tx_set, 1);
+            }
+
+            if (core_tx(c) != 0) {
+                abort();
+            }
+
+            sent++;
+        }
+        c->tokens -= (double) sent;
+
+        while (1) {
+            rx_ret = core_rx(c, &rx_op, &err, &opaque);
+            if (rx_ret < 0) {
+                abort();
+            }
+            if (rx_ret == 0) {
+                break;
+            }
+
+            received++;
+
+            now_us = (uint32_t) (get_nanos() / 1000);
+            delta_us = now_us - opaque;
+            record_latency(c, (uint64_t) delta_us * 1000);
+
+            if (rx_op == WL_OP_GET) {
+                STATS_ADD(c, rx_get, 1);
+            } else {
+                STATS_ADD(c, rx_set, 1);
+            }
+
+            if (err == 0) {
+                STATS_ADD(c, rx_success, 1);
+            } else {
+                STATS_ADD(c, rx_fail, 1);
+            }
         }
 
-        if (core_tx(c) != 0) {
-            abort();
-        }
-
-        if (core_rx(c, &rx_op, &err, &opaque) != 0) {
-            abort();
-        }
-
-        now = get_nanos();
-        record_latency(c, now - opaque);
-
-        if (rx_op == WL_OP_GET) {
-            STATS_ADD(c, rx_get, 1);
-        } else {
-            STATS_ADD(c, rx_set, 1);
-        }
-
-        if (err == 0) {
-            STATS_ADD(c, rx_success, 1);
-        } else {
-            STATS_ADD(c, rx_fail, 1);
+        if (sent == 0 && received == 0) {
+            sched_yield();
         }
     }
 
@@ -408,11 +481,18 @@ int main(int argc, char *argv[])
     struct core *cs;
     uint64_t t_prev;
     uint64_t t_cur;
-    long double *ttp;
-    long double tp;
-    long double tp_total;
     uint32_t *hist;
+    uint32_t *hist_prev;
+    uint32_t *hist_cur;
     uint32_t hx;
+    uint64_t gen_total = 0;
+    uint64_t tp_total = 0;
+    uint64_t gen_int = 0;
+    uint64_t tp_int = 0;
+    uint64_t sec;
+    long double load_mops;
+    long double tp_mops;
+    long double dt_s;
     uint64_t msg_total;
     double fracs[6] = { 0.5, 0.9, 0.95, 0.99, 0.999, 0.9999 };
     size_t fracs_pos[sizeof(fracs) / sizeof(fracs[0])];
@@ -425,14 +505,19 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    tsc_per_us = clock_tsc_per_us();
+
     num_threads = settings.threads;
     workload_init(&workload);
 
     assert(sizeof(*cs) % 64 == 0);
     cs = calloc(num_threads, sizeof(*cs));
-    ttp = calloc(num_threads, sizeof(*ttp));
     hist = calloc(HIST_BUCKETS, sizeof(*hist));
-    if (cs == NULL || ttp == NULL || hist == NULL) {
+    hist_prev = calloc(HIST_BUCKETS, sizeof(*hist_prev));
+    hist_cur = calloc(HIST_BUCKETS, sizeof(*hist_cur));
+    if (cs == NULL || hist == NULL || hist_prev == NULL ||
+            hist_cur == NULL)
+    {
         fprintf(stderr, "allocation failed\n");
         return EXIT_FAILURE;
     }
@@ -457,38 +542,107 @@ int main(int argc, char *argv[])
 
     phase = BENCHMARK_RUNNING;
     t_prev = get_nanos();
-    while (1) {
+    for (sec = 1; sec <= settings.run_time; sec++) {
         sleep(1);
         t_cur = get_nanos();
-        tp_total = 0;
+        dt_s = (long double) (t_cur - t_prev) / 1000000000.0L;
+        if (dt_s <= 0.0L) {
+            dt_s = 1.0L;
+        }
+        gen_int = 0;
+        tp_int = 0;
         msg_total = 0;
 
         for (i = 0; i < num_threads; i++) {
-            tp = read_cnt(&cs[i].rx_success);
-            tp /= (double) (t_cur - t_prev) / 1000000000.;
-            ttp[i] = tp;
-            tp_total += tp;
+            gen_int += read_cnt(&cs[i].tx_get) + read_cnt(&cs[i].tx_set);
+            tp_int += read_cnt(&cs[i].rx_success);
+        }
 
-            for (j = 0; j < HIST_BUCKETS; j++) {
+        gen_total += gen_int;
+        tp_total += tp_int;
+
+        for (j = 0; j < HIST_BUCKETS; j++) {
+            uint64_t sum = 0;
+            for (i = 0; i < num_threads; i++) {
                 hx = cs[i].hist[j];
-                msg_total += hx;
-                hist[j] += hx;
+                sum += hx;
+            }
+            hist_cur[j] = (uint32_t) sum;
+            if (hist_cur[j] >= hist_prev[j]) {
+                hist[j] = hist_cur[j] - hist_prev[j];
+            } else {
+                hist[j] = 0;
+            }
+            hist_prev[j] = hist_cur[j];
+            msg_total += hist[j];
+        }
+
+        if (msg_total > 0) {
+            hist_fract_buckets(hist, msg_total, fracs, fracs_pos,
+                sizeof(fracs) / sizeof(fracs[0]));
+        } else {
+            for (i = 0; i < (int) (sizeof(fracs) / sizeof(fracs[0])); i++) {
+                fracs_pos[i] = HIST_BUCKETS - 1;
             }
         }
 
-        hist_fract_buckets(hist, msg_total, fracs, fracs_pos,
-            sizeof(fracs) / sizeof(fracs[0]));
+        load_mops = (long double) gen_int / dt_s / 1000000.0L;
+        tp_mops = (long double) tp_int / dt_s / 1000000.0L;
 
-        printf("TP: total=%'.4Lf mops  50p=%d us  90p=%d us  95p=%d us  "
+        printf("[ %3"PRIu64"s ] load=%'.4Lf mops  tp=%'.4Lf mops  50p=%d us  "
+               "90p=%d us  95p=%d us  "
                "99p=%d us  99.9p=%d us  99.99p=%d us\n",
-            tp_total / 1000000.,
+            sec,
+            load_mops,
+            tp_mops,
             hist_value(fracs_pos[0]), hist_value(fracs_pos[1]),
             hist_value(fracs_pos[2]), hist_value(fracs_pos[3]),
             hist_value(fracs_pos[4]), hist_value(fracs_pos[5]));
 
         fflush(stdout);
-        memset(hist, 0, sizeof(*hist) * HIST_BUCKETS);
-
         t_prev = t_cur;
     }
+
+    phase = BENCHMARK_DONE;
+    for (i = 0; i < num_threads; i++) {
+        pthread_join(cs[i].pthread, NULL);
+    }
+
+    for (i = 0; i < num_threads; i++) {
+        gen_total += read_cnt(&cs[i].tx_get) + read_cnt(&cs[i].tx_set);
+        tp_total += read_cnt(&cs[i].rx_success);
+    }
+
+    msg_total = 0;
+    for (j = 0; j < HIST_BUCKETS; j++) {
+        uint64_t sum = 0;
+        for (i = 0; i < num_threads; i++) {
+            sum += cs[i].hist[j];
+        }
+        hist_cur[j] = (uint32_t) sum;
+        msg_total += hist_cur[j];
+    }
+    if (msg_total > 0) {
+        hist_fract_buckets(hist_cur, msg_total, fracs, fracs_pos,
+            sizeof(fracs) / sizeof(fracs[0]));
+    } else {
+        for (i = 0; i < (int) (sizeof(fracs) / sizeof(fracs[0])); i++) {
+            fracs_pos[i] = HIST_BUCKETS - 1;
+        }
+    }
+
+    printf("Summary:\n");
+    printf("  Duration: %"PRIu32" s\n", settings.run_time);
+    printf("  Generated Requests: %"PRIu64"\n", gen_total);
+    printf("  Completed Requests: %"PRIu64"\n", tp_total);
+    printf("  Avg Generated Load: %'.4Lf mops\n",
+        (long double) gen_total / (long double) settings.run_time / 1000000.0L);
+    printf("  Avg Throughput:     %'.4Lf mops\n",
+        (long double) tp_total / (long double) settings.run_time / 1000000.0L);
+    printf("  Latency: 50p=%d us  90p=%d us  95p=%d us  99p=%d us  99.9p=%d us  99.99p=%d us\n",
+        hist_value(fracs_pos[0]), hist_value(fracs_pos[1]),
+        hist_value(fracs_pos[2]), hist_value(fracs_pos[3]),
+        hist_value(fracs_pos[4]), hist_value(fracs_pos[5]));
+
+    return 0;
 }

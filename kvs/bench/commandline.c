@@ -39,6 +39,7 @@ void print_usage(void)
         "./benchmark [options] dst-ip:dst-port\n"
         "Options:\n"
         "  -t, --threads=COUNT   Number of sending threads [default 1].\n"
+        "  -R, --rate=KREQPS     Per-core rate in kreq/s   [default 1000].\n"
         "  -k, --key-size=BYTES  Key size in bytes         [default 32].\n"
         "  -n, --key-num=COUNT   Number of keys            [default 1000].\n"
         "  -u, --key-uniform     Uniform key distribution  [default]\n"
@@ -47,6 +48,7 @@ void print_usage(void)
         "  -v, --val-size=BYTES  Value size in bytes       [default 1024].\n"
         "  -g, --get-prob=PROB   Probability of GET Reqs.  [default .9].\n"
         "  -T, --time=SECS       Measurement time in [s].  [default 10].\n"
+        "  -D, --duration=SECS   Benchmark duration in [s] [default 10].\n"
         "  -w, --warmup=SECS     Warmup time [s].          [default 5].\n"
         "  -c, --cooldown=SECS   Cooldown time [s].        [default 5].\n"
         "  -s, --key-seed=SEED   Seed for key PRG.\n"
@@ -58,6 +60,7 @@ void print_usage(void)
 void init_settings(struct settings *s)
 {
     s->threads = 1;
+    s->rate = 1000;
     s->keysize = 32;
     s->keynum = 1000;
     s->keydist = DIST_UNIFORM;
@@ -66,17 +69,16 @@ void init_settings(struct settings *s)
     s->warmup_time = 5;
     s->cooldown_time = 5;
     s->run_time = 10;
-    s->request_gap = 100 * 1000;
     s->key_seed = 0x123457890123ULL;
     s->op_seed =  0x987654321098ULL;
     s->keybased = false;
-    s->batchsize = 32;
 }
 
 int parse_settings(int argc, char *argv[], struct settings *s)
 {
     static struct option long_opts[] = {
             {"threads",     required_argument, NULL, 't'},
+            {"rate",        required_argument, NULL, 'R'},
             {"key-size",    required_argument, NULL, 'k'},
             {"key-num",     required_argument, NULL, 'n'},
             {"key-uniform", no_argument,       NULL, 'u'},
@@ -84,14 +86,14 @@ int parse_settings(int argc, char *argv[], struct settings *s)
             {"val-size",    required_argument, NULL, 'v'},
             {"get-prob",    required_argument, NULL, 'g'},
             {"time",        required_argument, NULL, 'T'},
+            {"duration",    required_argument, NULL, 'D'},
             {"warmup",      required_argument, NULL, 'w'},
             {"cooldown",    required_argument, NULL, 'c'},
-            {"delay",       required_argument, NULL, 'd'},
             {"key-seed",    required_argument, NULL, 's'},
             {"op-seed",     required_argument, NULL, 'o'},
             {"keysteer",    no_argument,       NULL, 'K'},
         };
-    static const char *short_opts = "t:k:n:uz:v:g:T:w:c:d:s:o:r:K";
+    static const char *short_opts = "t:R:k:n:uz:v:g:T:D:w:c:s:o:r:K";
     int c, opt_idx, done = 0;
     char *end;
 
@@ -103,6 +105,14 @@ int parse_settings(int argc, char *argv[], struct settings *s)
                 if (!*optarg || *end || s->threads < 1) {
                     fprintf(stderr, "threads needs to be a positive "
                             "integer\n");
+                    return -1;
+                }
+                break;
+            case 'R':
+                s->rate = strtoul(optarg, &end, 10);
+                if (!*optarg || *end || s->rate < 1) {
+                    fprintf(stderr, "rate needs to be a positive integer "
+                            "(kreq/s)\n");
                     return -1;
                 }
                 break;
@@ -159,6 +169,14 @@ int parse_settings(int argc, char *argv[], struct settings *s)
                     return -1;
                 }
                 break;
+            case 'D':
+                s->run_time = strtoul(optarg, &end, 10);
+                if (!*optarg || *end || s->run_time < 1) {
+                    fprintf(stderr, "Duration needs to be a positive "
+                            "integer\n");
+                    return -1;
+                }
+                break;
             case 'w':
                 s->warmup_time = strtoul(optarg, &end, 10);
                 if (!*optarg || *end) {
@@ -171,14 +189,6 @@ int parse_settings(int argc, char *argv[], struct settings *s)
                 s->cooldown_time = strtoul(optarg, &end, 10);
                 if (!*optarg || *end) {
                     fprintf(stderr, "Cool down time needs to be a positive "
-                            "integer\n");
-                    return -1;
-                }
-                break;
-            case 'd':
-                s->request_gap = strtoul(optarg, &end, 10);
-                if (!*optarg || *end) {
-                    fprintf(stderr, "Delay needs to be a positive "
                             "integer\n");
                     return -1;
                 }

@@ -36,8 +36,7 @@ struct settings {
     uint32_t dstip;
     uint16_t dstport;
     uint16_t threads;
-    uint16_t conns;
-    uint16_t pending;
+    uint32_t rate;
 
     uint32_t keynum;
     union {
@@ -49,14 +48,11 @@ struct settings {
     enum key_dist keydist;
     uint64_t key_seed;
     uint64_t op_seed;
-    uint32_t request_gap;
     uint32_t warmup_time;
     uint32_t cooldown_time;
     uint32_t run_time;
     uint16_t keysize;
     uint16_t valuesize;
-
-    uint8_t batchsize;
 
     bool keybased;
 };
