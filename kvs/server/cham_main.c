@@ -319,10 +319,6 @@ static void *processing_thread(void *data)
     }
     c->ctx = udp_ctx;
 
-    if ((c->fd = core_socket(c)) < 0) {
-        abort();
-    }
-
     c->rx_buf = malloc((size_t) settings.max_msg_size * 2);
     if (c->rx_buf == NULL) {
         fprintf(stderr, "[%u] rx/tx buffer allocation failed\n", c->id);
@@ -331,6 +327,10 @@ static void *processing_thread(void *data)
     c->tx_buf = c->rx_buf + settings.max_msg_size;
 
     ialloc_init_allocator(&c->ia);
+
+    if ((c->fd = core_socket(c)) < 0) {
+        abort();
+    }
 
     iallocs[c->id] = &c->ia;
     __sync_fetch_and_add(&n_ready, 1);
