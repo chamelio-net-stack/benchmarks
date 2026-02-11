@@ -107,8 +107,11 @@ static int core_rx(struct core *c, ssize_t *rx_len)
     ssize_t ret;
 
     c->peer_addr_len = sizeof(c->peer_addr);
+    udp_poll_fast(c->ctx);
     ret = udp_recvfrom(c->ctx, c->fd, c->rx_buf, settings.max_msg_size,
         (struct sockaddr *) &c->peer_addr, c->peer_addr_len);
+    if (ret == 0)
+      return 0;
     if (ret < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
             return 0;
@@ -126,29 +129,26 @@ static int core_tx(struct core *c, size_t tx_len)
 {
     ssize_t ret;
 
-    while (1) {
-        ret = udp_sendto(c->ctx, c->fd, c->tx_buf, tx_len,
-            (const struct sockaddr *) &c->peer_addr, c->peer_addr_len);
-        if (ret == (ssize_t) tx_len) {
-            return 0;
-        }
-
-        if (ret < 0 && errno == EINTR) {
-            continue;
-        }
-
-        if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            sched_yield();
-            continue;
-        }
-
-        if (ret >= 0) {
-            fprintf(stderr, "[%u] short sendto: %zd of %zu\n", c->id, ret, tx_len);
-        } else {
-            perror("sendto failed");
-        }
-        return -1;
+    udp_poll_fast(c->ctx);
+    ret = udp_sendto(c->ctx, c->fd, c->tx_buf, tx_len,
+        (const struct sockaddr *) &c->peer_addr, c->peer_addr_len);
+    if (ret == (ssize_t) tx_len || ret == 0) {
+        return 0;
     }
+
+
+    if (ret < 0) {
+      fprintf(stderr, "sendto failed\n");
+      return -1;
+    }
+
+    if (ret >= 0) {
+        fprintf(stderr, "[%u] short sendto: %zd of %zu\n", c->id, ret, tx_len);
+    } else {
+        perror("sendto failed");
+    }
+
+    return -1;
 }
 
 static size_t process_request(struct core *c, ssize_t rx_len)
@@ -339,7 +339,7 @@ static void *processing_thread(void *data)
         ssize_t rx_len = 0;
         size_t tx_len;
         int rx_ret;
-
+  
         rx_ret = core_rx(c, &rx_len);
         if (rx_ret < 0) {
             abort();
