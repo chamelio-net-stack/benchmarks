@@ -51,7 +51,7 @@ if cham_enabled
   )
   flexkvs_cham = executable(
     'flexkvs_cham',
-    kvs_server_common + files('server/linux_main.c') + sock_util_src,
+    kvs_server_common + files('server/cham_main.c') + sock_util_src,
     include_directories: [kvs_inc, utils_inc],
     dependencies : [kvs_deps, cham_deps],
   )
