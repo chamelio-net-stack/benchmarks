@@ -355,6 +355,7 @@ static void maintenance(void)
 
 int main(int argc, char *argv[])
 {
+    int ret;
     unsigned i;
     char name[32];
 
@@ -370,6 +371,13 @@ int main(int argc, char *argv[])
     if (cores == NULL || iallocs == NULL) {
         fprintf(stderr, "allocation failed\n");
         return EXIT_FAILURE;
+    }
+
+    ret = udp_connect_slow();
+    if (ret != 0)
+    {
+        fprintf(stderr, "failed to connect to Chamelio");
+        exit(EXIT_FAILURE);
     }
 
     for (i = 0; i < settings.numcores; i++) {

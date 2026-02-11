@@ -132,6 +132,15 @@ static void prepare_core(struct core *c)
     struct sockaddr_in *addr;
     double reqs_per_s;
 
+    /* Each core has its own UDP context and socket */
+    udp_ctx = udp_ctx_new();
+    if (udp_ctx == NULL)
+    {
+        fprintf(stderr, "core %ld: failed to create UDP context\n", c->id);
+        pthread_exit((void *) (intptr_t) -1);
+    }
+    c->ctx = udp_ctx;
+
     c->rx_buf = malloc(BUFSIZE * 2);
     if (c->rx_buf == NULL) {
         fprintf(stderr, "[%"PRIu64"] allocating rx/tx buffer failed\n", c->id);
@@ -166,15 +175,6 @@ static void prepare_core(struct core *c)
     }
     c->tokens = 0.0;
     c->last_tsc = util_rdtsc();
-
-    /* Each core has its own UDP context and socket */
-    udp_ctx = udp_ctx_new();
-    if (udp_ctx == NULL)
-    {
-        fprintf(stderr, "core %ld: failed to create UDP context\n", c->id);
-        pthread_exit((void *) (intptr_t) -1);
-    }
-    c->ctx = udp_ctx;
 }
 
 static int core_tx(struct core *c)
@@ -478,8 +478,7 @@ static inline int hist_value(size_t i)
 
 int main(int argc, char *argv[])
 {
-    int i;
-    int j;
+    int i, j, ret;
     int num_threads;
     struct core *cs;
     uint64_t t_prev;
@@ -523,6 +522,13 @@ int main(int argc, char *argv[])
     {
         fprintf(stderr, "allocation failed\n");
         return EXIT_FAILURE;
+    }
+
+    ret = udp_connect_slow();
+    if (ret != 0)
+    {
+        fprintf(stderr, "failed to connect to Chamelio");
+        exit(EXIT_FAILURE);
     }
 
     phase = BENCHMARK_INIT;
