@@ -28,19 +28,32 @@ if librt.found()
   kvs_deps += librt
 endif
 
-flexkvs_linux = executable(
-  'flexkvs_linux',
-  kvs_server_common + files('server/linux_main.c') + sock_util_src,
-  include_directories: [kvs_inc, utils_inc],
-  dependencies: kvs_deps,
-)
-
 kvsbench_linux = executable(
   'kvsbench_linux',
   kvs_bench_common + files('bench/linux_main.c') + clock_util_src + sock_util_src,
   include_directories: [kvs_inc, utils_inc],
   dependencies: kvs_deps,
 )
-
-alias_target('kvs', [flexkvs_linux, kvsbench_linux])
+flexkvs_linux = executable(
+  'flexkvs_linux',
+  kvs_server_common + files('server/linux_main.c') + sock_util_src,
+  include_directories: [kvs_inc, utils_inc],
+  dependencies: kvs_deps,
+)
 alias_target('kvs_linux', [flexkvs_linux, kvsbench_linux])
+
+if cham_enabled
+  kvsbench_cham = executable(
+    'kvsbench_cham',
+    kvs_bench_common + files('bench/cham_main.c') + clock_util_src + sock_util_src,
+    include_directories: [kvs_inc, utils_inc],
+    dependencies: [kvs_deps, cham_deps],
+  )
+  flexkvs_cham = executable(
+    'flexkvs_cham',
+    kvs_server_common + files('server/linux_main.c') + sock_util_src,
+    include_directories: [kvs_inc, utils_inc],
+    dependencies : [kvs_deps, cham_deps],
+  )
+  alias_target('kvs_cham', [udp_cham_client, udp_cham_server])
+endif
