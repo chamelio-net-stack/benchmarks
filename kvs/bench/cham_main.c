@@ -82,6 +82,7 @@ struct core {
     uint32_t *hist;
 #endif
     int fd;
+    size_t rx_len;
     uint8_t *rx_buf;
     uint8_t *tx_buf;
     size_t tx_len;
@@ -149,6 +150,7 @@ static void prepare_core(struct core *c)
     }
     memset(c->rx_buf, 0, BUFSIZE * 2);
     c->tx_buf = c->rx_buf + BUFSIZE;
+    c->rx_len = 0;
 
     c->hist = calloc(HIST_BUCKETS, sizeof(*c->hist));
     if (c->hist == NULL) {
@@ -198,94 +200,6 @@ static void prepare_core(struct core *c)
     }
     c->tokens = 0.0;
     c->last_tsc = util_rdtsc();
-}
-
-static int core_tx(struct core *c)
-{
-    ssize_t ret;
-
-    assert(c->tx_len > 0);
-
-    while (1) {
-        udp_poll_fast(c->ctx);
-        ret = udp_sendto(c->ctx, c->fd, c->tx_buf, c->tx_len, 
-            (struct sockaddr *) &c->addr, sizeof(c->addr));
-
-        if (ret == (ssize_t) c->tx_len) {
-            c->tx_len = 0;
-            return 0;
-        }
-
-        if (ret == 0 ||
-            (ret < 0 &&
-             (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)))
-        {
-            sched_yield();
-            continue;
-        }
-
-        if (ret > 0) {
-            fprintf(stderr, "[%"PRIu64"] short send: %zd of %zu\n", c->id, ret, c->tx_len);
-            return -1;
-        }
-
-        perror("send failed");
-        return -1;
-    }
-}
-
-static int core_rx(struct core *c, enum workload_op *op, uint16_t *err,
-    uint32_t *opaque)
-{
-    protocol_binary_response_header *res;
-    ssize_t ret;
-    size_t reqlen;
-
-    udp_poll_fast(c->ctx);
-    ret = udp_recvfrom(c->ctx, c->fd, c->rx_buf, BUFSIZE, NULL, 0);
-    if (ret < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-            return 0;
-        }
-        perror("recv failed");
-        return -1;
-    }
-
-    /* Nothing to receive */
-    if (ret == 0)
-        return 0;
-
-    if (ret < (ssize_t) sizeof(*res)) {
-        fprintf(stderr, "[%"PRIu64"] short response\n", c->id);
-        return -1;
-    }
-
-    res = (protocol_binary_response_header *) c->rx_buf;
-    if (res->response.magic != PROTOCOL_BINARY_RES) {
-        fprintf(stderr, "[%"PRIu64"] invalid response magic: %x\n",
-            c->id, res->response.magic);
-        return -1;
-    }
-
-    reqlen = sizeof(*res) + ntohl(res->response.bodylen);
-    if ((size_t) ret != reqlen) {
-        fprintf(stderr, "[%"PRIu64"] malformed response length\n", c->id);
-        return -1;
-    }
-
-    if (res->response.opcode == PROTOCOL_BINARY_CMD_GET) {
-        *op = WL_OP_GET;
-    } else if (res->response.opcode == PROTOCOL_BINARY_CMD_SET) {
-        *op = WL_OP_SET;
-    } else {
-        fprintf(stderr, "[%"PRIu64"] unknown response opcode: %x\n",
-            c->id, res->response.opcode);
-        return -1;
-    }
-
-    *err = ntohs(res->response.status);
-    *opaque = res->response.opaque;
-    return 1;
 }
 
 static inline void set_request(struct core *c, struct key *k, uint32_t opaque)
@@ -342,11 +256,183 @@ static inline void get_request(struct core *c, struct key *k, uint32_t opaque)
     c->tx_len = sizeof(*get) + k->keylen;
 }
 
+static int core_tx(struct core *c)
+{
+    ssize_t ret;
+
+    assert(c->tx_len > 0);
+
+    while (1) {
+        udp_poll_fast(c->ctx);
+        ret = udp_sendto(c->ctx, c->fd, c->tx_buf, c->tx_len,
+            (struct sockaddr *) &c->addr, sizeof(c->addr));
+
+        if (ret == (ssize_t) c->tx_len) {
+            c->tx_len = 0;
+            return 0;
+        }
+
+        if (ret == 0 ||
+            (ret < 0 &&
+             (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)))
+        {
+            sched_yield();
+            continue;
+        }
+
+        if (ret > 0) {
+            fprintf(stderr, "[%"PRIu64"] short send: %zd of %zu\n",
+                c->id, ret, c->tx_len);
+            return -1;
+        }
+
+        perror("send failed");
+        return -1;
+    }
+}
+
+static int parse_one_response(struct core *c, const uint8_t *buf, size_t len,
+    size_t *reqlen, enum workload_op *op, uint16_t *err, uint32_t *opaque)
+{
+    const protocol_binary_response_header *res;
+
+    if (len < sizeof(*res)) {
+        return 0;
+    }
+
+    res = (const protocol_binary_response_header *) buf;
+    if (res->response.magic != PROTOCOL_BINARY_RES) {
+        fprintf(stderr, "[%"PRIu64"] invalid response magic: %x\n",
+            c->id, res->response.magic);
+        return -1;
+    }
+
+    *reqlen = sizeof(*res) + ntohl(res->response.bodylen);
+    if (*reqlen > BUFSIZE) {
+        fprintf(stderr, "[%"PRIu64"] response too large: %zu\n",
+            c->id, *reqlen);
+        return -1;
+    }
+
+    if (len < *reqlen) {
+        return 0;
+    }
+
+    if (res->response.opcode == PROTOCOL_BINARY_CMD_GET) {
+        *op = WL_OP_GET;
+    } else if (res->response.opcode == PROTOCOL_BINARY_CMD_SET) {
+        *op = WL_OP_SET;
+    } else {
+        fprintf(stderr, "[%"PRIu64"] unknown response opcode: %x\n",
+            c->id, res->response.opcode);
+        return -1;
+    }
+
+    *err = ntohs(res->response.status);
+    *opaque = res->response.opaque;
+    return 1;
+}
+
+static inline void account_response(struct core *c, enum workload_op op,
+    uint16_t err, uint32_t opaque)
+{
+    uint32_t now_us;
+    uint32_t delta_us;
+
+    now_us = (uint32_t) (get_nanos() / 1000);
+    delta_us = now_us - opaque;
+    record_latency(c, (uint64_t) delta_us * 1000);
+
+    if (op == WL_OP_GET) {
+        STATS_ADD(c, rx_get, 1);
+    } else {
+        STATS_ADD(c, rx_set, 1);
+    }
+
+    if (err == 0) {
+        STATS_ADD(c, rx_success, 1);
+    } else {
+        STATS_ADD(c, rx_fail, 1);
+    }
+}
+
+static int core_rx(struct core *c, enum workload_op *last_op,
+    uint16_t *last_err)
+{
+    ssize_t ret;
+    int processed = 0;
+
+    udp_poll_fast(c->ctx);
+    while (1) {
+        size_t parsed = 0;
+
+        while (parsed < c->rx_len) {
+            enum workload_op op;
+            uint16_t err;
+            uint32_t opaque;
+            size_t reqlen;
+            int parse_ret;
+
+            parse_ret = parse_one_response(c, c->rx_buf + parsed,
+                c->rx_len - parsed, &reqlen, &op, &err, &opaque);
+            if (parse_ret < 0) {
+                return -1;
+            }
+            if (parse_ret == 0) {
+                break;
+            }
+
+            account_response(c, op, err, opaque);
+            if (last_op != NULL) {
+                *last_op = op;
+            }
+            if (last_err != NULL) {
+                *last_err = err;
+            }
+
+            parsed += reqlen;
+            processed++;
+        }
+
+        if (parsed > 0) {
+            c->rx_len -= parsed;
+            if (c->rx_len > 0) {
+                memmove(c->rx_buf, c->rx_buf + parsed, c->rx_len);
+            }
+        }
+
+        if (c->rx_len >= BUFSIZE) {
+            fprintf(stderr, "[%"PRIu64"] incomplete response exceeds BUFSIZE\n",
+                c->id);
+            return -1;
+        }
+
+        ret = udp_recvfrom(c->ctx, c->fd, c->rx_buf + c->rx_len,
+                BUFSIZE - c->rx_len, NULL, 0);
+        if (ret == 0) {
+            if (c->rx_len != 0) {
+                fprintf(stderr, "[%"PRIu64"] trailing partial response: %zu bytes\n",
+                    c->id, c->rx_len);
+                return -1;
+            }
+            return processed;
+        }
+        if (ret < 0) {
+            fprintf(stderr, "[%"PRIu64"] error when receiving: ret=%zd errno=%d\n",
+                c->id, ret, errno);
+            return -1;
+        }
+
+        c->rx_len += (size_t) ret;
+    }
+
+    return processed;
+}
+
 static void preload_keys(struct core *c)
 {
     enum workload_op op;
     uint16_t err;
-    uint32_t opaque;
     size_t i;
     int rx_ret;
 
@@ -357,10 +443,11 @@ static void preload_keys(struct core *c)
         }
 
         while (1) {
-            rx_ret = core_rx(c, &op, &err, &opaque);
+            rx_ret = core_rx(c, &op, &err);
             if (rx_ret < 0) {
                 abort();
             }
+
             if (rx_ret > 0) {
                 break;
             }
@@ -394,6 +481,7 @@ static inline void refill_tokens(struct core *c)
 
 static void *thread_run(void *arg)
 {
+    int ret;
     struct core *c = arg;
 
     prepare_core(c);
@@ -410,24 +498,14 @@ static void *thread_run(void *arg)
     }
 
     while (phase == BENCHMARK_RUNNING) {
-        uint32_t sent = 0;
-        uint32_t received = 0;
-        enum workload_op rx_op;
-        uint16_t err;
+        struct key *k;
+        enum workload_op tx_op;
         uint32_t opaque;
-        uint32_t now_us;
-        uint32_t delta_us;
-        int rx_ret;
 
         refill_tokens(c);
-
         while (c->tokens >= 1.0 && phase == BENCHMARK_RUNNING) {
-            struct key *k;
-            enum workload_op tx_op;
-
             workload_op(&workload, &c->wlc, &k, &tx_op);
             opaque = (uint32_t) (get_nanos() / 1000);
-
             if (tx_op == WL_OP_GET) {
                 get_request(c, k, opaque);
                 STATS_ADD(c, tx_get, 1);
@@ -437,43 +515,15 @@ static void *thread_run(void *arg)
             }
 
             if (core_tx(c) != 0) {
+                fprintf(stderr, "error sending\n");
                 abort();
             }
-
             c->tokens -= 1.0;
-            sent++;
         }
 
-        while (phase == BENCHMARK_RUNNING) {
-            rx_ret = core_rx(c, &rx_op, &err, &opaque);
-            if (rx_ret < 0) {
-                abort();
-            }
-            if (rx_ret == 0) {
-                break;
-            }
-
-            received++;
-
-            now_us = (uint32_t) (get_nanos() / 1000);
-            delta_us = now_us - opaque;
-            record_latency(c, (uint64_t) delta_us * 1000);
-
-            if (rx_op == WL_OP_GET) {
-                STATS_ADD(c, rx_get, 1);
-            } else {
-                STATS_ADD(c, rx_set, 1);
-            }
-
-            if (err == 0) {
-                STATS_ADD(c, rx_success, 1);
-            } else {
-                STATS_ADD(c, rx_fail, 1);
-            }
-        }
-
-        if (sent == 0 && received == 0) {
-            sched_yield();
+        ret = core_rx(c, NULL, NULL);
+        if (ret < 0) {
+            abort();
         }
     }
 

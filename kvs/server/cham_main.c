@@ -111,20 +111,19 @@ static int core_rx(struct core *c, ssize_t *rx_len)
     ssize_t ret;
 
     c->peer_addr_len = sizeof(c->peer_addr);
+
     udp_poll_fast(c->ctx);
     ret = udp_recvfrom(c->ctx, c->fd, c->rx_buf, settings.max_msg_size,
         (struct sockaddr *) &c->peer_addr, c->peer_addr_len);
-    if (ret == 0)
-      return 0;
-    if (ret < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-            return 0;
-        }
 
-        perror("recvfrom failed");
+    if (ret == 0)
+        return 0;
+
+    if (ret < 0) {
+        fprintf(stderr, "errror when receiving\n");
         return -1;
     }
-
+    
     *rx_len = ret;
     return 1;
 }
@@ -133,30 +132,12 @@ static int core_tx(struct core *c, size_t tx_len)
 {
     ssize_t ret;
 
-    while (1) {
-        udp_poll_fast(c->ctx);
-        ret = udp_sendto(c->ctx, c->fd, c->tx_buf, tx_len,
-            (const struct sockaddr *) &c->peer_addr, c->peer_addr_len);
-        if (ret == (ssize_t) tx_len) {
-            return 0;
-        }
+    udp_poll_fast(c->ctx);
+    ret = udp_sendto(c->ctx, c->fd, c->tx_buf, tx_len,
+        (const struct sockaddr *) &c->peer_addr, c->peer_addr_len);
+    assert(ret <= 0 || ret == tx_len);
 
-        if (ret == 0 ||
-            (ret < 0 &&
-             (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)))
-        {
-            sched_yield();
-            continue;
-        }
-
-        if (ret > 0) {
-            fprintf(stderr, "[%u] short sendto: %zd of %zu\n", c->id, ret, tx_len);
-            return -1;
-        }
-
-        perror("sendto failed");
-        return -1;
-    }
+    return 0;
 }
 
 static size_t process_request(struct core *c, ssize_t rx_len)
@@ -359,11 +340,11 @@ static void *processing_thread(void *data)
         }
 
         tx_len = process_request(c, rx_len);
-        if (tx_len != 0 && core_tx(c, tx_len) != 0) {
-            abort();
-        }
 
-        clean_log(&c->ia, false);
+        if (tx_len != 0) {
+            core_tx(c, tx_len);
+            clean_log(&c->ia, false);
+        }
     }
 
     return NULL;
