@@ -394,7 +394,7 @@ static inline void core_rx(struct udp_context_lib *udp_ctx, struct core *c)
   while (1)
   {
     nrx = udp_recvfrom(udp_ctx, c->fd, c->rxbuf, msize, NULL, 0);
-    assert(nrx == msize || nrx < 0);
+    assert(nrx == msize || nrx <= 0);
     
     if (nrx <= 0)
       break;

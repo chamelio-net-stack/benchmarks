@@ -308,7 +308,7 @@ static inline void core_rx(struct udp_context_lib *udp_ctx, struct core *c)
     assert(msize <= bsize - c->nrx);
     nrx = udp_recvfrom(udp_ctx, c->fd, c->buf + c->nrx, msize, 
         (struct sockaddr *) &c->dst_addr, sizeof(c->dst_addr));
-    assert(nrx == msize || nrx < 0);
+    assert(nrx == msize || nrx <= 0);
     
     if (nrx <= 0)
       break;
