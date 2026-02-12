@@ -136,12 +136,30 @@ static int core_tx(struct core *c, size_t tx_len)
 {
     ssize_t ret;
 
-    udp_poll_fast(c->ctx);
-    ret = udp_sendto(c->ctx, c->fd, c->tx_buf, tx_len,
-        (const struct sockaddr *) &c->peer_addr, c->peer_addr_len);
-    assert(ret <= 0 || ret == tx_len);
+    while (1) {
+        udp_poll_fast(c->ctx);
+        ret = udp_sendto(c->ctx, c->fd, c->tx_buf, tx_len,
+            (const struct sockaddr *) &c->peer_addr, c->peer_addr_len);
+        if (ret == (ssize_t) tx_len) {
+            return 0;
+        }
 
-    return 0;
+        if (ret == 0 ||
+            (ret < 0 &&
+             (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)))
+        {
+            sched_yield();
+            continue;
+        }
+
+        if (ret > 0) {
+            fprintf(stderr, "[%u] short udp_sendto: %zd of %zu\n",
+                c->id, ret, tx_len);
+        } else {
+            fprintf(stderr, "[%u] udp_sendto failed errno=%d\n", c->id, errno);
+        }
+        return -1;
+    }
 }
 
 static size_t process_request(struct core *c, ssize_t rx_len)
@@ -346,7 +364,9 @@ static void *processing_thread(void *data)
 
             tx_len = process_request(c, rx_len);
             if (tx_len != 0) {
-                core_tx(c, tx_len);
+                if (core_tx(c, tx_len) != 0) {
+                    abort();
+                }
                 clean_log(&c->ia, false);
             }
         }
