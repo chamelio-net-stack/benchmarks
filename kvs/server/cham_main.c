@@ -137,7 +137,6 @@ static int core_tx(struct core *c, size_t tx_len)
     ssize_t ret;
 
     while (1) {
-        udp_poll_fast(c->ctx);
         ret = udp_sendto(c->ctx, c->fd, c->tx_buf, tx_len,
             (const struct sockaddr *) &c->peer_addr, c->peer_addr_len);
         if (ret == (ssize_t) tx_len) {
@@ -148,7 +147,7 @@ static int core_tx(struct core *c, size_t tx_len)
             (ret < 0 &&
              (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)))
         {
-            sched_yield();
+            udp_poll_fast(c->ctx);
             continue;
         }
 
