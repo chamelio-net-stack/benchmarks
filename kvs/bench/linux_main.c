@@ -481,10 +481,7 @@ int main(int argc, char *argv[])
     struct core *cs;
     uint64_t t_prev;
     uint64_t t_cur;
-    uint32_t *hist;
-    uint32_t *hist_prev;
     uint32_t *hist_cur;
-    uint32_t hx;
     uint64_t gen_total = 0;
     uint64_t tp_total = 0;
     uint64_t gen_int = 0;
@@ -512,11 +509,8 @@ int main(int argc, char *argv[])
 
     assert(sizeof(*cs) % 64 == 0);
     cs = calloc(num_threads, sizeof(*cs));
-    hist = calloc(HIST_BUCKETS, sizeof(*hist));
-    hist_prev = calloc(HIST_BUCKETS, sizeof(*hist_prev));
     hist_cur = calloc(HIST_BUCKETS, sizeof(*hist_cur));
-    if (cs == NULL || hist == NULL || hist_prev == NULL ||
-            hist_cur == NULL)
+    if (cs == NULL || hist_cur == NULL)
     {
         fprintf(stderr, "allocation failed\n");
         return EXIT_FAILURE;
@@ -564,21 +558,14 @@ int main(int argc, char *argv[])
         for (j = 0; j < HIST_BUCKETS; j++) {
             uint64_t sum = 0;
             for (i = 0; i < num_threads; i++) {
-                hx = cs[i].hist[j];
-                sum += hx;
+                sum += cs[i].hist[j];
             }
             hist_cur[j] = (uint32_t) sum;
-            if (hist_cur[j] >= hist_prev[j]) {
-                hist[j] = hist_cur[j] - hist_prev[j];
-            } else {
-                hist[j] = 0;
-            }
-            hist_prev[j] = hist_cur[j];
-            msg_total += hist[j];
+            msg_total += hist_cur[j];
         }
 
         if (msg_total > 0) {
-            hist_fract_buckets(hist, msg_total, fracs, fracs_pos,
+            hist_fract_buckets(hist_cur, msg_total, fracs, fracs_pos,
                 sizeof(fracs) / sizeof(fracs[0]));
         } else {
             for (i = 0; i < (int) (sizeof(fracs) / sizeof(fracs[0])); i++) {

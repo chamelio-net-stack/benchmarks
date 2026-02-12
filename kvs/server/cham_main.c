@@ -41,6 +41,8 @@
 #include "iokvs.h"
 #include "sock.h"
 
+#define CHAM_DUMMY_BATCH_SIZE 32
+
 struct core {
     int fd;
     uint16_t id;
@@ -106,13 +108,15 @@ static int core_socket(struct core *c)
     return fd;
 }
 
-static int core_rx(struct core *c, ssize_t *rx_len)
+static int core_rx(struct core *c, ssize_t *rx_len, bool do_poll)
 {
     ssize_t ret;
 
     c->peer_addr_len = sizeof(c->peer_addr);
 
-    udp_poll_fast(c->ctx);
+    if (do_poll) {
+        udp_poll_fast(c->ctx);
+    }
     ret = udp_recvfrom(c->ctx, c->fd, c->rx_buf, settings.max_msg_size,
         (struct sockaddr *) &c->peer_addr, c->peer_addr_len);
 
@@ -325,25 +329,30 @@ static void *processing_thread(void *data)
     __sync_fetch_and_add(&n_ready, 1);
 
     while (1) {
-        ssize_t rx_len = 0;
-        size_t tx_len;
+        size_t i;
         int rx_ret;
-  
-        rx_ret = core_rx(c, &rx_len);
-        if (rx_ret < 0) {
-            abort();
+
+        for (i = 0; i < CHAM_DUMMY_BATCH_SIZE; i++) {
+            ssize_t rx_len = 0;
+            size_t tx_len;
+
+            rx_ret = core_rx(c, &rx_len, i == 0);
+            if (rx_ret < 0) {
+                abort();
+            }
+            if (rx_ret == 0) {
+                break;
+            }
+
+            tx_len = process_request(c, rx_len);
+            if (tx_len != 0) {
+                core_tx(c, tx_len);
+                clean_log(&c->ia, false);
+            }
         }
 
-        if (rx_ret == 0) {
+        if (i == 0) {
             clean_log(&c->ia, true);
-            continue;
-        }
-
-        tx_len = process_request(c, rx_len);
-
-        if (tx_len != 0) {
-            core_tx(c, tx_len);
-            clean_log(&c->ia, false);
         }
     }
 

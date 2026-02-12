@@ -81,6 +81,7 @@ struct core {
     uint64_t rx_fail;
     uint32_t *hist;
 #endif
+    uint64_t rx_malformed;
     int fd;
     size_t rx_len;
     uint8_t *rx_buf;
@@ -173,6 +174,7 @@ static void prepare_core(struct core *c)
 
     /* Core 0 resolves ARP */
     int arp_size = 8;
+    ssize_t arp_ret;
     if (c->id == 0)
     {
         udp_sendto(c->ctx, c->fd, c->tx_buf, arp_size, 
@@ -182,8 +184,15 @@ static void prepare_core(struct core *c)
             (struct sockaddr *) &c->addr, sizeof(c->addr));
         sleep(1);
         while(udp_poll_fast(c->ctx) == 0);
-        while(udp_recvfrom(c->ctx, c->fd, c->rx_buf, 
-            arp_size, NULL, 0) == 0);
+        do {
+            arp_ret = udp_recvfrom(c->ctx, c->fd, c->rx_buf,
+                BUFSIZE, NULL, 0);
+        } while (arp_ret > 0);
+        if (arp_ret < 0) {
+            fprintf(stderr, "[%"PRIu64"] ARP probe drain failed: ret=%zd errno=%d\n",
+                c->id, arp_ret, errno);
+            abort();
+        }
         fprintf(stderr, "Resolved ARP\n");
         __sync_fetch_and_add(&arp_ready, 1);
     } else {
@@ -291,7 +300,13 @@ static int core_tx(struct core *c)
     }
 }
 
-static int parse_one_response(struct core *c, const uint8_t *buf, size_t len,
+enum parse_result {
+    PARSE_ERR = -1,
+    PARSE_NEED_MORE = 0,
+    PARSE_OK = 1,
+};
+
+static int parse_one_response(const uint8_t *buf, size_t len,
     size_t *reqlen, enum workload_op *op, uint16_t *err, uint32_t *opaque)
 {
     const protocol_binary_response_header *res;
@@ -302,20 +317,16 @@ static int parse_one_response(struct core *c, const uint8_t *buf, size_t len,
 
     res = (const protocol_binary_response_header *) buf;
     if (res->response.magic != PROTOCOL_BINARY_RES) {
-        fprintf(stderr, "[%"PRIu64"] invalid response magic: %x\n",
-            c->id, res->response.magic);
-        return -1;
+        return PARSE_ERR;
     }
 
     *reqlen = sizeof(*res) + ntohl(res->response.bodylen);
     if (*reqlen > BUFSIZE) {
-        fprintf(stderr, "[%"PRIu64"] response too large: %zu\n",
-            c->id, *reqlen);
-        return -1;
+        return PARSE_ERR;
     }
 
     if (len < *reqlen) {
-        return 0;
+        return PARSE_NEED_MORE;
     }
 
     if (res->response.opcode == PROTOCOL_BINARY_CMD_GET) {
@@ -323,14 +334,12 @@ static int parse_one_response(struct core *c, const uint8_t *buf, size_t len,
     } else if (res->response.opcode == PROTOCOL_BINARY_CMD_SET) {
         *op = WL_OP_SET;
     } else {
-        fprintf(stderr, "[%"PRIu64"] unknown response opcode: %x\n",
-            c->id, res->response.opcode);
-        return -1;
+        return PARSE_ERR;
     }
 
     *err = ntohs(res->response.status);
     *opaque = res->response.opaque;
-    return 1;
+    return PARSE_OK;
 }
 
 static inline void account_response(struct core *c, enum workload_op op,
@@ -373,16 +382,25 @@ static int core_rx(struct core *c, enum workload_op *last_op,
             size_t reqlen;
             int parse_ret;
 
-            parse_ret = parse_one_response(c, c->rx_buf + parsed,
+            parse_ret = parse_one_response(c->rx_buf + parsed,
                 c->rx_len - parsed, &reqlen, &op, &err, &opaque);
-            if (parse_ret < 0) {
-                return -1;
+            if (parse_ret == PARSE_NEED_MORE) {
+                break;
             }
-            if (parse_ret == 0) {
+            if (parse_ret == PARSE_ERR) {
+                c->rx_malformed++;
+                if (c->rx_malformed <= 3) {
+                    fprintf(stderr,
+                        "[%"PRIu64"] dropped malformed rx chunk (rx_len=%zu parsed=%zu)\n",
+                        c->id, c->rx_len, parsed);
+                }
+                parsed = c->rx_len;
                 break;
             }
 
-            account_response(c, op, err, opaque);
+            if (phase == BENCHMARK_RUNNING) {
+                account_response(c, op, err, opaque);
+            }
             if (last_op != NULL) {
                 *last_op = op;
             }
@@ -409,13 +427,9 @@ static int core_rx(struct core *c, enum workload_op *last_op,
 
         ret = udp_recvfrom(c->ctx, c->fd, c->rx_buf + c->rx_len,
                 BUFSIZE - c->rx_len, NULL, 0);
-        if (ret == 0) {
-            if (c->rx_len != 0) {
-                fprintf(stderr, "[%"PRIu64"] trailing partial response: %zu bytes\n",
-                    c->id, c->rx_len);
-                return -1;
-            }
-            return processed;
+        if (ret > 0) {
+            c->rx_len += (size_t) ret;
+            continue;
         }
         if (ret < 0) {
             fprintf(stderr, "[%"PRIu64"] error when receiving: ret=%zd errno=%d\n",
@@ -423,10 +437,8 @@ static int core_rx(struct core *c, enum workload_op *last_op,
             return -1;
         }
 
-        c->rx_len += (size_t) ret;
+        return processed;
     }
-
-    return processed;
 }
 
 static void preload_keys(struct core *c)
@@ -566,14 +578,9 @@ int main(int argc, char *argv[])
     struct core *cs;
     uint64_t t_prev;
     uint64_t t_cur;
-    uint32_t *hist;
-    uint32_t *hist_prev;
     uint32_t *hist_cur;
-    uint32_t hx;
     uint64_t gen_total = 0;
     uint64_t tp_total = 0;
-    uint64_t gen_int = 0;
-    uint64_t tp_int = 0;
     uint64_t sec;
     long double load_mops;
     long double tp_mops;
@@ -597,11 +604,8 @@ int main(int argc, char *argv[])
 
     assert(sizeof(*cs) % 64 == 0);
     cs = calloc(num_threads, sizeof(*cs));
-    hist = calloc(HIST_BUCKETS, sizeof(*hist));
-    hist_prev = calloc(HIST_BUCKETS, sizeof(*hist_prev));
     hist_cur = calloc(HIST_BUCKETS, sizeof(*hist_cur));
-    if (cs == NULL || hist == NULL || hist_prev == NULL ||
-            hist_cur == NULL)
+    if (cs == NULL || hist_cur == NULL)
     {
         fprintf(stderr, "allocation failed\n");
         return EXIT_FAILURE;
@@ -635,14 +639,15 @@ int main(int argc, char *argv[])
     phase = BENCHMARK_RUNNING;
     t_prev = get_nanos();
     for (sec = 1; sec <= settings.run_time; sec++) {
+        uint64_t gen_int = 0;
+        uint64_t tp_int = 0;
+
         sleep(1);
         t_cur = get_nanos();
         dt_s = (long double) (t_cur - t_prev) / 1000000000.0L;
         if (dt_s <= 0.0L) {
             dt_s = 1.0L;
         }
-        gen_int = 0;
-        tp_int = 0;
         msg_total = 0;
 
         for (i = 0; i < num_threads; i++) {
@@ -656,21 +661,14 @@ int main(int argc, char *argv[])
         for (j = 0; j < HIST_BUCKETS; j++) {
             uint64_t sum = 0;
             for (i = 0; i < num_threads; i++) {
-                hx = cs[i].hist[j];
-                sum += hx;
+                sum += cs[i].hist[j];
             }
             hist_cur[j] = (uint32_t) sum;
-            if (hist_cur[j] >= hist_prev[j]) {
-                hist[j] = hist_cur[j] - hist_prev[j];
-            } else {
-                hist[j] = 0;
-            }
-            hist_prev[j] = hist_cur[j];
-            msg_total += hist[j];
+            msg_total += hist_cur[j];
         }
 
         if (msg_total > 0) {
-            hist_fract_buckets(hist, msg_total, fracs, fracs_pos,
+            hist_fract_buckets(hist_cur, msg_total, fracs, fracs_pos,
                 sizeof(fracs) / sizeof(fracs[0]));
         } else {
             for (i = 0; i < (int) (sizeof(fracs) / sizeof(fracs[0])); i++) {
