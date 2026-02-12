@@ -157,6 +157,7 @@ static void prepare_core(struct core *c)
     }
 
     c->fd = udp_socket(c->ctx);
+    fprintf(stderr, "sock fd=%d\n", c->fd);
     if (c->fd < 0) {
         perror("socket failed");
         fprintf(stderr, "[%"PRIu64"] socket failed\n", c->id);
@@ -268,32 +269,30 @@ static int core_tx(struct core *c)
 
     assert(c->tx_len > 0);
 
-    while (1) {
+    while (1)
+    {
         udp_poll_fast(c->ctx);
         ret = udp_sendto(c->ctx, c->fd, c->tx_buf, c->tx_len,
             (struct sockaddr *) &c->addr, sizeof(c->addr));
-
-        if (ret == (ssize_t) c->tx_len) {
+    
+        if (ret == c->tx_len) {
             c->tx_len = 0;
             return 0;
         }
-
-        if (ret == 0 ||
-            (ret < 0 &&
-             (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)))
-        {
-            sched_yield();
+        
+        if (ret < 0 && errno == EAGAIN)
             continue;
+            
+        if (ret < 0) {
+            fprintf(stderr, "error sending in core_tx\n");
+            abort();
         }
-
-        if (ret > 0) {
+        
+        if (ret < c->tx_len) {
             fprintf(stderr, "[%"PRIu64"] short send: %zd of %zu\n",
                 c->id, ret, c->tx_len);
             return -1;
         }
-
-        perror("send failed");
-        return -1;
     }
 }
 
@@ -440,35 +439,17 @@ static int core_rx(struct core *c, enum workload_op *last_op,
 
 static void preload_keys(struct core *c)
 {
-    enum workload_op op;
-    uint16_t err;
     size_t i;
-    int rx_ret;
 
-    for (i = c->id; i < workload.keys_num; i += settings.threads) {
+    fprintf(stderr, "begino core=%d\n", c->id);
+    for (i = c->id; i < workload.keys_num; i++) {
         set_request(c, &workload.keys[i], 0);
         if (core_tx(c) != 0) {
-            abort();
-        }
-
-        while (1) {
-            rx_ret = core_rx(c, &op, &err);
-            if (rx_ret < 0) {
-                abort();
-            }
-
-            if (rx_ret > 0) {
-                break;
-            }
-            sched_yield();
-        }
-
-        if (op != WL_OP_SET || err != 0) {
-            fprintf(stderr, "[%"PRIu64"] preload set failed: op=%d err=%x\n",
-                c->id, (int) op, err);
+            fprintf(stderr, "error sending on preload\n");
             abort();
         }
     }
+    fprintf(stderr, "fini core=%d\n", c->id);
 }
 
 static inline void refill_tokens(struct core *c)
@@ -505,7 +486,7 @@ static void *thread_run(void *arg)
     while (phase < BENCHMARK_RUNNING) {
         sched_yield();
     }
-
+    
     while (phase == BENCHMARK_RUNNING) {
         struct key *k;
         enum workload_op tx_op;
@@ -524,7 +505,7 @@ static void *thread_run(void *arg)
             }
 
             if (core_tx(c) != 0) {
-                fprintf(stderr, "error sending\n");
+                fprintf(stderr, "error sending data loop\n");
                 abort();
             }
             c->tokens -= 1.0;
