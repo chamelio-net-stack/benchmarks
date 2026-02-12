@@ -46,6 +46,7 @@
 struct core {
     int fd;
     uint16_t id;
+    uint64_t rx_malformed;
     uint8_t *rx_buf;
     uint8_t *tx_buf;
     struct sockaddr_in peer_addr;
@@ -400,10 +401,14 @@ static void *processing_thread(void *data)
                     break;
                 }
                 if (parse_ret == REQ_PARSE_ERR) {
-                    fprintf(stderr, "[%u] malformed request chunk (rx_len=%zd parsed=%zu)\n",
-                        c->id, rx_len, parsed);
-                    parsed = (size_t) rx_len;
-                    break;
+                    c->rx_malformed++;
+                    if (c->rx_malformed <= 3) {
+                        fprintf(stderr,
+                            "[%u] malformed request byte (rx_len=%zd parsed=%zu byte=0x%02x)\n",
+                            c->id, rx_len, parsed, c->rx_buf[parsed]);
+                    }
+                    parsed++;
+                    continue;
                 }
 
                 tx_len = process_request(c, c->rx_buf + parsed, reqlen);

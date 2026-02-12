@@ -388,11 +388,11 @@ static int core_rx(struct core *c, enum workload_op *last_op,
                 c->rx_malformed++;
                 if (c->rx_malformed <= 3) {
                     fprintf(stderr,
-                        "[%"PRIu64"] dropped malformed rx chunk (rx_len=%zu parsed=%zu)\n",
-                        c->id, c->rx_len, parsed);
+                        "[%"PRIu64"] malformed response byte (rx_len=%zu parsed=%zu byte=0x%02x)\n",
+                        c->id, c->rx_len, parsed, c->rx_buf[parsed]);
                 }
-                parsed = c->rx_len;
-                break;
+                parsed++;
+                continue;
             }
 
             if (phase == BENCHMARK_RUNNING) {
