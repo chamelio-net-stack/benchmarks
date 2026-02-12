@@ -120,12 +120,9 @@ static inline void record_latency(struct core *c, uint64_t nanos)
 }
 
 #ifdef PRINT_STATS
-static inline uint64_t read_cnt(uint64_t *p)
+static inline uint64_t load_cnt(uint64_t *p)
 {
-    uint64_t v = *p;
-
-    __sync_fetch_and_sub(p, v);
-    return v;
+    return __atomic_load_n(p, __ATOMIC_RELAXED);
 }
 #endif
 
@@ -579,6 +576,8 @@ int main(int argc, char *argv[])
     uint64_t t_prev;
     uint64_t t_cur;
     uint32_t *hist_cur;
+    uint64_t *prev_gen_cur;
+    uint64_t *prev_tp_cur;
     uint64_t gen_total = 0;
     uint64_t tp_total = 0;
     uint64_t sec;
@@ -605,7 +604,10 @@ int main(int argc, char *argv[])
     assert(sizeof(*cs) % 64 == 0);
     cs = calloc(num_threads, sizeof(*cs));
     hist_cur = calloc(HIST_BUCKETS, sizeof(*hist_cur));
-    if (cs == NULL || hist_cur == NULL)
+    prev_gen_cur = calloc((size_t) num_threads, sizeof(*prev_gen_cur));
+    prev_tp_cur = calloc((size_t) num_threads, sizeof(*prev_tp_cur));
+    if (cs == NULL || hist_cur == NULL ||
+        prev_gen_cur == NULL || prev_tp_cur == NULL)
     {
         fprintf(stderr, "allocation failed\n");
         return EXIT_FAILURE;
@@ -651,8 +653,22 @@ int main(int argc, char *argv[])
         msg_total = 0;
 
         for (i = 0; i < num_threads; i++) {
-            gen_int += read_cnt(&cs[i].tx_get) + read_cnt(&cs[i].tx_set);
-            tp_int += read_cnt(&cs[i].rx_success);
+            uint64_t gen_cur = load_cnt(&cs[i].tx_get) + load_cnt(&cs[i].tx_set);
+            uint64_t tp_cur = load_cnt(&cs[i].rx_success);
+
+            if (gen_cur >= prev_gen_cur[i]) {
+                gen_int += gen_cur - prev_gen_cur[i];
+            } else {
+                gen_int += gen_cur;
+            }
+            if (tp_cur >= prev_tp_cur[i]) {
+                tp_int += tp_cur - prev_tp_cur[i];
+            } else {
+                tp_int += tp_cur;
+            }
+
+            prev_gen_cur[i] = gen_cur;
+            prev_tp_cur[i] = tp_cur;
         }
 
         gen_total += gen_int;
@@ -698,9 +714,11 @@ int main(int argc, char *argv[])
         pthread_join(cs[i].pthread, NULL);
     }
 
+    gen_total = 0;
+    tp_total = 0;
     for (i = 0; i < num_threads; i++) {
-        gen_total += read_cnt(&cs[i].tx_get) + read_cnt(&cs[i].tx_set);
-        tp_total += read_cnt(&cs[i].rx_success);
+        gen_total += load_cnt(&cs[i].tx_get) + load_cnt(&cs[i].tx_set);
+        tp_total += load_cnt(&cs[i].rx_success);
     }
 
     msg_total = 0;

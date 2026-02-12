@@ -161,7 +161,39 @@ static int core_tx(struct core *c, size_t tx_len)
     }
 }
 
-static size_t process_request(struct core *c, ssize_t rx_len)
+enum request_parse_result {
+    REQ_PARSE_ERR = -1,
+    REQ_PARSE_NEED_MORE = 0,
+    REQ_PARSE_OK = 1,
+};
+
+static int parse_one_request(const uint8_t *buf, size_t len, size_t *reqlen)
+{
+    const protocol_binary_request_header *req;
+
+    if (len < sizeof(*req)) {
+        return REQ_PARSE_NEED_MORE;
+    }
+
+    req = (const protocol_binary_request_header *) buf;
+    if (req->request.magic != PROTOCOL_BINARY_REQ) {
+        return REQ_PARSE_ERR;
+    }
+
+    *reqlen = sizeof(*req) + ntohl(req->request.bodylen);
+    if (*reqlen > settings.max_msg_size) {
+        return REQ_PARSE_ERR;
+    }
+
+    if (len < *reqlen) {
+        return REQ_PARSE_NEED_MORE;
+    }
+
+    return REQ_PARSE_OK;
+}
+
+static size_t process_request(struct core *c, const uint8_t *req_buf,
+    size_t rx_len)
 {
     protocol_binary_request_header *req;
     protocol_binary_response_header *res;
@@ -178,14 +210,10 @@ static size_t process_request(struct core *c, ssize_t rx_len)
     void *v;
     struct item *it;
 
-    if (rx_len < (ssize_t) sizeof(*req)) {
-        return 0;
-    }
-
-    req = (protocol_binary_request_header *) c->rx_buf;
+    req = (protocol_binary_request_header *) req_buf;
     bl = ntohl(req->request.bodylen);
     total_len = sizeof(*req) + bl;
-    if (total_len != (size_t) rx_len) {
+    if (total_len != rx_len) {
         return 0;
     }
 
@@ -351,7 +379,7 @@ static void *processing_thread(void *data)
 
         for (i = 0; i < CHAM_DUMMY_BATCH_SIZE; i++) {
             ssize_t rx_len = 0;
-            size_t tx_len;
+            size_t parsed = 0;
 
             rx_ret = core_rx(c, &rx_len, i == 0);
             if (rx_ret < 0) {
@@ -361,12 +389,31 @@ static void *processing_thread(void *data)
                 break;
             }
 
-            tx_len = process_request(c, rx_len);
-            if (tx_len != 0) {
-                if (core_tx(c, tx_len) != 0) {
-                    abort();
+            while (parsed < (size_t) rx_len) {
+                size_t reqlen;
+                size_t tx_len;
+                int parse_ret;
+
+                parse_ret = parse_one_request(c->rx_buf + parsed,
+                    (size_t) rx_len - parsed, &reqlen);
+                if (parse_ret == REQ_PARSE_NEED_MORE) {
+                    break;
                 }
-                clean_log(&c->ia, false);
+                if (parse_ret == REQ_PARSE_ERR) {
+                    fprintf(stderr, "[%u] malformed request chunk (rx_len=%zd parsed=%zu)\n",
+                        c->id, rx_len, parsed);
+                    parsed = (size_t) rx_len;
+                    break;
+                }
+
+                tx_len = process_request(c, c->rx_buf + parsed, reqlen);
+                if (tx_len != 0) {
+                    if (core_tx(c, tx_len) != 0) {
+                        abort();
+                    }
+                    clean_log(&c->ia, false);
+                }
+                parsed += reqlen;
             }
         }
 
