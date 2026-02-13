@@ -22,6 +22,8 @@
 #include <pthread.h>
 #include <assert.h>
 #include <sched.h>
+#include "../utils/clock.h"
+#include "../utils/core.h"
 
 struct core {
   int id;
@@ -55,24 +57,6 @@ static pthread_barrier_t start_barrier;
 static pthread_t *threads = NULL;
 static struct core *cores = NULL;
 struct sockaddr_in src_addr;
-
-static inline int pin_thread_to_core(int core_id)
-{
-  cpu_set_t cpuset;
-  int ret;
-
-  CPU_ZERO(&cpuset);
-  CPU_SET(core_id, &cpuset);
-  ret = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
-  if (ret != 0)
-  {
-    errno = ret;
-    perror("pthread_setaffinity_np");
-    return -1;
-  }
-
-  return 0;
-}
 
 static inline int parse_core_list(const char *arg, int expected_len)
 {
@@ -150,13 +134,6 @@ static inline int parse_core_list(const char *arg, int expected_len)
   free(tmp);
   core_list_len = count;
   return 0;
-}
-
-static inline __u64 now_ns(void)
-{
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-  return (__u64) ts.tv_sec * 1000000000ULL + (__u64) ts.tv_nsec;
 }
 
 static inline int parse_args(int argc, char **argv)
@@ -331,7 +308,7 @@ static inline void core_rx(struct udp_context_lib *udp_ctx, struct core *c)
     assert(msize <= bsize - c->nrx);
     nrx = udp_recvfrom(udp_ctx, c->fd, c->buf + c->nrx, msize, 
         (struct sockaddr *) &c->dst_addr, sizeof(c->dst_addr));
-    assert(nrx == msize || nrx < 0);
+    assert(nrx == msize || nrx <= 0);
     
     if (nrx <= 0)
       break;
