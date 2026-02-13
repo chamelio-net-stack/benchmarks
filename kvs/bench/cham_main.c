@@ -417,7 +417,6 @@ static void preload_keys(struct core *c)
 {
     size_t i;
 
-    fprintf(stderr, "begino core=%d\n", c->id);
     for (i = c->id; i < workload.keys_num; i++) {
         set_request(c, &workload.keys[i], 0);
         if (core_tx(c) != 0) {
@@ -425,7 +424,6 @@ static void preload_keys(struct core *c)
             abort();
         }
     }
-    fprintf(stderr, "fini core=%d\n", c->id);
 }
 
 static inline void refill_tokens(struct core *c)
