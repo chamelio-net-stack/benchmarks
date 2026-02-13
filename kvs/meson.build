@@ -57,3 +57,19 @@ if cham_enabled
   )
   alias_target('kvs_cham', [kvsbench_cham, flexkvs_cham])
 endif
+
+if demi_enabled
+  kvsbench_demi = executable(
+    'kvsbench_demi',
+    kvs_bench_common + files('bench/demi_main.c') + clock_util_src + sock_util_src,
+    include_directories: [kvs_inc, utils_inc],
+    dependencies: [kvs_deps, demi_dep],
+  )
+  flexkvs_demi = executable(
+    'flexkvs_demi',
+    kvs_server_common + files('server/demi_main.c') + sock_util_src,
+    include_directories: [kvs_inc, utils_inc],
+    dependencies: [kvs_deps, demi_dep],
+  )
+  alias_target('kvs_demi', [kvsbench_demi, flexkvs_demi])
+endif
