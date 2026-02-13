@@ -23,7 +23,6 @@
 struct core {
     int fd;
     demi_qtoken_t rx_qt;
-    demi_sgarray_t tx_sga;
     bool rx_pending;
     uint16_t id;
     uint8_t *rx_buf;
@@ -138,6 +137,7 @@ static int core_tx(struct core *c, size_t tx_len)
 {
     demi_qtoken_t tx_qt;
     demi_qresult_t qr;
+    demi_sgarray_t sga;
     int ret;
 
     if (tx_len > settings.max_msg_size) {
@@ -145,15 +145,22 @@ static int core_tx(struct core *c, size_t tx_len)
         return -1;
     }
 
-    memcpy(c->tx_sga.segments[0].data_buf_ptr, c->tx_buf, tx_len);
-    c->tx_sga.sga_numsegs = 1;
-    c->tx_sga.segments[0].data_len_bytes = (uint32_t) tx_len;
+    sga = demi_sgaalloc(tx_len);
+    if (sga.sga_numsegs != 1 || sga.segments[0].data_len_bytes < tx_len) {
+        fprintf(stderr, "[%u] demi_sgaalloc failed for tx_len=%zu\n",
+            c->id, tx_len);
+        return -1;
+    }
+    sga.sga_numsegs = 1;
+    sga.segments[0].data_len_bytes = (uint32_t) tx_len;
+    memcpy(sga.segments[0].data_buf_ptr, c->tx_buf, tx_len);
 
-    ret = demi_pushto(&tx_qt, c->fd, &c->tx_sga,
+    ret = demi_pushto(&tx_qt, c->fd, &sga,
         (const struct sockaddr *) &c->peer_addr, c->peer_addr_len);
     if (ret != 0) {
         errno = ret;
         perror("demi_pushto failed");
+        (void) demi_sgafree(&sga);
         return -1;
     }
 
@@ -166,11 +173,19 @@ static int core_tx(struct core *c, size_t tx_len)
         if (ret != 0) {
             errno = ret;
             perror("demi_wait push failed");
+            (void) demi_sgafree(&sga);
             return -1;
         }
         if (qr.qr_opcode != DEMI_OPC_PUSH) {
             fprintf(stderr, "[%u] unexpected opcode on push: %d\n",
                 c->id, (int) qr.qr_opcode);
+            (void) demi_sgafree(&sga);
+            return -1;
+        }
+        ret = demi_sgafree(&sga);
+        if (ret != 0) {
+            errno = ret;
+            perror("demi_sgafree failed");
             return -1;
         }
         return 0;
@@ -358,13 +373,6 @@ static void *processing_thread(void *data)
         abort();
     }
     c->tx_buf = c->rx_buf + settings.max_msg_size;
-    c->tx_sga = demi_sgaalloc((size_t) settings.max_msg_size);
-    if (c->tx_sga.sga_numsegs != 1 ||
-            c->tx_sga.segments[0].data_len_bytes < settings.max_msg_size)
-    {
-        fprintf(stderr, "[%u] demi_sgaalloc failed\n", c->id);
-        abort();
-    }
     c->rx_pending = false;
     c->rx_qt = 0;
 

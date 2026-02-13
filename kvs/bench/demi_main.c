@@ -61,7 +61,6 @@ struct core {
 #endif
     int fd;
     demi_qtoken_t rx_qt;
-    demi_sgarray_t tx_sga;
     struct sockaddr_in dst_addr;
     socklen_t dst_addr_len;
     bool rx_pending;
@@ -157,14 +156,6 @@ static void prepare_core(struct core *c)
     c->dst_addr = addr;
     c->dst_addr_len = sizeof(c->dst_addr);
 
-    c->tx_sga = demi_sgaalloc(BUFSIZE);
-    if (c->tx_sga.sga_numsegs != 1 ||
-            c->tx_sga.segments[0].data_len_bytes < BUFSIZE)
-    {
-        fprintf(stderr, "[%"PRIu64"] demi_sgaalloc failed\n", c->id);
-        abort();
-    }
-
     c->rx_pending = false;
     c->rx_qt = 0;
     reqs_per_s = (double) settings.rate * 1000.0;
@@ -181,6 +172,7 @@ static int core_tx(struct core *c)
 {
     demi_qtoken_t tx_qt;
     demi_qresult_t qr;
+    demi_sgarray_t sga;
     size_t tx_len;
     int ret;
 
@@ -191,15 +183,22 @@ static int core_tx(struct core *c)
         return -1;
     }
 
-    memcpy(c->tx_sga.segments[0].data_buf_ptr, c->tx_buf, tx_len);
-    c->tx_sga.sga_numsegs = 1;
-    c->tx_sga.segments[0].data_len_bytes = (uint32_t) tx_len;
+    sga = demi_sgaalloc(tx_len);
+    if (sga.sga_numsegs != 1 || sga.segments[0].data_len_bytes < tx_len) {
+        fprintf(stderr, "[%"PRIu64"] demi_sgaalloc failed for tx_len=%zu\n",
+            c->id, tx_len);
+        return -1;
+    }
+    sga.sga_numsegs = 1;
+    sga.segments[0].data_len_bytes = (uint32_t) tx_len;
+    memcpy(sga.segments[0].data_buf_ptr, c->tx_buf, tx_len);
 
-    ret = demi_pushto(&tx_qt, c->fd, &c->tx_sga,
+    ret = demi_pushto(&tx_qt, c->fd, &sga,
         (const struct sockaddr *) &c->dst_addr, c->dst_addr_len);
     if (ret != 0) {
         errno = ret;
         perror("demi_pushto failed");
+        (void) demi_sgafree(&sga);
         return -1;
     }
 
@@ -212,14 +211,22 @@ static int core_tx(struct core *c)
         if (ret != 0) {
             errno = ret;
             perror("demi_wait push failed");
+            (void) demi_sgafree(&sga);
             return -1;
         }
         if (qr.qr_opcode != DEMI_OPC_PUSH) {
             fprintf(stderr, "[%"PRIu64"] unexpected opcode on push: %d\n",
                 c->id, (int) qr.qr_opcode);
+            (void) demi_sgafree(&sga);
             return -1;
         }
 
+        ret = demi_sgafree(&sga);
+        if (ret != 0) {
+            errno = ret;
+            perror("demi_sgafree failed");
+            return -1;
+        }
         c->tx_len = 0;
         return 0;
     }
