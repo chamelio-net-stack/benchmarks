@@ -1,5 +1,5 @@
 /* Usage:
- *   ./udp_cham_server <bind_ip> <port> [--msize N] [--ncores N] [--buf-size N]
+ *   ./udp_cham_server <bind_ip> <port> [--msize N] [--ncores N] [--buf-size N] [--cores LIST]
  *
  * Example:
  *   ./udp_cham_server 0.0.0.0 9000 --msize 64 --ncores 2 --buf-size 4096
@@ -7,6 +7,7 @@
  *   --msize Size of expected message
  *   --ncores Number of cores to use
  *   --buf-size Size of transmit buffer
+ *   --cores Comma-separated core list (main, thread0, thread1, ...)
  */
 
 #define _GNU_SOURCE
@@ -20,6 +21,9 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <assert.h>
+#include <sched.h>
+#include "../utils/clock.h"
+#include "../utils/core.h"
 
 struct core {
   int id;
@@ -38,6 +42,9 @@ struct core {
 size_t msize = 64;
 size_t bsize = 4096;
 int ncores = 1;
+static char *cores_arg = NULL;
+static int *core_list = NULL;
+static int core_list_len = 0;
 
 __u64 rxb_interval_total, rxp_interval_total;
 __u64 txb_interval_total, txp_interval_total;
@@ -51,11 +58,82 @@ static pthread_t *threads = NULL;
 static struct core *cores = NULL;
 struct sockaddr_in src_addr;
 
-static inline __u64 now_ns(void)
+static inline int parse_core_list(const char *arg, int expected_len)
 {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-  return (__u64) ts.tv_sec * 1000000000ULL + (__u64) ts.tv_nsec;
+  int count = 1;
+  const char *p = arg;
+  char *tmp, *tok, *end;
+  int idx = 0;
+
+  if (arg == NULL || *arg == '\0')
+    return -1;
+
+  while (*p)
+  {
+    if (*p == ',')
+      count++;
+    p++;
+  }
+
+  if (expected_len > 0 && count != expected_len)
+  {
+    fprintf(stderr, "cores list must have %d entries (main + %d threads)\n",
+        expected_len, expected_len - 1);
+    return -1;
+  }
+
+  core_list = (int *) calloc((size_t) count, sizeof(int));
+  if (!core_list)
+  {
+    perror("calloc core_list");
+    return -1;
+  }
+
+  tmp = strdup(arg);
+  if (!tmp)
+  {
+    perror("strdup cores");
+    free(core_list);
+    core_list = NULL;
+    return -1;
+  }
+
+  for (tok = strtok(tmp, ","); tok != NULL; tok = strtok(NULL, ","))
+  {
+    while (*tok == ' ' || *tok == '\t')
+      tok++;
+    if (*tok == '\0')
+    {
+      fprintf(stderr, "empty core id in list\n");
+      free(core_list);
+      core_list = NULL;
+      free(tmp);
+      return -1;
+    }
+    errno = 0;
+    core_list[idx] = (int) strtol(tok, &end, 10);
+    if (errno != 0 || end == tok || (*end != '\0' && *end != ' ' && *end != '\t'))
+    {
+      fprintf(stderr, "invalid core id: %s\n", tok);
+      free(core_list);
+      core_list = NULL;
+      free(tmp);
+      return -1;
+    }
+    if (core_list[idx] < 0 || core_list[idx] >= CPU_SETSIZE)
+    {
+      fprintf(stderr, "core id out of range: %d\n", core_list[idx]);
+      free(core_list);
+      core_list = NULL;
+      free(tmp);
+      return -1;
+    }
+    idx++;
+  }
+
+  free(tmp);
+  core_list_len = count;
+  return 0;
 }
 
 static inline int parse_args(int argc, char **argv)
@@ -65,7 +143,7 @@ static inline int parse_args(int argc, char **argv)
   if (argc < 3)
   {
     fprintf(stderr, "Usage: %s <bind_ip> <port>" 
-        " [--msize N] [--ncores N] [--buf-size]\n", argv[0]);
+        " [--msize N] [--ncores N] [--buf-size N] [--cores LIST]\n", argv[0]);
     return -1;
   }
 
@@ -91,11 +169,21 @@ static inline int parse_args(int argc, char **argv)
     {
       bsize = (size_t)strtoul(argv[++i], NULL, 10);
     }
+    else if (strcmp(argv[i], "--cores") == 0 && i + 1 < argc)
+    {
+      cores_arg = argv[++i];
+    }
     else
     {
       fprintf(stderr, "Unknown arg: %s\n", argv[i]);
       return -1;
     }
+  }
+
+  if (cores_arg != NULL)
+  {
+    if (parse_core_list(cores_arg, ncores + 1) != 0)
+      return -1;
   }
 
   return 0;
@@ -220,7 +308,7 @@ static inline void core_rx(struct udp_context_lib *udp_ctx, struct core *c)
     assert(msize <= bsize - c->nrx);
     nrx = udp_recvfrom(udp_ctx, c->fd, c->buf + c->nrx, msize, 
         (struct sockaddr *) &c->dst_addr, sizeof(c->dst_addr));
-    assert(nrx == msize || nrx < 0);
+    assert(nrx == msize || nrx <= 0);
     
     if (nrx <= 0)
       break;
@@ -260,6 +348,11 @@ static inline void * core_thread(void *arg)
   struct udp_context_lib *udp_ctx;
   
   c = (struct core *) arg;
+  if (core_list_len > 0)
+  {
+    if (pin_thread_to_core(core_list[c->id + 1]) != 0)
+      pthread_exit((void *) (intptr_t) -1);
+  }
   udp_ctx = core_init(c);
 
   /* Core 0 waits here while others wait in init */
@@ -366,6 +459,13 @@ int main(int argc, char **argv)
     
   init_server();
   prepare_cores();
+
+  if (core_list_len > 0)
+  {
+    if (pin_thread_to_core(core_list[0]) != 0)
+      return EXIT_FAILURE;
+  }
+
   start_cores();
 
   printf("UDP echo server listening on %s:%d (msize=%zu) (bsize=%zu) (ncores=%d)\n", 
@@ -401,6 +501,7 @@ int main(int argc, char **argv)
   /* Join all cores */
   for (i = 0; i < ncores; i++)
     pthread_join(threads[i], NULL);
-    
+  
+  free(core_list);
   return 0;
 }
