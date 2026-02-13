@@ -101,6 +101,7 @@ static inline uint64_t read_cnt(uint64_t *p)
 
 static void prepare_core(struct core *c)
 {
+    struct sockaddr_in bind_addr;
     struct sockaddr_in addr;
     double reqs_per_s;
 
@@ -121,6 +122,16 @@ static void prepare_core(struct core *c)
     if (c->fd < 0) {
         perror("socket failed");
         fprintf(stderr, "[%"PRIu64"] socket failed\n", c->id);
+        abort();
+    }
+
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = htonl(settings.srcip);
+    bind_addr.sin_port = htons(settings.srcport);
+    if (bind(c->fd, (struct sockaddr *) &bind_addr, sizeof(bind_addr)) != 0) {
+        perror("bind failed");
+        fprintf(stderr, "[%"PRIu64"] bind failed\n", c->id);
         abort();
     }
 

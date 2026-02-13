@@ -35,6 +35,8 @@ enum key_dist {
 struct settings {
     uint32_t dstip;
     uint16_t dstport;
+    uint32_t srcip;
+    uint16_t srcport;
     uint16_t threads;
     uint32_t rate;
 
@@ -55,6 +57,7 @@ struct settings {
     uint16_t valuesize;
 
     bool keybased;
+    bool bypass_arp;
 };
 
 struct key {

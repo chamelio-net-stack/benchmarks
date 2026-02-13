@@ -53,8 +53,11 @@ void print_usage(void)
         "  -c, --cooldown=SECS   Cooldown time [s].        [default 5].\n"
         "  -s, --key-seed=SEED   Seed for key PRG.\n"
         "  -o, --op-seed=SEED    Seed for operation PRG.\n"
+        "  -S, --src-ip=IP       Source IPv4 address to bind [default 0.0.0.0].\n"
+        "  -P, --src-port=PORT   Source UDP port to bind     [default 0].\n"
         "  -r, --trace=FILE      Write operation trace to file.\n"
-        "  -K, --keysteer        Key-based steering.\n");
+        "  -K, --keysteer        Key-based steering.\n"
+        "  -B  --bypass-arp      Bypass ARP wait");
 }
 
 void init_settings(struct settings *s)
@@ -71,7 +74,10 @@ void init_settings(struct settings *s)
     s->run_time = 10;
     s->key_seed = 0x123457890123ULL;
     s->op_seed =  0x987654321098ULL;
+    s->srcip = INADDR_ANY;
+    s->srcport = 0;
     s->keybased = false;
+    s->bypass_arp = false;
 }
 
 int parse_settings(int argc, char *argv[], struct settings *s)
@@ -91,9 +97,12 @@ int parse_settings(int argc, char *argv[], struct settings *s)
             {"cooldown",    required_argument, NULL, 'c'},
             {"key-seed",    required_argument, NULL, 's'},
             {"op-seed",     required_argument, NULL, 'o'},
+            {"src-ip",      required_argument, NULL, 'S'},
+            {"src-port",    required_argument, NULL, 'P'},
             {"keysteer",    no_argument,       NULL, 'K'},
+            {"bypass-arp",  no_argument,       NULL, 'B'},
         };
-    static const char *short_opts = "t:R:k:n:uz:v:g:T:D:w:c:s:o:r:K";
+    static const char *short_opts = "t:R:k:n:uz:v:g:T:D:w:c:s:o:S:P:r:K:B";
     int c, opt_idx, done = 0;
     char *end;
 
@@ -207,8 +216,26 @@ int parse_settings(int argc, char *argv[], struct settings *s)
                     return -1;
                 }
                 break;
+            case 'S':
+                if (parse_ipv4(optarg, &s->srcip) != 0) {
+                    fprintf(stderr, "Parsing source ip address failed\n");
+                    return -1;
+                }
+                break;
+            case 'P': {
+                unsigned long port = strtoul(optarg, &end, 10);
+                if (!*optarg || *end || port > UINT16_MAX) {
+                    fprintf(stderr, "Source port must be in range [0, 65535].\n");
+                    return -1;
+                }
+                s->srcport = (uint16_t) port;
+                break;
+            }
             case 'K':
                 settings.keybased = true;
+                break;
+            case 'B':
+                settings.bypass_arp = true;
                 break;
             case -1:
                 done = 1;

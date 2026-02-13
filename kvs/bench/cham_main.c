@@ -105,8 +105,10 @@ static inline uint64_t load_cnt(uint64_t *p)
 static void prepare_core(struct core *c)
 {
     struct udp_context_lib *udp_ctx;
+    struct sockaddr_in bind_addr;
     struct sockaddr_in *addr;
     double reqs_per_s;
+    int ret;
 
     /* Each core has its own UDP context and socket */
     udp_ctx = udp_ctx_new();
@@ -140,6 +142,18 @@ static void prepare_core(struct core *c)
         abort();
     }
 
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = htonl(settings.srcip);
+    bind_addr.sin_port = htons(settings.srcport);
+    ret = udp_bind(c->ctx, c->fd, (struct sockaddr *) &bind_addr,
+        sizeof(bind_addr));
+    if (ret != 0) {
+        perror("bind failed");
+        fprintf(stderr, "[%"PRIu64"] bind failed\n", c->id);
+        abort();
+    }
+
     addr = &c->addr;
     memset(addr, 0, sizeof(*addr));
     addr->sin_family = AF_INET;
@@ -148,19 +162,18 @@ static void prepare_core(struct core *c)
 
     /* Core 0 resolves ARP */
     int arp_size = 8;
-    ssize_t arp_ret;
-    if (c->id == 0)
-    {
+    if (c->id == 0) {
         udp_sendto(c->ctx, c->fd, c->tx_buf, arp_size, 
             (struct sockaddr *) &c->addr, sizeof(c->addr));
         sleep(1);
         udp_sendto(c->ctx, c->fd, c->tx_buf, arp_size, 
             (struct sockaddr *) &c->addr, sizeof(c->addr));
         sleep(1);
-        while(udp_poll_fast(c->ctx) == 0);
-        while(udp_recvfrom(c->ctx, c->fd, c->rx_buf, 
-            arp_size, NULL, 0) == 0)
-        fprintf(stderr, "Resolved ARP\n");
+        if (!settings.bypass_arp) {
+            while(udp_poll_fast(c->ctx) == 0);
+            while(udp_recvfrom(c->ctx, c->fd, c->rx_buf, arp_size, NULL, 0) == 0);
+            fprintf(stderr, "Resolved ARP\n");
+        }
         __sync_fetch_and_add(&arp_ready, 1);
     } else {
         while (__sync_fetch_and_add(&arp_ready, 0) == 0) {
