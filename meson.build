@@ -20,9 +20,11 @@ demi_lib = cc.find_library(
 )
 
 cham_dep = dependency('cham_udp', required: false)
+cham_dep_rpc = dependency('cham_rpc', required: false)
 
 demi_enabled = dpdk_dep.found() and demi_lib.found()
 cham_enabled = dpdk_dep.found() and cham_dep.found()
+
 
 if demi_enabled
   demi_inc = include_directories('/workspaces/include')
@@ -39,13 +41,15 @@ if demi_enabled
   )
 endif
 
-if cham_enabled
+# if cham_enabled
   cham_deps = declare_dependency(
     dependencies: [
       cham_dep,
       dpdk_dep,
+      cham_dep_rpc
     ],
   )
-endif
+# endif
 
-subdir('udp')
+# subdir('udp')
+subdir('rpc')
