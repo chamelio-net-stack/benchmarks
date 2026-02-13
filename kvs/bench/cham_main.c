@@ -158,15 +158,8 @@ static void prepare_core(struct core *c)
             (struct sockaddr *) &c->addr, sizeof(c->addr));
         sleep(1);
         while(udp_poll_fast(c->ctx) == 0);
-        do {
-            arp_ret = udp_recvfrom(c->ctx, c->fd, c->rx_buf,
-                BUFSIZE, NULL, 0);
-        } while (arp_ret > 0);
-        if (arp_ret < 0) {
-            fprintf(stderr, "[%"PRIu64"] ARP probe drain failed: ret=%zd errno=%d\n",
-                c->id, arp_ret, errno);
-            abort();
-        }
+        while(udp_recvfrom(c->ctx, c->fd, c->rx_buf, 
+            arp_size, NULL, 0) == 0)
         fprintf(stderr, "Resolved ARP\n");
         __sync_fetch_and_add(&arp_ready, 1);
     } else {

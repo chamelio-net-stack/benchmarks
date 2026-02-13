@@ -71,14 +71,11 @@ static int core_socket(struct core *c)
     if (c->id == 0)
     {
         ssize_t n;
-        while (udp_poll_fast(c->ctx) == 0) {
-        }
+        while (udp_poll_fast(c->ctx) == 0) {}
         n = udp_recvfrom(c->ctx, fd, c->rx_buf, arp_size,
             (struct sockaddr *) &c->peer_addr, sizeof(c->peer_addr));
-        if (n > 0) {
-            udp_sendto(c->ctx, fd, c->rx_buf, (size_t) n,
-                (struct sockaddr *) &c->peer_addr, sizeof(c->peer_addr));
-        }
+        udp_sendto(c->ctx, fd, c->rx_buf, (size_t) n,
+            (struct sockaddr *) &c->peer_addr, sizeof(c->peer_addr));
         printf("ARP initialized\n");
     }
 
