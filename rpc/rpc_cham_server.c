@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <assert.h>
 #include <sched.h>
+#include "../utils/clock.h"
 #include "../utils/core.h"
 
 #define MAX_WORKERS 16
@@ -55,13 +56,6 @@ static struct core *cores = NULL;
 struct sockaddr_in src_addr;
 
 struct rpc_context_lib *rpc_ctx;
-
-static inline __u64 now_ns(void)
-{
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-  return (__u64)ts.tv_sec * 1000000000ULL + (__u64)ts.tv_nsec;
-}
 
 static inline int parse_core_list(const char *arg, int expected_len)
 {
@@ -341,6 +335,8 @@ static inline struct rpc_context_lib *core_init(struct core *c)
   struct rpc_server_lib *rpc_server;
   struct rpc_worker_lib *rpc_workers;
 
+  rpc_server = NULL;
+
   buf = (__u8 *)malloc(bsize);
   if (buf == NULL)
   {
@@ -510,9 +506,9 @@ int main(int argc, char **argv)
 {
   int ret, i;
   __u64 now;
-  struct rpc_context_lib *rpc_ctx;
-  struct rpc_server_lib *rpc_server;
-  struct rpc_worker_lib *rpc_worker[MAX_WORKERS];
+  // struct rpc_context_lib *rpc_ctx;
+  // struct rpc_server_lib *rpc_server;
+  // struct rpc_worker_lib *rpc_worker[MAX_WORKERS];
 
   ret = parse_args(argc, argv);
   if (ret != 0)
@@ -597,6 +593,12 @@ int main(int argc, char **argv)
 
   init_server();
   prepare_cores();
+  if (core_list_len > 0)
+  {
+    if (pin_thread_to_core(core_list[0]) != 0)
+      return EXIT_FAILURE;
+  }
+
   start_cores();
 
   printf("RPC server listening on %s:%d (msize=%zu) (bsize=%zu) (ncores=%d) \
@@ -631,5 +633,6 @@ int main(int argc, char **argv)
   for (i = 0; i < ncores; i++)
     pthread_join(threads[i], NULL);
 
+  free(core_list);
   return 0;
 }

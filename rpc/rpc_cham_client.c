@@ -437,7 +437,7 @@ static inline void core_rx(struct rpc_context_lib *rpc_ctx, struct core *c)
 
 static inline struct rpc_context_lib * core_init(struct core *c)
 {
-  int ret;
+  // int ret;
   struct rpc_context_lib *rpc_ctx;
 
   /* Each core has its own RPC context and socket */
@@ -544,8 +544,8 @@ int main(int argc, char **argv)
 {   
     int ret, i;
     __u64 now;
-    struct rpc_client_lib *rpc_client;
-    struct rpc_context_lib *rpc_ctx;
+    // struct rpc_client_lib *rpc_client;
+    // struct rpc_context_lib *rpc_ctx;
 
     ret = parse_args(argc, argv);
     if (ret != 0) 
