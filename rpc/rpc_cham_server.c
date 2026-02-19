@@ -9,6 +9,8 @@
 #include <errno.h>
 #include <pthread.h>
 #include <assert.h>
+#include <sched.h>
+#include "../utils/core.h"
 
 #define MAX_WORKERS 16
 
@@ -32,6 +34,9 @@ struct core
 size_t msize = 64;
 size_t bsize = 4096;
 int ncores = 1;
+static char *cores_arg = NULL;
+static int *core_list = NULL;
+static int core_list_len = 0;
 
 __u64 rxb_interval_total, rxp_interval_total;
 __u64 txb_interval_total, txp_interval_total;
@@ -58,6 +63,84 @@ static inline __u64 now_ns(void)
   return (__u64)ts.tv_sec * 1000000000ULL + (__u64)ts.tv_nsec;
 }
 
+static inline int parse_core_list(const char *arg, int expected_len)
+{
+  int count = 1;
+  const char *p = arg;
+  char *tmp, *tok, *end;
+  int idx = 0;
+
+  if (arg == NULL || *arg == '\0')
+    return -1;
+
+  while (*p)
+  {
+    if (*p == ',')
+      count++;
+    p++;
+  }
+
+  if (expected_len > 0 && count != expected_len)
+  {
+    fprintf(stderr, "cores list must have %d entries (main + %d threads)\n",
+        expected_len, expected_len - 1);
+    return -1;
+  }
+
+  core_list = (int *) calloc((size_t) count, sizeof(int));
+  if (!core_list)
+  {
+    perror("calloc core_list");
+    return -1;
+  }
+
+  tmp = strdup(arg);
+  if (!tmp)
+  {
+    perror("strdup cores");
+    free(core_list);
+    core_list = NULL;
+    return -1;
+  }
+
+  for (tok = strtok(tmp, ","); tok != NULL; tok = strtok(NULL, ","))
+  {
+    while (*tok == ' ' || *tok == '\t')
+      tok++;
+    if (*tok == '\0')
+    {
+      fprintf(stderr, "empty core id in list\n");
+      free(core_list);
+      core_list = NULL;
+      free(tmp);
+      return -1;
+    }
+    errno = 0;
+    core_list[idx] = (int) strtol(tok, &end, 10);
+    if (errno != 0 || end == tok || (*end != '\0' && *end != ' ' && *end != '\t'))
+    {
+      fprintf(stderr, "invalid core id: %s\n", tok);
+      free(core_list);
+      core_list = NULL;
+      free(tmp);
+      return -1;
+    }
+    if (core_list[idx] < 0 || core_list[idx] >= CPU_SETSIZE)
+    {
+      fprintf(stderr, "core id out of range: %d\n", core_list[idx]);
+      free(core_list);
+      core_list = NULL;
+      free(tmp);
+      return -1;
+    }
+    idx++;
+  }
+
+  free(tmp);
+  core_list_len = count;
+  return 0;
+}
+
 static inline int parse_args(int argc, char **argv)
 {
   int i;
@@ -66,8 +149,8 @@ static inline int parse_args(int argc, char **argv)
   if (argc < 3)
   {
     fprintf(stderr, "Usage: %s <bind_ip> <port> [--nworkers N]"
-                    " [--service id1,id2,...] [--ncores N] [--buf-size] [--msize N]\n",
-            argv[0]);
+                    " [--service id1,id2,...] [--ncores N] [--buf-size]"
+                    " [--msize N] [--cores LIST]\n",argv[0]);
     return -1;
   }
   src_ip = argv[1];
@@ -144,12 +227,22 @@ static inline int parse_args(int argc, char **argv)
       if (msize <= 0)
         msize = 1;
     }
+    else if (strcmp(argv[i], "--cores") == 0 && i + 1 < argc)
+    {
+      cores_arg = argv[++i];
+      
+    }
     else
     {
       fprintf(stderr, "Unknown arg: %s\n", argv[i]);
       return -1;
     }
   }
+  if (cores_arg != NULL)
+  {
+    if (parse_core_list(cores_arg, ncores + 1) != 0) return -1;
+  }
+
   return 0;
 }
 
@@ -324,6 +417,11 @@ static inline void *core_thread(void *arg)
   struct rpc_context_lib *rpc_ctx;
 
   c = (struct core *)arg;
+  if (core_list_len > 0)
+  {
+    if (pin_thread_to_core(core_list[c->id + 1]) != 0)
+      pthread_exit((void *) (intptr_t) -1);
+  }
   rpc_ctx = core_init(c);
 
   /* Core 0 waits here while others wait in init */
