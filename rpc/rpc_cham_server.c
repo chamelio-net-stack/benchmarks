@@ -1,3 +1,19 @@
+/* Usage:
+ *   ./rpc_cham_server <bind_ip> <port> [--nworkers N][--service id1,id2,...]
+ *  [--ncores N] [--buf-size] [--msize N] [--cores LIST]
+ * 
+ * Example:
+ *   ./rpc_cham_server 0.0.0.0 9000 --nworkers 2 --service 1,2,3,4
+ *   --ncores 2 --buf-size 4096 --msize 64 
+ *                
+ *   --nworkers Number of worker threads to create (default: 1)
+ *   --service Comma-separated list of service IDs to register (default: none)  
+ *   --msize Size of expected message
+ *   --ncores Number of cores to use
+ *   --buf-size Size of transmit buffer
+ *   --cores Comma-separated core list (main, thread0, thread1, ...)
+ */
+
 #define _GNU_SOURCE
 #include <chamelio/rpc_lib.h>
 #include <sys/socket.h>
