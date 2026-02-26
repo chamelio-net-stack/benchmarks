@@ -424,7 +424,7 @@ static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
       
     c->tokens -= msize;
     c->total_tx_pkts++;
-    __sync_fetch_and_add(&c->txb_load_interval, ntx);
+    __sync_fetch_and_add(&c->txb_load_interval, msize);
     __sync_fetch_and_add(&c->txp_load_interval, 1);
   }
 }
