@@ -1,3 +1,17 @@
+/* Reports per-second throughput (Mbits/s and packets/s) and cumulative
+ * latency percentiles (p50, p99, p99.9) in microseconds.
+ *
+ * Usage:
+ *   ./rpc_cham_client <src_ip> <src_port> <rem_ip> <rem_port>
+ *     [--msize N] [--duration S] [--rate R] [--ncores N]
+ *
+ *   --msize Total UDP payload bytes.
+ *   --duration Duration in seconds to run benchmark
+ *   --rate Per-core send rate in megabits per second
+ *   --ncores Number of cores to use
+ *   --cores Comma-separated core list (main, thread0, thread1, ...)
+ */
+
 #define _GNU_SOURCE
 #include <chamelio/rpc_lib.h>
 #include <errno.h>
@@ -254,6 +268,7 @@ static inline void print_stats(__u64 now)
   }
 }
 
+//TODO: add arg for cores to use (main, thread0, thread1, etc.)
 static inline int parse_args(int argc, char **argv)
 {
   if (argc < 3)
