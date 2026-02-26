@@ -397,10 +397,12 @@ static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
     ph->tsc = util_rdtsc();
 
     //TODO: remove the hardcoded service_id
+    fprintf(stderr, "core %d: attempting rpc_call\n", c->id);
     ntx = rpc_call(c->client, c->dst_addr.sin_addr.s_addr, 
       ntohs(c->dst_addr.sin_port), 1, c->txbuf, msize);
     // assert(ntx == msize || ntx <= 0);
     // assert(c->tokens >= msize);
+    fprintf(stderr, "core %d: rpc_call returned %d\n", c->id, ntx);
     
     if (ntx < 0)
       break;
@@ -503,6 +505,9 @@ static inline void * core_thread(void *arg)
     assert(delta_us >= 0);
     bytes_per_us = (c->rate / 8.0);
     c->tokens += delta_us * bytes_per_us;
+
+    fprintf(stderr, "tokens=%.2f msize=%zu delta_us=%.2f\n", 
+        c->tokens, msize, delta_us);
     
     /* Cap bucket to 1 ms worth of traffic to avoid unbounded bursts */
     max_tokens = bytes_per_us * 1000;
