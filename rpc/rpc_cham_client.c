@@ -26,12 +26,14 @@
 #include <unistd.h>
 #include <pthread.h>
 
-struct payload_hdr {
+struct payload_hdr
+{
   __u64 tsc;
-}__attribute__((packed));
+} __attribute__((packed));
 
 /* Per-core context */
-struct core {
+struct core
+{
   int id;
   // int fd;
   __u8 *txbuf;
@@ -63,7 +65,6 @@ int ncores = 1;
 const char *rem_ip;
 int rem_port;
 
-
 /* Global time and stats variables */
 __u64 t_start_ns, t_end_ns;
 __u64 t_last_report_ns, t_next_report_ns;
@@ -88,12 +89,12 @@ static inline __u64 now_ns(void)
 {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-  return (__u64) ts.tv_sec * 1000000000ULL + (__u64) ts.tv_nsec;
+  return (__u64)ts.tv_sec * 1000000000ULL + (__u64)ts.tv_nsec;
 }
 
 static inline void hist_add(__u64 rtt_us)
 {
-  if (rtt_us > MAX_RTT_US) 
+  if (rtt_us > MAX_RTT_US)
     rtt_us = MAX_RTT_US;
 
   __sync_fetch_and_add(&rtt_hist[rtt_us], 1);
@@ -103,19 +104,19 @@ static inline void hist_add(__u64 rtt_us)
 static inline __u64 util_rdtsc(void)
 {
   __u32 eax, edx;
-  asm volatile ("rdtsc" : "=a" (eax), "=d" (edx));
+  asm volatile("rdtsc" : "=a"(eax), "=d"(edx));
   return ((__u64)edx << 32) | eax;
 }
 
 static inline __u64 us_since_tsc(__u64 tsc_then)
 {
   __u64 tsc_now = util_rdtsc();
-  double delta = (double) (tsc_now - tsc_then);
+  double delta = (double)(tsc_now - tsc_then);
   assert(delta >= 0);
   double us = delta / tsc_per_us;
   assert(us >= 0);
-  
-  return (__u64) us;
+
+  return (__u64)us;
 }
 
 static inline void calibrate_tsc(void)
@@ -124,8 +125,8 @@ static inline void calibrate_tsc(void)
   __u64 t0, t1;
   __u64 us_before, us_after;
   __u64 dt_cycles, dt_us;
-  
-  if (tsc_per_us != 0.0) 
+
+  if (tsc_per_us != 0.0)
     return;
 
   if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts_before) != 0)
@@ -145,16 +146,14 @@ static inline void calibrate_tsc(void)
   }
 
   dt_cycles = t1 - t0;
-  us_before = (__u64) ts_before.tv_sec * 1000000ULL
-      + (__u64) (ts_before.tv_nsec / 1000ULL);
-  us_after  = (__u64) ts_after.tv_sec  * 1000000ULL
-      + (__u64) (ts_after.tv_nsec  / 1000ULL);
+  us_before = (__u64)ts_before.tv_sec * 1000000ULL + (__u64)(ts_before.tv_nsec / 1000ULL);
+  us_after = (__u64)ts_after.tv_sec * 1000000ULL + (__u64)(ts_after.tv_nsec / 1000ULL);
   dt_us = us_after - us_before;
 
   if (dt_us == 0)
     dt_us = 1;
 
-  tsc_per_us = (double) dt_cycles / (double) dt_us;
+  tsc_per_us = (double)dt_cycles / (double)dt_us;
   if (tsc_per_us <= 0.0)
   {
     fprintf(stderr, "calibrate_tsc: invalid tsc_per_us: %f\n", tsc_per_us);
@@ -170,14 +169,14 @@ static inline bool hist_percentiles(__u64 *p50, __u64 *p99, __u64 *p999)
   __u64 acc = 0;
   __u64 v50 = 0, v99 = 0, v999 = 0;
   __u8 got50 = 0, got99 = 0, got999 = 0;
-  
+
   samples = __sync_fetch_and_add(&total_rx, 0);
-  if (samples == 0) 
+  if (samples == 0)
     return 0;
 
   N = samples;
-  t50  = (N * 50  + 100 - 1) / 100;
-  t99  = (N * 99  + 100 - 1) / 100;
+  t50 = (N * 50 + 100 - 1) / 100;
+  t99 = (N * 99 + 100 - 1) / 100;
   t999 = (N * 999 + 1000 - 1) / 1000;
 
   for (i = 0; i <= MAX_RTT_US; i++)
@@ -210,7 +209,9 @@ static inline bool hist_percentiles(__u64 *p50, __u64 *p99, __u64 *p999)
       break;
   }
 
-  *p50 = v50; *p99 = v99; *p999 = v999;
+  *p50 = v50;
+  *p99 = v99;
+  *p999 = v999;
   return 1;
 }
 
@@ -220,17 +221,18 @@ static inline void print_stats(__u64 now)
   __u64 p50 = 0, p99 = 0, p999 = 0;
   __u64 bytes_load = 0, pkts_load = 0, bytes_tp = 0, pkts_tp = 0;
 
-  interval_s = (double) (t_next_report_ns - t_last_report_ns) / 1e9;
-  if (interval_s <= 0.0) interval_s = 1.0;
+  interval_s = (double)(t_next_report_ns - t_last_report_ns) / 1e9;
+  if (interval_s <= 0.0)
+    interval_s = 1.0;
 
   /* Aggregate per-core and reset per-core intervals */
   for (int i = 0; i < ncores; i++)
   {
     bytes_load += __sync_fetch_and_add(&cores[i].txb_load_interval, 0);
-    pkts_load  += __sync_fetch_and_add(&cores[i].txp_load_interval, 0);
+    pkts_load += __sync_fetch_and_add(&cores[i].txp_load_interval, 0);
     bytes_tp += __sync_fetch_and_add(&cores[i].txb_tp_interval, 0);
-    pkts_tp  += __sync_fetch_and_add(&cores[i].txp_tp_interval, 0);
-    
+    pkts_tp += __sync_fetch_and_add(&cores[i].txp_tp_interval, 0);
+
     /* Zero values safely */
     __sync_fetch_and_and(&cores[i].txb_load_interval, 0);
     __sync_fetch_and_and(&cores[i].txp_load_interval, 0);
@@ -238,27 +240,27 @@ static inline void print_stats(__u64 now)
     __sync_fetch_and_and(&cores[i].txp_tp_interval, 0);
   }
   txb_load_interval_total = bytes_load;
-  txp_load_interval_total  = pkts_load;
+  txp_load_interval_total = pkts_load;
   txb_tp_interval_total = bytes_tp;
-  txp_tp_interval_total  = pkts_tp;
+  txp_tp_interval_total = pkts_tp;
 
-  rps_load  = (double) txp_load_interval_total / interval_s;
-  mbps_load = ((double) txb_load_interval_total * 8.0 / 1e6) / interval_s;
-  rps_tp  = (double) txp_tp_interval_total / interval_s;
-  mbps_tp = ((double) txb_tp_interval_total * 8.0 / 1e6) / interval_s;
+  rps_load = (double)txp_load_interval_total / interval_s;
+  mbps_load = ((double)txb_load_interval_total * 8.0 / 1e6) / interval_s;
+  rps_tp = (double)txp_tp_interval_total / interval_s;
+  mbps_tp = ((double)txb_tp_interval_total * 8.0 / 1e6) / interval_s;
 
   hist_percentiles(&p50, &p99, &p999);
 
   printf("[ %3lus ] load=%lld rps | load=%.2f Mb/s | tp=%lld rps | tp=%.2f Mb/s | ",
-          (unsigned long)((t_next_report_ns - t_start_ns) / 1000000000ULL),
-          (__u64) rps_load, mbps_load, (__u64) rps_tp, mbps_tp);
+         (unsigned long)((t_next_report_ns - t_start_ns) / 1000000000ULL),
+         (__u64)rps_load, mbps_load, (__u64)rps_tp, mbps_tp);
   printf("p50=%llu us  p99=%llu us  p99.9=%llu us\n",
-          (unsigned long long) p50,
-          (unsigned long long) p99,
-          (unsigned long long) p999);
+         (unsigned long long)p50,
+         (unsigned long long)p99,
+         (unsigned long long)p999);
   fflush(stdout);
 
-  t_last_report_ns  = t_next_report_ns;
+  t_last_report_ns = t_next_report_ns;
   t_next_report_ns += 1000000000ULL;
 
   if (now > t_next_report_ns + 5000000000ULL)
@@ -268,13 +270,14 @@ static inline void print_stats(__u64 now)
   }
 }
 
-//TODO: add arg for cores to use (main, thread0, thread1, etc.)
+// TODO: add arg for cores to use (main, thread0, thread1, etc.)
 static inline int parse_args(int argc, char **argv)
 {
   if (argc < 3)
   {
     fprintf(stderr, "Usage: %s <src_ip> <src_port>  <rem_ip> <rem_port> [--msize N]"
-        " [--duration S] [--rate R] [--ncores N]\n", argv[0]);
+                    " [--duration S] [--rate R] [--ncores N]\n",
+            argv[0]);
     return -1;
   }
 
@@ -322,21 +325,22 @@ static inline int parse_args(int argc, char **argv)
     fprintf(stderr, "rate must be > 0\n");
     return -1;
   }
- 
+
   if (msize < sizeof(struct payload_hdr))
   {
     fprintf(stderr, "msize must be at least %zu bytes (header size)\n",
-        sizeof(struct payload_hdr));
+            sizeof(struct payload_hdr));
     return -1;
   }
 
-  if (ncores <= 0) ncores = 1;
+  if (ncores <= 0)
+    ncores = 1;
   return 0;
 }
 
 static inline int init_hist(void)
 {
-  rtt_hist = (__u64 *) calloc((size_t) MAX_RTT_US + 1, sizeof(__u64));
+  rtt_hist = (__u64 *)calloc((size_t)MAX_RTT_US + 1, sizeof(__u64));
   if (!rtt_hist)
   {
     perror("calloc rtt_hist");
@@ -348,29 +352,29 @@ static inline int init_hist(void)
 static inline void init_client()
 {
   src_addr.sin_family = AF_INET;
-  src_addr.sin_port = htons((__u16) src_port);
+  src_addr.sin_port = htons((__u16)src_port);
   if (inet_pton(AF_INET, src_ip, &src_addr.sin_addr) != 1)
   {
     fprintf(stderr, "invalid bind_ip\n");
     abort();
   }
-  
+
   /* Calibrate tsc */
   calibrate_tsc();
 
   /* Allocate cores and thread handles */
-  cores = (struct core *) calloc((size_t) ncores, 
-      sizeof(struct core));
-  threads = (pthread_t *) calloc((size_t) ncores, sizeof(pthread_t));
+  cores = (struct core *)calloc((size_t)ncores,
+                                sizeof(struct core));
+  threads = (pthread_t *)calloc((size_t)ncores, sizeof(pthread_t));
   if (!cores || !threads)
   {
     perror("calloc cores/threads");
     exit(EXIT_FAILURE);
   }
-  
+
   /* Barrier for all cores + main (to synchronize start of sending) */
-  if (pthread_barrier_init(&start_barrier, NULL, 
-      (unsigned) ncores + 1) != 0)
+  if (pthread_barrier_init(&start_barrier, NULL,
+                           (unsigned)ncores + 1) != 0)
   {
     perror("pthread_barrier_init");
     exit(EXIT_FAILURE);
@@ -380,7 +384,7 @@ static inline void init_client()
 static inline void prepare_cores()
 {
   int i;
-  
+
   for (i = 0; i < ncores; i++)
   {
     memset(&cores[i], 0, sizeof(struct core));
@@ -391,7 +395,7 @@ static inline void prepare_cores()
 
     memset(&cores[i].dst_addr, 0, sizeof(cores[i].dst_addr));
     cores[i].dst_addr.sin_family = AF_INET;
-    cores[i].dst_addr.sin_port   = htons((__u16) rem_port);
+    cores[i].dst_addr.sin_port = htons((__u16)rem_port);
     if (inet_pton(AF_INET, rem_ip, &cores[i].dst_addr.sin_addr) != 1)
     {
       fprintf(stderr, "Invalid server_ip\n");
@@ -405,23 +409,27 @@ static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
 {
   int ntx;
   struct payload_hdr *ph;
-  
-  while (c->tokens >= (double) msize)
+
+  while (c->tokens >= (double)msize)
   {
-    ph = (struct payload_hdr *) c->txbuf;
+    ph = (struct payload_hdr *)c->txbuf;
     ph->tsc = util_rdtsc();
 
-    //TODO: remove the hardcoded service_id
-    fprintf(stderr, "core %d: attempting rpc_call\n", c->id);
-    ntx = rpc_call(c->client, c->dst_addr.sin_addr.s_addr, 
-      ntohs(c->dst_addr.sin_port), 1, c->txbuf, msize);
+    // TODO: remove the hardcoded service_id
+    //  fprintf(stderr, "core %d: attempting rpc_call\n", c->id);
+    ntx = rpc_call(c->client, c->dst_addr.sin_addr.s_addr,
+                   ntohs(c->dst_addr.sin_port), 1, c->txbuf, msize);
+    if (c->total_tx_pkts < 10)
+    {
+      fprintf(stderr, "rpc_call ret=%d tokens=%.2f\n", ntx, c->tokens);
+    }
     // assert(ntx == msize || ntx <= 0);
     // assert(c->tokens >= msize);
-    fprintf(stderr, "core %d: rpc_call returned %d\n", c->id, ntx);
-    
+    // fprintf(stderr, "core %d: rpc_call returned %d\n", c->id, ntx);
+
     if (ntx < 0)
       break;
-      
+
     c->tokens -= msize;
     c->total_tx_pkts++;
     __sync_fetch_and_add(&c->txb_load_interval, msize);
@@ -434,7 +442,7 @@ static inline void core_rx(struct rpc_context_lib *rpc_ctx, struct core *c)
   int nrx;
   __u64 rtt_us;
   struct payload_hdr *ph;
-  
+
   while (1)
   {
     // assert(msize <= msize - c->total_rx_pkts);
@@ -443,7 +451,7 @@ static inline void core_rx(struct rpc_context_lib *rpc_ctx, struct core *c)
     if (nrx < 0)
       break;
 
-    ph = (struct payload_hdr *) c->rxbuf;
+    ph = (struct payload_hdr *)c->rxbuf;
     rtt_us = us_since_tsc(ph->tsc);
     c->total_rx_pkts += 1;
     __sync_fetch_and_add(&c->txp_load_interval, 1);
@@ -452,7 +460,7 @@ static inline void core_rx(struct rpc_context_lib *rpc_ctx, struct core *c)
   }
 }
 
-static inline struct rpc_context_lib * core_init(struct core *c)
+static inline struct rpc_context_lib *core_init(struct core *c)
 {
   // int ret;
   struct rpc_context_lib *rpc_ctx;
@@ -462,15 +470,15 @@ static inline struct rpc_context_lib * core_init(struct core *c)
   if (rpc_ctx == NULL)
   {
     fprintf(stderr, "core %d: failed to create RPC context\n", c->id);
-    pthread_exit((void *) (intptr_t) -1);
+    pthread_exit((void *)(intptr_t)-1);
   }
 
-  c->txbuf = (__u8 *) malloc(msize);
-  c->rxbuf = (__u8 *) malloc(msize);
+  c->txbuf = (__u8 *)malloc(msize);
+  c->rxbuf = (__u8 *)malloc(msize);
   if (!c->txbuf || !c->rxbuf)
   {
     perror("malloc buffers");
-    pthread_exit((void *) (intptr_t) -1);
+    pthread_exit((void *)(intptr_t)-1);
   }
   memset(c->txbuf, 0, msize);
   memset(c->rxbuf, 0, msize);
@@ -479,7 +487,26 @@ static inline struct rpc_context_lib * core_init(struct core *c)
   if (c->client == NULL)
   {
     fprintf(stderr, "core %d: failed to create RPC client\n", c->id);
-    pthread_exit((void *) (intptr_t) -1);
+    pthread_exit((void *)(intptr_t)-1);
+  }
+   fprintf(stderr, "client: bind_success=%d tx_len=%u rx_len=%u tx_buf=%p rx_buf=%p core=%u\n",
+          c->client->bind_success,
+          c->client->tx_len,
+          c->client->rx_len,
+          c->client->tx_buf,
+          c->client->rx_buf,
+          c->client->core);
+          
+  fprintf(stderr, "client core=%u rx_ip=%u rx_port=%u tx_ip=%u\n",
+          c->client->core,
+          c->client->rx_ip,
+          c->client->rx_port,
+          c->client->tx_ip);
+
+  if (c->client->rx_ip == 0 && c->client->tx_ip == 0)
+  {
+    fprintf(stderr, "FATAL: client has zero IPs — rpc_new_client misconfigured\n");
+    pthread_exit((void *)(intptr_t)-1);
   }
 
   c->txb_load_interval = 0;
@@ -488,26 +515,26 @@ static inline struct rpc_context_lib * core_init(struct core *c)
   c->txp_tp_interval = 0;
   c->total_tx_pkts = 0;
   c->total_rx_pkts = 0;
-  c->tokens  = 0.0;
+  c->tokens = 0.0;
   return rpc_ctx;
 }
 
-static inline void * core_thread(void *arg)
+static inline void *core_thread(void *arg)
 {
   struct core *c;
   struct rpc_context_lib *rpc_ctx;
   __u64 start_tsc, elapsed, tsc_now;
   double bytes_per_us, delta_cycles, delta_us, max_tokens;
 
-  c = (struct core *) arg;
+  c = (struct core *)arg;
   rpc_ctx = core_init(c);
-  
+
   /* Synchronize start with all other cores and main */
   pthread_barrier_wait(&start_barrier);
   c->last_tsc = util_rdtsc();
   start_tsc = util_rdtsc();
-  
-  while(1)
+
+  while (1)
   {
     elapsed = us_since_tsc(start_tsc);
     if (duration > 0 && elapsed >= (duration * 1000000))
@@ -515,15 +542,15 @@ static inline void * core_thread(void *arg)
 
     /* Update token bucket using TSC */
     tsc_now = util_rdtsc();
-    delta_cycles = (double) (tsc_now - c->last_tsc);
+    delta_cycles = (double)(tsc_now - c->last_tsc);
     delta_us = delta_cycles / tsc_per_us;
     assert(delta_us >= 0);
     bytes_per_us = (c->rate / 8.0);
     c->tokens += delta_us * bytes_per_us;
 
-    fprintf(stderr, "tokens=%.2f msize=%zu delta_us=%.2f\n", 
-        c->tokens, msize, delta_us);
-    
+    // fprintf(stderr, "tokens=%.2f msize=%zu delta_us=%.2f\n",
+    // c->tokens, msize, delta_us);
+
     /* Cap bucket to 1 ms worth of traffic to avoid unbounded bursts */
     max_tokens = bytes_per_us * 1000;
     if (c->tokens > max_tokens)
@@ -536,17 +563,17 @@ static inline void * core_thread(void *arg)
     /* Send as many packets as tokens allow */
     core_tx(rpc_ctx, c);
     /* Drain replies */
-    // rpc_poll_calls(rpc_ctx);
+    rpc_poll_calls(rpc_ctx);
     // core_rx(rpc_ctx, c);
   }
 
-  pthread_exit((void *) (intptr_t) 0);
+  pthread_exit((void *)(intptr_t)0);
 }
 
 static inline void start_cores()
 {
   int i, rc;
-  
+
   /* Spawn core threads */
   for (i = 0; i < ncores; i++)
   {
@@ -561,44 +588,46 @@ static inline void start_cores()
 }
 
 int main(int argc, char **argv)
-{   
-    int ret, i;
-    __u64 now;
-    // struct rpc_client_lib *rpc_client;
-    // struct rpc_context_lib *rpc_ctx;
+{
+  int ret, i;
+  __u64 now;
+  // struct rpc_client_lib *rpc_client;
+  // struct rpc_context_lib *rpc_ctx;
 
-    ret = parse_args(argc, argv);
-    if (ret != 0) 
-    {
-        fprintf(stderr, "Failed to parse args\n");
-        abort();
-    }
-    ret = init_hist();
-    if (ret != 0)    {
-        fprintf(stderr, "Failed to init hist\n");
-        abort();
-    }
+  ret = parse_args(argc, argv);
+  if (ret != 0)
+  {
+    fprintf(stderr, "Failed to parse args\n");
+    abort();
+  }
+  ret = init_hist();
+  if (ret != 0)
+  {
+    fprintf(stderr, "Failed to init hist\n");
+    abort();
+  }
 
-    ret = rpc_connect_slow();
-    if (ret != 0)    {
-        fprintf(stderr, "Failed to connect to RPC server\n");
-        exit(EXIT_FAILURE);
-    }
-    init_client();
-    prepare_cores();
-    start_cores();
+  ret = rpc_connect_slow();
+  if (ret != 0)
+  {
+    fprintf(stderr, "Failed to connect to RPC server\n");
+    exit(EXIT_FAILURE);
+  }
+  init_client();
+  prepare_cores();
+  start_cores();
 
-    /* Wait for work threads before continuing */
+  /* Wait for work threads before continuing */
   printf("Initialized %d core(s). Waiting for barrier\n", ncores);
   fflush(stdout);
   pthread_barrier_wait(&start_barrier);
-  
+
   /* Establish timebase and reporting windows */
   t_start_ns = now_ns();
   t_last_report_ns = t_start_ns;
   t_next_report_ns = t_start_ns + 1000000000ULL;
-  t_end_ns = t_start_ns + (__u64) duration * 1000000000ULL;
-  
+  t_end_ns = t_start_ns + (__u64)duration * 1000000000ULL;
+
   /* Per-second reporting loop in main thread */
   while (1)
   {
@@ -610,7 +639,7 @@ int main(int argc, char **argv)
       print_stats(now);
 
     /* Sleep a bit to avoid busy wait */
-    struct timespec ts = { .tv_sec = 0, .tv_nsec = 2000000 };
+    struct timespec ts = {.tv_sec = 0, .tv_nsec = 2000000};
     nanosleep(&ts, NULL);
   }
 
@@ -634,24 +663,26 @@ int main(int argc, char **argv)
   }
 
   printf("Cores               : %d\n", ncores);
-  printf("TX packets          : %llu\n", (unsigned long long) totalp_tx);
-  printf("RX packets          : %llu\n", (unsigned long long) totalp_rx);
-  printf("Avg Load            : %lld rps %.2f Mb/s\n", 
-      totalp_tx / duration, 
-      ((double) totalp_tx * msize * 8 / 1000000) / duration);
-  printf("Avg Throughput      : %lld rps %.2f Mb/s\n", 
-      totalp_rx / duration, 
-      ((double) totalp_rx * msize * 8 / 1000000) / duration);
+  printf("TX packets          : %llu\n", (unsigned long long)totalp_tx);
+  printf("RX packets          : %llu\n", (unsigned long long)totalp_rx);
+  printf("Avg Load            : %lld rps %.2f Mb/s\n",
+         totalp_tx / duration,
+         ((double)totalp_tx * msize * 8 / 1000000) / duration);
+  printf("Avg Throughput      : %lld rps %.2f Mb/s\n",
+         totalp_rx / duration,
+         ((double)totalp_rx * msize * 8 / 1000000) / duration);
   printf("RTT percentiles (us): p50=%llu  p99=%llu  p99.9=%llu\n",
-      (unsigned long long) p50,
-      (unsigned long long) p99,
-      (unsigned long long) p999);
+         (unsigned long long)p50,
+         (unsigned long long)p99,
+         (unsigned long long)p999);
 
   /* Cleanup */
   for (i = 0; i < ncores; i++)
   {
-    if (cores[i].txbuf) free(cores[i].txbuf);
-    if (cores[i].rxbuf) free(cores[i].rxbuf);
+    if (cores[i].txbuf)
+      free(cores[i].txbuf);
+    if (cores[i].rxbuf)
+      free(cores[i].rxbuf);
   }
 
   free(cores);
@@ -659,16 +690,15 @@ int main(int argc, char **argv)
   free(rtt_hist);
   pthread_barrier_destroy(&start_barrier);
 
-
   //   memset(&src_addr, 0, sizeof(src_addr));
   //   src_addr.sin_family = AF_INET;
   //   src_addr.sin_port   = htons((__u16) src_port);
-    
+
   //   if (inet_pton(AF_INET, src_ip, &src_addr.sin_addr) != 1) {
   //       fprintf(stderr, "Invalid bind_ip\n");
   //       abort();
   //   }
-    
+
   //   ret = rpc_connect_slow();
   //   if (ret != 0)
   //       abort();
@@ -678,7 +708,7 @@ int main(int argc, char **argv)
   //       fprintf(stderr, "Failed to create RPC context\n");
   //       abort();
   //   }
-  //   rpc_client = rpc_new_client(rpc_ctx, 
+  //   rpc_client = rpc_new_client(rpc_ctx,
   //       ntohl(src_addr.sin_addr.s_addr), src_port);
   //   if (rpc_client == NULL) {
   //       fprintf(stderr, "Failed to create RPC client\n");
@@ -739,5 +769,5 @@ int main(int argc, char **argv)
   //     next = now + 1000000000ULL;
   //   }
   // }
-    return 0;
+  return 0;
 }
