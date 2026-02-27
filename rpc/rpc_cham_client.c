@@ -423,6 +423,14 @@ static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
     {
       fprintf(stderr, "rpc_call ret=%d tokens=%.2f\n", ntx, c->tokens);
     }
+    if (c->total_tx_pkts < 10)
+    {
+      fprintf(stderr, "rpc_call ret=%d tx_avail=%u tx_len=%u tokens=%.2f\n",
+              ntx,
+              c->client->tx_avail,
+              c->client->tx_len,
+              c->tokens);
+    }
     // assert(ntx == msize || ntx <= 0);
     // assert(c->tokens >= msize);
     // fprintf(stderr, "core %d: rpc_call returned %d\n", c->id, ntx);
@@ -489,25 +497,19 @@ static inline struct rpc_context_lib *core_init(struct core *c)
     fprintf(stderr, "core %d: failed to create RPC client\n", c->id);
     pthread_exit((void *)(intptr_t)-1);
   }
-   fprintf(stderr, "client: bind_success=%d tx_len=%u rx_len=%u tx_buf=%p rx_buf=%p core=%u\n",
+  fprintf(stderr, "client: bind_success=%d tx_len=%u rx_len=%u tx_buf=%p rx_buf=%p core=%u\n",
           c->client->bind_success,
           c->client->tx_len,
           c->client->rx_len,
           c->client->tx_buf,
           c->client->rx_buf,
           c->client->core);
-          
+
   fprintf(stderr, "client core=%u rx_ip=%u rx_port=%u tx_ip=%u\n",
           c->client->core,
           c->client->rx_ip,
           c->client->rx_port,
           c->client->tx_ip);
-
-  if (c->client->rx_ip == 0 && c->client->tx_ip == 0)
-  {
-    fprintf(stderr, "FATAL: client has zero IPs — rpc_new_client misconfigured\n");
-    pthread_exit((void *)(intptr_t)-1);
-  }
 
   c->txb_load_interval = 0;
   c->txp_load_interval = 0;
