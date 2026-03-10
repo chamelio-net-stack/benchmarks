@@ -377,7 +377,7 @@ static inline struct rpc_context_lib *core_init(struct core *c)
     }
 
     fprintf(stderr, "thread %d creating server %s:%d\n", c->id, src_ip, src_port);
-    rpc_server = rpc_new_server(rpc_ctx, inet_addr(src_ip), (__u16)src_port);
+    rpc_server = rpc_new_server(rpc_ctx, ntohl(inet_addr(src_ip)), (__u16)src_port);
     fflush(stderr);
 
     if (!rpc_server)

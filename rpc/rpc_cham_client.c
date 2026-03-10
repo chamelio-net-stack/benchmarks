@@ -417,7 +417,7 @@ static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
 
     // TODO: remove the hardcoded service_id
     //  fprintf(stderr, "core %d: attempting rpc_call\n", c->id);
-    ntx = rpc_call(c->client, c->dst_addr.sin_addr.s_addr,
+    ntx = rpc_call(c->client, ntohl(c->dst_addr.sin_addr.s_addr),
                    ntohs(c->dst_addr.sin_port), 1, c->txbuf, msize);
     if (c->total_tx_pkts < 10)
     {
@@ -536,8 +536,14 @@ static inline void *core_thread(void *arg)
   c->last_tsc = util_rdtsc();
   start_tsc = util_rdtsc();
 
+  fprintf(stderr, "core %d: rpc_ctx=%p ncores=%d\n", 
+        c->id, rpc_ctx, rpc_ctx->ncores);
+
   while (1)
   {
+      // fprintf(stderr, "loop: rpc_ctx=%p fast_app_qs=%p fast_app_qs[0]=%p\n",
+      //     rpc_ctx, rpc_ctx->fast_app_qs, rpc_ctx->fast_app_qs[0]);
+
     elapsed = us_since_tsc(start_tsc);
     if (duration > 0 && elapsed >= (duration * 1000000))
       break;
@@ -565,7 +571,7 @@ static inline void *core_thread(void *arg)
     /* Send as many packets as tokens allow */
     core_tx(rpc_ctx, c);
     /* Drain replies */
-    rpc_poll_calls(rpc_ctx);
+    // rpc_poll_calls(rpc_ctx);
     // core_rx(rpc_ctx, c);
   }
 
