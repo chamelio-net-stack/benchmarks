@@ -98,9 +98,14 @@ static pthread_t *threads = NULL;
 static struct core *cores = NULL;
 static struct hist_state rtt_hist = { 0 };
 
+static inline int src_ip_is_auto(void)
+{
+  return strcmp(src_ip, "-1") == 0;
+}
+
 static inline int should_bind_source(void)
 {
-  return nconns == 1 && src_port != 0;
+  return nconns == 1 && src_port > 0 && !src_ip_is_auto();
 }
 
 static inline int core_src_port(int core_id)
@@ -200,7 +205,7 @@ static inline int parse_args(int argc, char **argv)
 
   src_ip = argv[1];
   src_port = atoi(argv[2]);
-  if (src_port < 0 || src_port > 65535)
+  if (src_port < -1 || src_port > 65535)
   {
     fprintf(stderr, "Invalid src_port\n");
     return -1;
@@ -793,10 +798,13 @@ static inline void init_client(void)
   memset(&src_addr, 0, sizeof(src_addr));
   src_addr.sin_family = AF_INET;
   src_addr.sin_port = htons((__u16) src_port);
-  if (inet_pton(AF_INET, src_ip, &src_addr.sin_addr) != 1)
+  if (should_bind_source())
   {
-    fprintf(stderr, "invalid source bind_ip\n");
-    abort();
+    if (inet_pton(AF_INET, src_ip, &src_addr.sin_addr) != 1)
+    {
+      fprintf(stderr, "invalid source bind_ip\n");
+      abort();
+    }
   }
 
   calibrate_tsc();
