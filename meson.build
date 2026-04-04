@@ -19,10 +19,12 @@ demi_lib = cc.find_library(
   required: false,
 )
 
-cham_dep = dependency('cham_udp', required: false)
+cham_udp_dep = dependency('cham_udp', required: false)
+cham_tcp_dep = dependency('cham_tcp', required: false)
 
 demi_enabled = dpdk_dep.found() and demi_lib.found()
-cham_enabled = dpdk_dep.found() and cham_dep.found()
+cham_enabled = dpdk_dep.found() and cham_udp_dep.found()
+cham_tcp_enabled = dpdk_dep.found() and cham_tcp_dep.found()
 
 if demi_enabled
   demi_inc = include_directories('/workspaces/include')
@@ -42,11 +44,21 @@ endif
 if cham_enabled
   cham_deps = declare_dependency(
     dependencies: [
-      cham_dep,
+      cham_udp_dep,
       dpdk_dep,
     ],
   )
 endif
 
+if cham_tcp_enabled
+  cham_tcp_deps = declare_dependency(
+    dependencies: [
+      cham_tcp_dep,
+      dpdk_dep,
+    ],
+  )
+endif
+
+subdir('tcp')
 subdir('udp')
 subdir('kvs')
