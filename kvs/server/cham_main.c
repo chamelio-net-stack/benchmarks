@@ -38,6 +38,20 @@ static struct core *cores;
 static struct item_allocator **iallocs;
 static volatile size_t n_ready = 0;
 
+static inline void core_wait_update(struct core *c, bool want_out)
+{
+    __u32 events = UDP_WAIT_IN;
+
+    if (want_out) {
+        events |= UDP_WAIT_OUT;
+    }
+
+    if (udp_wait_mod(c->wait, c->fd, events, 0) != 0) {
+        fprintf(stderr, "[%u] wait update failed errno=%d\n", c->id, errno);
+        abort();
+    }
+}
+
 static int core_socket(struct core *c)
 {
     uint16_t id;
@@ -119,6 +133,8 @@ static int core_tx(struct core *c, size_t tx_len)
             (ret < 0 &&
              (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)))
         {
+            core_wait_update(c, true);
+            udp_poll_fast(c->ctx);
             if (udp_wait_fast(c->wait, &c->event, 1, UDP_WAIT_NONBLOCK) < 0) {
                 fprintf(stderr, "[%u] udp_wait_fast failed errno=%d\n",
                     c->id, errno);
@@ -353,7 +369,7 @@ static void *processing_thread(void *data)
         fprintf(stderr, "[%u] wait allocation failed\n", c->id);
         abort();
     }
-    if (udp_wait_add(c->wait, c->fd, UDP_WAIT_IN | UDP_WAIT_OUT, 0) != 0) {
+    if (udp_wait_add(c->wait, c->fd, UDP_WAIT_IN, 0) != 0) {
         fprintf(stderr, "[%u] wait registration failed\n", c->id);
         abort();
     }
@@ -365,6 +381,8 @@ static void *processing_thread(void *data)
         size_t i;
         int rx_ret;
 
+        core_wait_update(c, false);
+        udp_poll_fast(c->ctx);
         rx_ret = udp_wait_fast(c->wait, &c->event, 1, UDP_WAIT_NONBLOCK);
         if (rx_ret < 0) {
             abort();

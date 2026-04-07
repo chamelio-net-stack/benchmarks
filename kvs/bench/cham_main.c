@@ -78,6 +78,21 @@ struct core {
 
 static double tsc_per_us;
 
+static inline void core_wait_update(struct core *c, bool want_out)
+{
+    __u32 events = UDP_WAIT_IN;
+
+    if (want_out) {
+        events |= UDP_WAIT_OUT;
+    }
+
+    if (udp_wait_mod(c->wait, c->fd, events, 0) != 0) {
+        fprintf(stderr, "[%"PRIu64"] wait update failed errno=%d\n",
+            c->id, errno);
+        abort();
+    }
+}
+
 static inline uint64_t get_nanos(void)
 {
     struct timespec ts;
@@ -196,7 +211,7 @@ static void prepare_core(struct core *c)
         fprintf(stderr, "[%"PRIu64"] wait allocation failed\n", c->id);
         abort();
     }
-    if (udp_wait_add(c->wait, c->fd, UDP_WAIT_IN | UDP_WAIT_OUT, 0) != 0) {
+    if (udp_wait_add(c->wait, c->fd, UDP_WAIT_IN, 0) != 0) {
         fprintf(stderr, "[%"PRIu64"] wait registration failed\n", c->id);
         abort();
     }
@@ -274,6 +289,8 @@ static int core_tx(struct core *c)
         
         if (ret < 0 && errno == EAGAIN)
         {
+            core_wait_update(c, true);
+            udp_poll_fast(c->ctx);
             if (udp_wait_fast(c->wait, &c->event, 1, UDP_WAIT_NONBLOCK) < 0) {
                 fprintf(stderr, "[%"PRIu64"] udp_wait_fast failed errno=%d\n",
                     c->id, errno);
@@ -510,6 +527,8 @@ static void *thread_run(void *arg)
             c->tokens -= 1.0;
         }
 
+        core_wait_update(c, false);
+        udp_poll_fast(c->ctx);
         ret = udp_wait_fast(c->wait, &c->event, 1, UDP_WAIT_NONBLOCK);
         if (ret < 0) {
             abort();

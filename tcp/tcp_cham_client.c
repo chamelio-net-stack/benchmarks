@@ -575,6 +575,11 @@ static inline void core_connect_all(struct core *c)
     int opened = core_open_pending(c);
     int nevents, progress = 0;
 
+    while (tcp_poll_slow(c->tcp_ctx) > 0)
+      progress = 1;
+    if (tcp_poll_fast(c->tcp_ctx) > 0)
+      progress = 1;
+
     nevents = tcp_wait(c->wait, c->events, nconns, TCP_WAIT_NONBLOCK);
     if (nevents < 0)
     {
@@ -802,6 +807,7 @@ static inline void * core_thread(void *arg)
       conn_wait_update(c, cn);
     }
 
+    tcp_poll_fast(c->tcp_ctx);
     nevents = tcp_wait_fast(c->wait, c->events, nconns, TCP_WAIT_NONBLOCK);
     if (nevents < 0)
     {

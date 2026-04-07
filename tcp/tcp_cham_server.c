@@ -361,7 +361,10 @@ static inline int core_accept_conn(struct core *c)
     if (fd < 0)
     {
       if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINVAL)
+      {
+        core_release_conn(c, slot);
         return 0;
+      }
 
       fprintf(stderr, "core %d: accept failed: %s\n",
           c->id, strerror(errno));
@@ -577,6 +580,12 @@ static inline void * core_thread(void *arg)
   while (1)
   {
     int nevents;
+    int polled = 0;
+
+    while (tcp_poll_slow(c->tcp_ctx) > 0)
+      polled = 1;
+    if (tcp_poll_fast(c->tcp_ctx) > 0)
+      polled = 1;
 
     nevents = tcp_wait(c->wait, c->events, mconns + 1, TCP_WAIT_NONBLOCK);
     if (nevents < 0)
@@ -587,7 +596,8 @@ static inline void * core_thread(void *arg)
 
     if (nevents == 0)
     {
-      sched_yield();
+      if (!polled)
+        sched_yield();
       continue;
     }
 

@@ -60,6 +60,22 @@ static pthread_t *threads = NULL;
 static struct core *cores = NULL;
 struct sockaddr_in src_addr;
 
+static inline __u32 core_wait_events(struct core *c)
+{
+  __u32 events = UDP_WAIT_IN;
+
+  if (c->ntx < c->nrx)
+    events |= UDP_WAIT_OUT;
+
+  return events;
+}
+
+static inline void core_wait_update(struct core *c)
+{
+  if (udp_wait_mod(c->wait, c->fd, core_wait_events(c), 0) != 0)
+    abort();
+}
+
 static inline int parse_core_list(const char *arg, int expected_len)
 {
   int count = 1;
@@ -301,7 +317,7 @@ static inline struct udp_context_lib * core_init(struct core *c)
   c->wait = udp_wait_new(udp_ctx);
   if (c->wait == NULL)
     abort();
-  if (udp_wait_add(c->wait, c->fd, UDP_WAIT_IN | UDP_WAIT_OUT, 0) != 0)
+  if (udp_wait_add(c->wait, c->fd, core_wait_events(c), 0) != 0)
     abort();
   return udp_ctx;
 }
@@ -324,6 +340,8 @@ static inline void core_rx(struct udp_context_lib *udp_ctx, struct core *c)
     __sync_fetch_and_add(&c->rxp_interval, 1);
     __sync_fetch_and_add(&c->rxb_interval, msize);
   }
+
+  core_wait_update(c);
 }
 
 static inline void core_tx(struct udp_context_lib *udp_ctx, struct core *c)
@@ -347,6 +365,7 @@ static inline void core_tx(struct udp_context_lib *udp_ctx, struct core *c)
   
   c->ntx = 0;
   c->nrx = 0;
+  core_wait_update(c);
 }
 
 static inline void * core_thread(void *arg)
@@ -370,6 +389,7 @@ static inline void * core_thread(void *arg)
   {
     int nevents;
 
+    udp_poll_fast(udp_ctx);
     nevents = udp_wait_fast(c->wait, &c->event, 1, UDP_WAIT_NONBLOCK);
     if (nevents < 0)
       abort();
@@ -381,7 +401,9 @@ static inline void * core_thread(void *arg)
 
     if ((c->event.events & UDP_WAIT_IN) != 0)
       core_rx(udp_ctx, c);
-    if ((c->event.events & UDP_WAIT_OUT) != 0)
+    if (c->ntx < c->nrx &&
+        (((c->event.events & UDP_WAIT_OUT) != 0) ||
+         ((c->event.events & UDP_WAIT_IN) != 0)))
       core_tx(udp_ctx, c);
   }
   
