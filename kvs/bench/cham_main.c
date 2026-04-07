@@ -71,6 +71,8 @@ struct core {
     uint64_t id;
     pthread_t pthread;
     struct udp_context_lib *ctx;
+    struct udp_wait *wait;
+    struct udp_wait_event event;
     struct sockaddr_in addr;
 } __attribute__((aligned(64)));
 
@@ -189,6 +191,15 @@ static void prepare_core(struct core *c)
     }
     c->tokens = 0.0;
     c->last_tsc = util_rdtsc();
+    c->wait = udp_wait_new(c->ctx);
+    if (c->wait == NULL) {
+        fprintf(stderr, "[%"PRIu64"] wait allocation failed\n", c->id);
+        abort();
+    }
+    if (udp_wait_add(c->wait, c->fd, UDP_WAIT_IN | UDP_WAIT_OUT, 0) != 0) {
+        fprintf(stderr, "[%"PRIu64"] wait registration failed\n", c->id);
+        abort();
+    }
 }
 
 static inline void set_request(struct core *c, struct key *k, uint32_t opaque)
@@ -253,7 +264,6 @@ static int core_tx(struct core *c)
 
     while (1)
     {
-        udp_poll_fast(c->ctx);
         ret = udp_sendto(c->ctx, c->fd, c->tx_buf, c->tx_len,
             (struct sockaddr *) &c->addr, sizeof(c->addr));
     
@@ -263,7 +273,17 @@ static int core_tx(struct core *c)
         }
         
         if (ret < 0 && errno == EAGAIN)
+        {
+            if (udp_wait_fast(c->wait, &c->event, 1, UDP_WAIT_NONBLOCK) < 0) {
+                fprintf(stderr, "[%"PRIu64"] udp_wait_fast failed errno=%d\n",
+                    c->id, errno);
+                abort();
+            }
+            if ((c->event.events & UDP_WAIT_OUT) == 0) {
+                sched_yield();
+            }
             continue;
+        }
             
         if (ret < 0) {
             fprintf(stderr, "error sending in core_tx\n");
@@ -349,7 +369,6 @@ static int core_rx(struct core *c, enum workload_op *last_op,
     ssize_t ret;
     int processed = 0;
 
-    udp_poll_fast(c->ctx);
     while (1) {
         size_t parsed = 0;
 
@@ -491,9 +510,15 @@ static void *thread_run(void *arg)
             c->tokens -= 1.0;
         }
 
-        ret = core_rx(c, NULL, NULL);
+        ret = udp_wait_fast(c->wait, &c->event, 1, UDP_WAIT_NONBLOCK);
         if (ret < 0) {
             abort();
+        }
+        if (ret > 0 && (c->event.events & UDP_WAIT_IN) != 0) {
+            ret = core_rx(c, NULL, NULL);
+            if (ret < 0) {
+                abort();
+            }
         }
     }
 

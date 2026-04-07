@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <assert.h>
+#include <stdint.h>
 #include <sched.h>
 #include "../utils/clock.h"
 #include "../utils/core.h"
@@ -40,7 +41,11 @@ struct core {
   int listen_fd;
   int nconns;
   struct tcp_context_lib *tcp_ctx;
+  struct tcp_wait *wait;
+  struct tcp_wait_event *events;
   struct conn *conns;
+  int *free_slots;
+  int nfree;
   __u64 rxb_interval;
   __u64 rxp_interval;
   __u64 txb_interval;
@@ -267,6 +272,57 @@ static inline void conn_reset(struct conn *cn)
   cn->ntx = 0;
 }
 
+static inline int conn_index(struct core *c, struct conn *cn)
+{
+  return (int) (cn - c->conns);
+}
+
+static inline struct conn *core_alloc_conn(struct core *c)
+{
+  if (c->nfree == 0)
+    return NULL;
+
+  return &c->conns[c->free_slots[--c->nfree]];
+}
+
+static inline void core_release_conn(struct core *c, struct conn *cn)
+{
+  c->free_slots[c->nfree++] = conn_index(c, cn);
+}
+
+static inline __u32 conn_wait_events(struct conn *cn)
+{
+  size_t ready;
+  __u32 events = TCP_WAIT_CLOSED;
+
+  if (!cn->active)
+    return 0;
+
+  if (cn->nrx < bsize)
+    events |= TCP_WAIT_IN;
+
+  ready = cn->nrx - (cn->nrx % msize);
+  if (cn->ntx < ready)
+    events |= TCP_WAIT_OUT;
+
+  return events;
+}
+
+static inline void conn_wait_update(struct core *c, struct conn *cn)
+{
+  __u32 events = conn_wait_events(cn);
+
+  if (!cn->active)
+    return;
+
+  if (tcp_wait_mod(c->wait, cn->fd, events, (__u64) (uintptr_t) cn) != 0)
+  {
+    fprintf(stderr, "core %d fd=%d: wait_mod failed: %s\n",
+        c->id, cn->fd, strerror(errno));
+    abort();
+  }
+}
+
 static inline void core_close_conn(struct core *c, struct conn *cn,
     const char *op, int err)
 {
@@ -276,9 +332,13 @@ static inline void core_close_conn(struct core *c, struct conn *cn,
   fflush(stderr);
 
   if (cn->fd >= 0)
+  {
+    tcp_wait_del(c->wait, cn->fd);
     tcp_close(c->tcp_ctx, cn->fd);
+  }
   if (c->nconns > 0)
     c->nconns--;
+  core_release_conn(c, cn);
   conn_reset(cn);
 }
 
@@ -289,18 +349,11 @@ static inline int core_accept_conn(struct core *c)
 
   while (c->nconns < mconns)
   {
-    struct conn *slot = NULL;
+    struct conn *slot;
     int fd;
+    __u32 events;
 
-    for (int i = 0; i < mconns; i++)
-    {
-      if (!c->conns[i].active)
-      {
-        slot = &c->conns[i];
-        break;
-      }
-    }
-
+    slot = core_alloc_conn(c);
     if (slot == NULL)
       return 0;
 
@@ -313,6 +366,7 @@ static inline int core_accept_conn(struct core *c)
       fprintf(stderr, "core %d: accept failed: %s\n",
           c->id, strerror(errno));
       fflush(stderr);
+      core_release_conn(c, slot);
       return -1;
     }
 
@@ -321,6 +375,19 @@ static inline int core_accept_conn(struct core *c)
     slot->nrx = 0;
     slot->ntx = 0;
     c->nconns++;
+
+    events = conn_wait_events(slot);
+    if (tcp_wait_add(c->wait, fd, events, (__u64) (uintptr_t) slot) != 0)
+    {
+      fprintf(stderr, "core %d fd=%d: wait_add failed: %s\n",
+          c->id, fd, strerror(errno));
+      fflush(stderr);
+      tcp_close(c->tcp_ctx, fd);
+      c->nconns--;
+      core_release_conn(c, slot);
+      conn_reset(slot);
+      return -1;
+    }
   }
 
   return 0;
@@ -338,7 +405,7 @@ static inline void core_rx_conn(struct core *c, struct conn *cn)
     if (nrx < 0)
     {
       if (errno == EAGAIN || errno == EWOULDBLOCK)
-        return;
+        break;
 
       core_close_conn(c, cn, "recv failed", errno);
       return;
@@ -360,6 +427,9 @@ static inline void core_rx_conn(struct core *c, struct conn *cn)
       __sync_fetch_and_add(&c->rxb_interval, delta_msgs * msize);
     }
   }
+
+  if (cn->active)
+    conn_wait_update(c, cn);
 }
 
 static inline void core_tx_conn(struct core *c, struct conn *cn)
@@ -409,6 +479,9 @@ static inline void core_tx_conn(struct core *c, struct conn *cn)
     cn->nrx = left;
     cn->ntx = 0;
   }
+
+  if (cn->active)
+    conn_wait_update(c, cn);
 }
 
 static inline void core_init(struct core *c)
@@ -419,16 +492,23 @@ static inline void core_init(struct core *c)
   if (c->tcp_ctx == NULL)
     abort();
 
+  c->wait = tcp_wait_new(c->tcp_ctx);
+  if (c->wait == NULL)
+    abort();
+
   c->conns = (struct conn *) calloc((size_t) mconns, sizeof(struct conn));
-  if (c->conns == NULL)
+  c->events = calloc((size_t) (mconns + 1), sizeof(*c->events));
+  c->free_slots = calloc((size_t) mconns, sizeof(*c->free_slots));
+  if (c->conns == NULL || c->events == NULL || c->free_slots == NULL)
   {
-    fprintf(stderr, "failed to calloc conn array\n");
+    fprintf(stderr, "failed to allocate conn state\n");
     abort();
   }
 
   for (int i = 0; i < mconns; i++)
   {
     conn_reset(&c->conns[i]);
+    c->free_slots[i] = mconns - 1 - i;
     c->conns[i].buf = (__u8 *) malloc(bsize);
     if (c->conns[i].buf == NULL)
     {
@@ -466,10 +546,17 @@ static inline void core_init(struct core *c)
 
   c->listen_fd = fd;
   c->nconns = 0;
+  c->nfree = mconns;
   c->rxb_interval = 0;
   c->rxp_interval = 0;
   c->txb_interval = 0;
   c->txp_interval = 0;
+
+  if (tcp_wait_add(c->wait, c->listen_fd, TCP_WAIT_ACCEPT, 0) != 0)
+  {
+    fprintf(stderr, "failed to register listen socket\n");
+    abort();
+  }
 }
 
 static inline void * core_thread(void *arg)
@@ -489,23 +576,41 @@ static inline void * core_thread(void *arg)
 
   while (1)
   {
-    while (tcp_poll_slow(c->tcp_ctx) > 0) {}
-    core_accept_conn(c);
+    int nevents;
 
-    tcp_poll_fast(c->tcp_ctx);
-    for (int i = 0; i < mconns; i++)
+    nevents = tcp_wait(c->wait, c->events, mconns + 1, TCP_WAIT_NONBLOCK);
+    if (nevents < 0)
     {
-      if (!c->conns[i].active)
-        continue;
-      core_rx_conn(c, &c->conns[i]);
+      fprintf(stderr, "core %d: tcp_wait failed: %s\n", c->id, strerror(errno));
+      abort();
     }
 
-    tcp_poll_fast(c->tcp_ctx);
-    for (int i = 0; i < mconns; i++)
+    if (nevents == 0)
     {
-      if (!c->conns[i].active)
+      sched_yield();
+      continue;
+    }
+
+    for (int i = 0; i < nevents; i++)
+    {
+      struct tcp_wait_event *ev = &c->events[i];
+      struct conn *cn;
+
+      if (ev->sockfd == c->listen_fd)
+      {
+        if (core_accept_conn(c) != 0)
+          abort();
         continue;
-      core_tx_conn(c, &c->conns[i]);
+      }
+
+      cn = (struct conn *) (uintptr_t) ev->data;
+      if (cn == NULL || !cn->active || cn->fd != ev->sockfd)
+        continue;
+
+      if ((ev->events & (TCP_WAIT_IN | TCP_WAIT_CLOSED)) != 0)
+        core_rx_conn(c, cn);
+      if (cn->active && (ev->events & TCP_WAIT_OUT) != 0)
+        core_tx_conn(c, cn);
     }
   }
 

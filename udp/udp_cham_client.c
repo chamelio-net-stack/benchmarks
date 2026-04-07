@@ -38,6 +38,8 @@ struct payload_hdr {
 struct core {
   int id;
   int fd;
+  struct udp_wait *wait;
+  struct udp_wait_event event;
   __u8 *txbuf;
   __u8 *rxbuf;
   struct sockaddr_in dst_addr;
@@ -357,6 +359,11 @@ static inline struct udp_context_lib * core_init(struct core *c)
   c->total_tx_pkts = 0;
   c->total_rx_pkts = 0;
   c->tokens  = 0.0;
+  c->wait = udp_wait_new(udp_ctx);
+  if (c->wait == NULL)
+    abort();
+  if (udp_wait_add(c->wait, c->fd, UDP_WAIT_IN | UDP_WAIT_OUT, 0) != 0)
+    abort();
   return udp_ctx;
 }
 
@@ -430,6 +437,8 @@ static inline void * core_thread(void *arg)
   
   while(1)
   {
+    int nevents;
+
     elapsed = us_since_tsc(start_tsc);
     if (duration > 0 && elapsed >= (duration * 1000000))
       break;
@@ -449,13 +458,19 @@ static inline void * core_thread(void *arg)
 
     c->last_tsc = tsc_now;
 
-    /* Poll bump messages */
-    udp_poll_fast(udp_ctx);
-    /* Send as many packets as tokens allow */
-    core_tx(udp_ctx, c);
-    /* Drain replies */
-    udp_poll_fast(udp_ctx);
-    core_rx(udp_ctx, c);
+    nevents = udp_wait_fast(c->wait, &c->event, 1, UDP_WAIT_NONBLOCK);
+    if (nevents < 0)
+      abort();
+    if (nevents == 0)
+    {
+      sched_yield();
+      continue;
+    }
+
+    if ((c->event.events & UDP_WAIT_OUT) != 0)
+      core_tx(udp_ctx, c);
+    if ((c->event.events & UDP_WAIT_IN) != 0)
+      core_rx(udp_ctx, c);
   }
 
   pthread_exit((void *) (intptr_t) 0);

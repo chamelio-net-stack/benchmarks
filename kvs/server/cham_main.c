@@ -30,6 +30,8 @@ struct core {
     struct item_allocator ia;
     pthread_t pthread;
     struct udp_context_lib *ctx;
+    struct udp_wait *wait;
+    struct udp_wait_event event;
 };
 
 static struct core *cores;
@@ -82,15 +84,11 @@ static int core_socket(struct core *c)
     return fd;
 }
 
-static int core_rx(struct core *c, ssize_t *rx_len, bool do_poll)
+static int core_rx(struct core *c, ssize_t *rx_len)
 {
     ssize_t ret;
 
     c->peer_addr_len = sizeof(c->peer_addr);
-
-    if (do_poll) {
-        udp_poll_fast(c->ctx);
-    }
     ret = udp_recvfrom(c->ctx, c->fd, c->rx_buf, settings.max_msg_size,
         (struct sockaddr *) &c->peer_addr, c->peer_addr_len);
 
@@ -121,7 +119,14 @@ static int core_tx(struct core *c, size_t tx_len)
             (ret < 0 &&
              (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)))
         {
-            udp_poll_fast(c->ctx);
+            if (udp_wait_fast(c->wait, &c->event, 1, UDP_WAIT_NONBLOCK) < 0) {
+                fprintf(stderr, "[%u] udp_wait_fast failed errno=%d\n",
+                    c->id, errno);
+                return -1;
+            }
+            if ((c->event.events & UDP_WAIT_OUT) == 0) {
+                sched_yield();
+            }
             continue;
         }
 
@@ -343,6 +348,15 @@ static void *processing_thread(void *data)
     if ((c->fd = core_socket(c)) < 0) {
         abort();
     }
+    c->wait = udp_wait_new(c->ctx);
+    if (c->wait == NULL) {
+        fprintf(stderr, "[%u] wait allocation failed\n", c->id);
+        abort();
+    }
+    if (udp_wait_add(c->wait, c->fd, UDP_WAIT_IN | UDP_WAIT_OUT, 0) != 0) {
+        fprintf(stderr, "[%u] wait registration failed\n", c->id);
+        abort();
+    }
 
     iallocs[c->id] = &c->ia;
     __sync_fetch_and_add(&n_ready, 1);
@@ -351,11 +365,21 @@ static void *processing_thread(void *data)
         size_t i;
         int rx_ret;
 
+        rx_ret = udp_wait_fast(c->wait, &c->event, 1, UDP_WAIT_NONBLOCK);
+        if (rx_ret < 0) {
+            abort();
+        }
+        if (rx_ret == 0 || (c->event.events & UDP_WAIT_IN) == 0) {
+            clean_log(&c->ia, true);
+            sched_yield();
+            continue;
+        }
+
         for (i = 0; i < CHAM_DUMMY_BATCH_SIZE; i++) {
             ssize_t rx_len = 0;
             size_t parsed = 0;
 
-            rx_ret = core_rx(c, &rx_len, i == 0);
+            rx_ret = core_rx(c, &rx_len);
             if (rx_ret < 0) {
                 abort();
             }
