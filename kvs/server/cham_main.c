@@ -140,9 +140,6 @@ static int core_tx(struct core *c, size_t tx_len)
                     c->id, errno);
                 return -1;
             }
-            if ((c->event.events & UDP_WAIT_OUT) == 0) {
-                sched_yield();
-            }
             continue;
         }
 
@@ -389,7 +386,6 @@ static void *processing_thread(void *data)
         }
         if (rx_ret == 0 || (c->event.events & UDP_WAIT_IN) == 0) {
             clean_log(&c->ia, true);
-            sched_yield();
             continue;
         }
 
@@ -496,7 +492,6 @@ int main(int argc, char *argv[])
     }
 
     while (n_ready < settings.numcores) {
-        sched_yield();
     }
 
     printf("Starting maintenance\n");

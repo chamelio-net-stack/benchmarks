@@ -484,10 +484,7 @@ static inline void * core_thread(void *arg)
     if (nevents < 0)
       abort();
     if (nevents == 0)
-    {
-      sched_yield();
       continue;
-    }
 
     if ((c->event.events & UDP_WAIT_OUT) != 0)
       core_tx(udp_ctx, c);

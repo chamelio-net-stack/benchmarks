@@ -194,7 +194,6 @@ static void prepare_core(struct core *c)
         __sync_fetch_and_add(&arp_ready, 1);
     } else {
         while (__sync_fetch_and_add(&arp_ready, 0) == 0) {
-            sched_yield();
         }
     }
 
@@ -295,9 +294,6 @@ static int core_tx(struct core *c)
                 fprintf(stderr, "[%"PRIu64"] udp_wait_fast failed errno=%d\n",
                     c->id, errno);
                 abort();
-            }
-            if ((c->event.events & UDP_WAIT_OUT) == 0) {
-                sched_yield();
             }
             continue;
         }
@@ -493,14 +489,12 @@ static void *thread_run(void *arg)
     prepare_core(c);
 
     while (phase < BENCHMARK_PRELOAD) {
-        sched_yield();
     }
 
     preload_keys(c);
     __sync_fetch_and_add(&init_count, 1);
 
     while (phase < BENCHMARK_RUNNING) {
-        sched_yield();
     }
     
     while (phase == BENCHMARK_RUNNING) {
@@ -637,7 +631,6 @@ int main(int argc, char *argv[])
 
     phase = BENCHMARK_PRELOAD;
     while (init_count < num_threads) {
-        sched_yield();
     }
 
     printf("Preloading completed\n");

@@ -33,6 +33,7 @@ struct conn {
   int active;
   size_t nrx;
   size_t ntx;
+  __u32 wait_events;
   __u8 *buf;
 };
 
@@ -270,6 +271,7 @@ static inline void conn_reset(struct conn *cn)
   cn->active = 0;
   cn->nrx = 0;
   cn->ntx = 0;
+  cn->wait_events = 0;
 }
 
 static inline int conn_index(struct core *c, struct conn *cn)
@@ -290,9 +292,13 @@ static inline void core_release_conn(struct core *c, struct conn *cn)
   c->free_slots[c->nfree++] = conn_index(c, cn);
 }
 
+static inline size_t conn_ready_bytes(struct conn *cn)
+{
+  return cn->nrx - (cn->nrx % msize);
+}
+
 static inline __u32 conn_wait_events(struct conn *cn)
 {
-  size_t ready;
   __u32 events = TCP_WAIT_CLOSED;
 
   if (!cn->active)
@@ -301,8 +307,7 @@ static inline __u32 conn_wait_events(struct conn *cn)
   if (cn->nrx < bsize)
     events |= TCP_WAIT_IN;
 
-  ready = cn->nrx - (cn->nrx % msize);
-  if (cn->ntx < ready)
+  if (cn->ntx < conn_ready_bytes(cn))
     events |= TCP_WAIT_OUT;
 
   return events;
@@ -314,6 +319,8 @@ static inline void conn_wait_update(struct core *c, struct conn *cn)
 
   if (!cn->active)
     return;
+  if (events == cn->wait_events)
+    return;
 
   if (tcp_wait_mod(c->wait, cn->fd, events, (__u64) (uintptr_t) cn) != 0)
   {
@@ -321,6 +328,8 @@ static inline void conn_wait_update(struct core *c, struct conn *cn)
         c->id, cn->fd, strerror(errno));
     abort();
   }
+
+  cn->wait_events = events;
 }
 
 static inline void core_close_conn(struct core *c, struct conn *cn,
@@ -391,6 +400,8 @@ static inline int core_accept_conn(struct core *c)
       conn_reset(slot);
       return -1;
     }
+
+    slot->wait_events = events;
   }
 
   return 0;
@@ -487,6 +498,40 @@ static inline void core_tx_conn(struct core *c, struct conn *cn)
     conn_wait_update(c, cn);
 }
 
+static inline void core_process_conn(struct core *c, struct conn *cn, __u32 events)
+{
+  if ((events & (TCP_WAIT_IN | TCP_WAIT_CLOSED)) != 0)
+    core_rx_conn(c, cn);
+
+  if (cn->active && cn->ntx < conn_ready_bytes(cn))
+    core_tx_conn(c, cn);
+
+  if (cn->active && (events & TCP_WAIT_OUT) != 0)
+    core_tx_conn(c, cn);
+}
+
+static inline void core_process_events(struct core *c, int nevents, int allow_accept)
+{
+  for (int i = 0; i < nevents; i++)
+  {
+    struct tcp_wait_event *ev = &c->events[i];
+    struct conn *cn;
+
+    if (allow_accept && ev->sockfd == c->listen_fd)
+    {
+      if (core_accept_conn(c) != 0)
+        abort();
+      continue;
+    }
+
+    cn = (struct conn *) (uintptr_t) ev->data;
+    if (cn == NULL || !cn->active || cn->fd != ev->sockfd)
+      continue;
+
+    core_process_conn(c, cn, ev->events);
+  }
+}
+
 static inline void core_init(struct core *c)
 {
   int ret, fd;
@@ -580,12 +625,10 @@ static inline void * core_thread(void *arg)
   while (1)
   {
     int nevents;
-    int polled = 0;
 
     while (tcp_poll_slow(c->tcp_ctx) > 0)
-      polled = 1;
-    if (tcp_poll_fast(c->tcp_ctx) > 0)
-      polled = 1;
+      ;
+    tcp_poll_fast(c->tcp_ctx);
 
     nevents = tcp_wait(c->wait, c->events, mconns + 1, TCP_WAIT_NONBLOCK);
     if (nevents < 0)
@@ -594,34 +637,19 @@ static inline void * core_thread(void *arg)
       abort();
     }
 
-    if (nevents == 0)
+    if (nevents > 0)
+      core_process_events(c, nevents, 1);
+
+    tcp_poll_fast(c->tcp_ctx);
+    nevents = tcp_wait_fast(c->wait, c->events, mconns, TCP_WAIT_NONBLOCK);
+    if (nevents < 0)
     {
-      if (!polled)
-        sched_yield();
-      continue;
+      fprintf(stderr, "core %d: tcp_wait_fast failed: %s\n",
+          c->id, strerror(errno));
+      abort();
     }
-
-    for (int i = 0; i < nevents; i++)
-    {
-      struct tcp_wait_event *ev = &c->events[i];
-      struct conn *cn;
-
-      if (ev->sockfd == c->listen_fd)
-      {
-        if (core_accept_conn(c) != 0)
-          abort();
-        continue;
-      }
-
-      cn = (struct conn *) (uintptr_t) ev->data;
-      if (cn == NULL || !cn->active || cn->fd != ev->sockfd)
-        continue;
-
-      if ((ev->events & (TCP_WAIT_IN | TCP_WAIT_CLOSED)) != 0)
-        core_rx_conn(c, cn);
-      if (cn->active && (ev->events & TCP_WAIT_OUT) != 0)
-        core_tx_conn(c, cn);
-    }
+    if (nevents > 0)
+      core_process_events(c, nevents, 0);
   }
 
   pthread_exit((void *) (intptr_t) 0);
