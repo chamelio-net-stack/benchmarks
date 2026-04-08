@@ -23,13 +23,14 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
+#include <sys/timerfd.h>
 #include <stdio.h>
 #include <time.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <fcntl.h>
-#include <poll.h>
+#include <stdint.h>
 #include <linux/types.h>
 #include "../utils/clock.h"
 #include "../utils/hist.h"
@@ -38,24 +39,44 @@ struct payload_hdr {
   __u64 tsc;
 }__attribute__((packed));
 
+enum epoll_item_type {
+  EPOLL_ITEM_CONN,
+  EPOLL_ITEM_TIMER,
+};
+
+struct epoll_item {
+  enum epoll_item_type type;
+  void *ptr;
+};
+
 struct conn {
   int fd;
   bool active;
   bool connected;
+  bool want_tx;
   __u8 *txbuf;
   __u8 *rxbuf;
   size_t tx_off;
   size_t rx_off;
   double tokens;
+  __u64 token_tsc;
+  __u64 next_tx_tsc;
   __u64 total_tx_pkts;
   __u64 total_rx_pkts;
+  int next_free;
+  int heap_idx;
+  struct epoll_item ev_item;
 };
 
 /* Per-core context */
 struct core {
   int id;
   int epoll_fd;
+  int timer_fd;
+  int free_head;
+  int heap_len;
   struct conn *conns;
+  struct conn **tx_heap;
   struct sockaddr_in dst_addr;
   socklen_t dst_len;
   __u64 txb_load_interval;
@@ -64,7 +85,7 @@ struct core {
   __u64 txp_tp_interval;
   int established_conns;
   int pending_conns;
-  __u64 last_tsc;
+  struct epoll_item timer_item;
 };
 
 /* Default arg values */
@@ -301,14 +322,242 @@ static inline void conn_reset(struct conn *cn)
   cn->fd = -1;
   cn->active = false;
   cn->connected = false;
+  cn->want_tx = false;
   cn->tx_off = 0;
   cn->rx_off = 0;
   cn->tokens = 0.0;
+  cn->token_tsc = 0;
+  cn->next_tx_tsc = 0;
+  cn->next_free = -1;
+  cn->heap_idx = -1;
+}
+
+static inline void core_push_free_conn(struct core *c, struct conn *cn)
+{
+  cn->next_free = c->free_head;
+  c->free_head = (int) (cn - c->conns);
+}
+
+static inline struct conn *core_pop_free_conn(struct core *c)
+{
+  int idx;
+  struct conn *cn;
+
+  if (c->free_head < 0)
+    return NULL;
+
+  idx = c->free_head;
+  cn = &c->conns[idx];
+  c->free_head = cn->next_free;
+  cn->next_free = -1;
+  return cn;
+}
+
+static inline void core_heap_swap(struct core *c, int a, int b)
+{
+  struct conn *tmp = c->tx_heap[a];
+
+  c->tx_heap[a] = c->tx_heap[b];
+  c->tx_heap[b] = tmp;
+  c->tx_heap[a]->heap_idx = a;
+  c->tx_heap[b]->heap_idx = b;
+}
+
+static inline void core_heap_sift_up(struct core *c, int idx)
+{
+  while (idx > 0)
+  {
+    int parent = (idx - 1) / 2;
+
+    if (c->tx_heap[parent]->next_tx_tsc <= c->tx_heap[idx]->next_tx_tsc)
+      break;
+
+    core_heap_swap(c, parent, idx);
+    idx = parent;
+  }
+}
+
+static inline void core_heap_sift_down(struct core *c, int idx)
+{
+  while (1)
+  {
+    int left = idx * 2 + 1;
+    int right = left + 1;
+    int smallest = idx;
+
+    if (left < c->heap_len &&
+        c->tx_heap[left]->next_tx_tsc < c->tx_heap[smallest]->next_tx_tsc)
+    {
+      smallest = left;
+    }
+
+    if (right < c->heap_len &&
+        c->tx_heap[right]->next_tx_tsc < c->tx_heap[smallest]->next_tx_tsc)
+    {
+      smallest = right;
+    }
+
+    if (smallest == idx)
+      return;
+
+    core_heap_swap(c, idx, smallest);
+    idx = smallest;
+  }
+}
+
+static inline void core_heap_insert(struct core *c, struct conn *cn)
+{
+  if (cn->heap_idx >= 0)
+  {
+    core_heap_sift_up(c, cn->heap_idx);
+    core_heap_sift_down(c, cn->heap_idx);
+    return;
+  }
+
+  c->tx_heap[c->heap_len] = cn;
+  cn->heap_idx = c->heap_len;
+  c->heap_len++;
+  core_heap_sift_up(c, cn->heap_idx);
+}
+
+static inline void core_heap_remove(struct core *c, struct conn *cn)
+{
+  int idx;
+  int last;
+
+  if (cn->heap_idx < 0)
+    return;
+
+  idx = cn->heap_idx;
+  last = c->heap_len - 1;
+  c->heap_len--;
+  cn->heap_idx = -1;
+
+  if (idx == last)
+    return;
+
+  c->tx_heap[idx] = c->tx_heap[last];
+  c->tx_heap[idx]->heap_idx = idx;
+  core_heap_sift_up(c, idx);
+  core_heap_sift_down(c, idx);
+}
+
+static inline struct conn *core_heap_peek(struct core *c)
+{
+  if (c->heap_len == 0)
+    return NULL;
+
+  return c->tx_heap[0];
+}
+
+static inline void conn_refresh_tokens(struct conn *cn, __u64 now_tsc,
+    double bytes_per_us, double max_tokens)
+{
+  double delta_us;
+
+  if (!cn->active || !cn->connected)
+    return;
+
+  if (cn->token_tsc == 0)
+  {
+    cn->token_tsc = now_tsc;
+    return;
+  }
+
+  if (now_tsc <= cn->token_tsc)
+    return;
+
+  delta_us = (double) (now_tsc - cn->token_tsc) / clock_tsc_per_us();
+  if (delta_us <= 0.0)
+    return;
+
+  cn->tokens += delta_us * bytes_per_us;
+  if (cn->tokens > max_tokens)
+    cn->tokens = max_tokens;
+  cn->token_tsc = now_tsc;
+}
+
+static inline __u64 conn_compute_next_tsc(struct conn *cn, __u64 now_tsc,
+    double bytes_per_us)
+{
+  double missing_bytes;
+  double wait_us;
+  double wait_cycles;
+
+  if (cn->tokens >= (double) msize || bytes_per_us <= 0.0)
+    return now_tsc;
+
+  missing_bytes = (double) msize - cn->tokens;
+  wait_us = missing_bytes / bytes_per_us;
+  wait_cycles = wait_us * clock_tsc_per_us();
+  if (wait_cycles < 1.0)
+    wait_cycles = 1.0;
+
+  return now_tsc + (__u64) wait_cycles;
+}
+
+static inline int core_update_conn_events(struct core *c, struct conn *cn)
+{
+  struct epoll_event ev;
+  uint32_t events;
+
+  if (!cn->active || cn->fd < 0)
+    return 0;
+
+  events = EPOLLERR | EPOLLHUP | EPOLLET;
+  if (cn->connected)
+  {
+    events |= EPOLLIN;
+    if (cn->want_tx)
+      events |= EPOLLOUT;
+  }
+  else
+  {
+    events |= EPOLLOUT;
+  }
+
+  ev.events = events;
+  ev.data.ptr = &cn->ev_item;
+  return epoll_ctl(c->epoll_fd, EPOLL_CTL_MOD, cn->fd, &ev);
+}
+
+static inline void core_rearm_timer(struct core *c, __u64 now_tsc)
+{
+  struct itimerspec its;
+  struct conn *cn = core_heap_peek(c);
+  __u64 delta_tsc;
+  __u64 delta_ns;
+
+  memset(&its, 0, sizeof(its));
+  if (cn == NULL)
+  {
+    timerfd_settime(c->timer_fd, 0, &its, NULL);
+    return;
+  }
+
+  if (cn->next_tx_tsc <= now_tsc)
+  {
+    its.it_value.tv_nsec = 1;
+  }
+  else
+  {
+    delta_tsc = cn->next_tx_tsc - now_tsc;
+    delta_ns = (__u64) (((double) delta_tsc * 1000.0) / clock_tsc_per_us());
+    if (delta_ns == 0)
+      delta_ns = 1;
+
+    its.it_value.tv_sec = (time_t) (delta_ns / 1000000000ULL);
+    its.it_value.tv_nsec = (long) (delta_ns % 1000000000ULL);
+  }
+
+  timerfd_settime(c->timer_fd, 0, &its, NULL);
 }
 
 static inline void core_drop_conn(struct core *c, struct conn *cn,
     const char *op, int err)
 {
+  core_heap_remove(c, cn);
+
   if (cn->fd >= 0)
   {
     epoll_ctl(c->epoll_fd, EPOLL_CTL_DEL, cn->fd, NULL);
@@ -334,11 +583,13 @@ static inline void core_drop_conn(struct core *c, struct conn *cn,
   fflush(stderr);
 
   conn_reset(cn);
+  core_push_free_conn(c, cn);
 }
 
 static inline int core_start_conn(struct core *c, struct conn *cn)
 {
   int fd, ret, err;
+  struct epoll_event ev;
 
   fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0)
@@ -366,19 +617,20 @@ static inline int core_start_conn(struct core *c, struct conn *cn)
   cn->fd = fd;
   cn->active = true;
   cn->connected = false;
+  cn->want_tx = false;
   cn->tx_off = 0;
   cn->rx_off = 0;
   cn->tokens = 0.0;
+  cn->token_tsc = 0;
+  cn->next_tx_tsc = 0;
 
+  ev.data.ptr = &cn->ev_item;
   ret = connect(fd, (struct sockaddr *) &c->dst_addr, c->dst_len);
   if (ret == 0)
   {
     cn->connected = true;
     c->established_conns++;
-    /* Add to epoll for I/O */
-    struct epoll_event ev;
-    ev.events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLET;
-    ev.data.fd = fd;
+    ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLET;
     if (epoll_ctl(c->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
     {
       err = errno;
@@ -393,10 +645,7 @@ static inline int core_start_conn(struct core *c, struct conn *cn)
   if (errno == EINPROGRESS)
   {
     c->pending_conns++;
-    /* Add to epoll for connection completion */
-    struct epoll_event ev;
     ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLET;
-    ev.data.fd = fd;
     if (epoll_ctl(c->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
     {
       err = errno;
@@ -415,24 +664,35 @@ static inline int core_start_conn(struct core *c, struct conn *cn)
   return -1;
 }
 
+static inline void core_fill_connects(struct core *c)
+{
+  while (c->established_conns + c->pending_conns < nconns &&
+      c->pending_conns < mpending)
+  {
+    struct conn *cn = core_pop_free_conn(c);
 
+    if (cn == NULL)
+      return;
+
+    if (core_start_conn(c, cn) != 0)
+    {
+      fprintf(stderr, "core %d: connect setup failed: %s\n",
+          c->id, strerror(errno));
+      fflush(stderr);
+      conn_reset(cn);
+      core_push_free_conn(c, cn);
+      return;
+    }
+  }
+}
 
 static inline void core_connect_all(struct core *c)
 {
   struct epoll_event events[nconns];
   int nev;
 
-  /* Try to initiate all connects */
-  for (int i = 0; i < nconns; i++)
-  {
-    if (core_start_conn(c, &c->conns[i]) != 0)
-    {
-      fprintf(stderr, "core %d: connect setup failed: %s\n",
-          c->id, strerror(errno));
-    }
-  }
+  core_fill_connects(c);
 
-  /* Wait for all connections to complete (using epoll) */
   while (c->established_conns < nconns)
   {
     nev = epoll_wait(c->epoll_fd, events, nconns, 1);
@@ -444,74 +704,50 @@ static inline void core_connect_all(struct core *c)
       pthread_exit((void *) (intptr_t) -1);
     }
 
-    /* Process connection completion events */
     for (int i = 0; i < nev; i++)
     {
-      int fd = events[i].data.fd;
       uint32_t ev = events[i].events;
+      struct epoll_item *item = (struct epoll_item *) events[i].data.ptr;
+      struct conn *cn;
+      int err = 0;
+      socklen_t len = sizeof(err);
 
-      struct conn *cn = NULL;
-      for (int j = 0; j < nconns; j++)
-      {
-        if (c->conns[j].active && c->conns[j].fd == fd)
-        {
-          cn = &c->conns[j];
-          break;
-        }
-      }
-
-      if (cn == NULL)
+      if (item == NULL || item->type != EPOLL_ITEM_CONN)
         continue;
 
-      /* Check for errors */
+      cn = (struct conn *) item->ptr;
+      if (cn == NULL || !cn->active || cn->connected)
+        continue;
+
       if (ev & (EPOLLERR | EPOLLHUP))
       {
-        int err = 0;
-        socklen_t len = sizeof(err);
-        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+        getsockopt(cn->fd, SOL_SOCKET, SO_ERROR, &err, &len);
         core_drop_conn(c, cn, "connect failed", err);
+        core_fill_connects(c);
         continue;
       }
 
-      /* Connection successful */
-      if (ev & EPOLLOUT)
+      if (!(ev & EPOLLOUT))
+        continue;
+
+      if (getsockopt(cn->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0)
+        err = errno;
+
+      if (err == 0)
       {
-        int err = 0;
-        socklen_t len = sizeof(err);
-        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0)
-          err = errno;
-
-        if (err == 0 && !cn->connected)
-        {
-          cn->connected = true;
-          if (c->pending_conns > 0)
-            c->pending_conns--;
-          c->established_conns++;
-
-          /* Modify epoll mask for established connection (add EPOLLIN) */
-          struct epoll_event ev_mod;
-          ev_mod.events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLET;
-          ev_mod.data.fd = fd;
-          epoll_ctl(c->epoll_fd, EPOLL_CTL_MOD, fd, &ev_mod);
-        }
-        else if (err != 0)
-        {
-          core_drop_conn(c, cn, "connect failed", err);
-        }
+        cn->connected = true;
+        if (c->pending_conns > 0)
+          c->pending_conns--;
+        c->established_conns++;
+        if (core_update_conn_events(c, cn) < 0)
+          core_drop_conn(c, cn, "epoll_ctl mod failed", errno);
       }
-    }
-
-    /* Initiate more connects if we have room */
-    for (int i = 0; i < nconns; i++)
-    {
-      if (!c->conns[i].active && c->pending_conns < mpending)
+      else
       {
-        if (core_start_conn(c, &c->conns[i]) != 0)
-        {
-          fprintf(stderr, "core %d: connect setup failed: %s\n",
-              c->id, strerror(errno));
-        }
+        core_drop_conn(c, cn, "connect failed", err);
       }
+
+      core_fill_connects(c);
     }
   }
 }
@@ -528,6 +764,8 @@ static inline void core_init(struct core *c)
   for (int i = 0; i < nconns; i++)
   {
     conn_reset(&c->conns[i]);
+    c->conns[i].ev_item.type = EPOLL_ITEM_CONN;
+    c->conns[i].ev_item.ptr = &c->conns[i];
     c->conns[i].txbuf = (__u8 *) malloc(msize);
     c->conns[i].rxbuf = (__u8 *) malloc(msize);
     if (c->conns[i].txbuf == NULL || c->conns[i].rxbuf == NULL)
@@ -539,6 +777,17 @@ static inline void core_init(struct core *c)
     memset(c->conns[i].rxbuf, 0, msize);
   }
 
+  c->free_head = -1;
+  for (int i = nconns - 1; i >= 0; i--)
+    core_push_free_conn(c, &c->conns[i]);
+
+  c->tx_heap = (struct conn **) calloc((size_t) nconns, sizeof(struct conn *));
+  if (c->tx_heap == NULL)
+  {
+    perror("calloc tx heap");
+    pthread_exit((void *) (intptr_t) -1);
+  }
+
   c->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
   if (c->epoll_fd < 0)
   {
@@ -546,113 +795,177 @@ static inline void core_init(struct core *c)
     pthread_exit((void *) (intptr_t) -1);
   }
 
+  c->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+  if (c->timer_fd < 0)
+  {
+    perror("timerfd_create");
+    pthread_exit((void *) (intptr_t) -1);
+  }
+
+  c->timer_item.type = EPOLL_ITEM_TIMER;
+  c->timer_item.ptr = c;
+  {
+    struct epoll_event ev;
+
+    ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLET;
+    ev.data.ptr = &c->timer_item;
+    if (epoll_ctl(c->epoll_fd, EPOLL_CTL_ADD, c->timer_fd, &ev) < 0)
+    {
+      perror("epoll_ctl add timerfd");
+      pthread_exit((void *) (intptr_t) -1);
+    }
+  }
+
+  c->heap_len = 0;
   c->txb_load_interval = 0;
   c->txp_load_interval = 0;
   c->txb_tp_interval = 0;
   c->txp_tp_interval = 0;
   c->established_conns = 0;
   c->pending_conns = 0;
-  c->last_tsc = 0;
 }
 
-static inline void core_tx(struct core *c)
+static inline void core_schedule_conn(struct core *c, struct conn *cn,
+    __u64 now_tsc, double bytes_per_us, double max_tokens)
+{
+  if (!cn->active || !cn->connected)
+    return;
+
+  conn_refresh_tokens(cn, now_tsc, bytes_per_us, max_tokens);
+  if (cn->tx_off > 0 || cn->tokens >= (double) msize)
+  {
+    cn->want_tx = true;
+    core_heap_remove(c, cn);
+  }
+  else
+  {
+    cn->want_tx = false;
+    cn->next_tx_tsc = conn_compute_next_tsc(cn, now_tsc, bytes_per_us);
+    core_heap_insert(c, cn);
+  }
+
+  if (core_update_conn_events(c, cn) < 0)
+    core_drop_conn(c, cn, "epoll_ctl mod failed", errno);
+}
+
+static inline void core_tx_conn(struct core *c, struct conn *cn, __u64 now_tsc,
+    double bytes_per_us, double max_tokens)
 {
   int ntx;
 
-  for (int i = 0; i < nconns; i++)
+  if (!cn->active || !cn->connected)
+    return;
+
+  conn_refresh_tokens(cn, now_tsc, bytes_per_us, max_tokens);
+
+  while (cn->tx_off > 0 || cn->tokens >= (double) msize)
   {
-    struct conn *cn = &c->conns[i];
+    struct payload_hdr *ph;
 
     if (!cn->active || !cn->connected)
-      continue;
+      return;
 
-    while (cn->tokens >= (double) msize)
+    if (cn->tx_off == 0)
     {
-      struct payload_hdr *ph;
-
-      if (!cn->active || !cn->connected)
-        break;
-
-      if (cn->tx_off == 0)
-      {
-        ph = (struct payload_hdr *) cn->txbuf;
-        ph->tsc = util_rdtsc();
-      }
-
-      ntx = send(cn->fd, cn->txbuf + cn->tx_off, msize - cn->tx_off, 0);
-      if (ntx < 0)
-      {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-          break;
-
-        core_drop_conn(c, cn, "send failed", errno);
-        break;
-      }
-
-      if (ntx == 0)
-      {
-        core_drop_conn(c, cn, "send failed", 0);
-        break;
-      }
-
-      cn->tx_off += (size_t) ntx;
-      if (cn->tx_off < msize)
-        break;
-
-      cn->tx_off = 0;
-      cn->tokens -= (double) msize;
-      cn->total_tx_pkts++;
-      __sync_fetch_and_add(&c->txb_load_interval, msize);
-      __sync_fetch_and_add(&c->txp_load_interval, 1);
+      ph = (struct payload_hdr *) cn->txbuf;
+      ph->tsc = util_rdtsc();
     }
+
+    ntx = send(cn->fd, cn->txbuf + cn->tx_off, msize - cn->tx_off, 0);
+    if (ntx < 0)
+    {
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+        break;
+
+      core_drop_conn(c, cn, "send failed", errno);
+      return;
+    }
+
+    if (ntx == 0)
+    {
+      core_drop_conn(c, cn, "send failed", 0);
+      return;
+    }
+
+    cn->tx_off += (size_t) ntx;
+    if (cn->tx_off < msize)
+      break;
+
+    cn->tx_off = 0;
+    cn->tokens -= (double) msize;
+    cn->total_tx_pkts++;
+    __sync_fetch_and_add(&c->txb_load_interval, msize);
+    __sync_fetch_and_add(&c->txp_load_interval, 1);
   }
+
+  if (!cn->active || !cn->connected)
+    return;
+
+  core_schedule_conn(c, cn, util_rdtsc(), bytes_per_us, max_tokens);
 }
 
-static inline void core_rx(struct core *c)
+static inline void core_rx_conn(struct core *c, struct conn *cn)
 {
   int nrx;
 
-  for (int i = 0; i < nconns; i++)
-  {
-    struct conn *cn = &c->conns[i];
+  if (!cn->active || !cn->connected)
+    return;
 
-    if (!cn->active || !cn->connected)
+  while (1)
+  {
+    struct payload_hdr *ph;
+    __u64 rtt_us;
+
+    nrx = recv(cn->fd, cn->rxbuf + cn->rx_off, msize - cn->rx_off, 0);
+    if (nrx < 0)
+    {
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+        break;
+
+      core_drop_conn(c, cn, "recv failed", errno);
+      break;
+    }
+
+    if (nrx == 0)
+    {
+      core_drop_conn(c, cn, "recv failed", 0);
+      break;
+    }
+
+    cn->rx_off += (size_t) nrx;
+    if (cn->rx_off < msize)
       continue;
 
-    while (1)
-    {
-      struct payload_hdr *ph;
-      __u64 rtt_us;
-
-      nrx = recv(cn->fd, cn->rxbuf + cn->rx_off, msize - cn->rx_off, 0);
-      if (nrx < 0)
-      {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-          break;
-
-        core_drop_conn(c, cn, "recv failed", errno);
-        break;
-      }
-
-      if (nrx == 0)
-      {
-        core_drop_conn(c, cn, "recv failed", 0);
-        break;
-      }
-
-      cn->rx_off += (size_t) nrx;
-      if (cn->rx_off < msize)
-        continue;
-
-      ph = (struct payload_hdr *) cn->rxbuf;
-      rtt_us = us_since_tsc(ph->tsc);
-      cn->rx_off = 0;
-      cn->total_rx_pkts++;
-      __sync_fetch_and_add(&c->txb_tp_interval, msize);
-      __sync_fetch_and_add(&c->txp_tp_interval, 1);
-      hist_add(&rtt_hist, rtt_us);
-    }
+    ph = (struct payload_hdr *) cn->rxbuf;
+    rtt_us = us_since_tsc(ph->tsc);
+    cn->rx_off = 0;
+    cn->total_rx_pkts++;
+    __sync_fetch_and_add(&c->txb_tp_interval, msize);
+    __sync_fetch_and_add(&c->txp_tp_interval, 1);
+    hist_add(&rtt_hist, rtt_us);
   }
+}
+
+static inline void core_handle_timer(struct core *c, __u64 now_tsc,
+    double bytes_per_us, double max_tokens)
+{
+  uint64_t expirations;
+
+  while (read(c->timer_fd, &expirations, sizeof(expirations)) > 0)
+    ;
+
+  while (1)
+  {
+    struct conn *cn = core_heap_peek(c);
+
+    if (cn == NULL || cn->next_tx_tsc > now_tsc)
+      break;
+
+    core_heap_remove(c, cn);
+    core_tx_conn(c, cn, now_tsc, bytes_per_us, max_tokens);
+  }
+
+  core_rearm_timer(c, util_rdtsc());
 }
 
 static inline void wait_for_start(void)
@@ -667,9 +980,9 @@ static inline void wait_for_start(void)
 static inline void * core_thread(void *arg)
 {
   struct core *c;
-  __u64 start_tsc, elapsed, tsc_now;
-  double bytes_per_us, delta_cycles, delta_us, max_tokens;
-  struct epoll_event events[nconns];
+  __u64 start_tsc, elapsed, now_tsc;
+  double bytes_per_us, max_tokens;
+  struct epoll_event events[nconns + 1];
   int nev;
 
   c = (struct core *) arg;
@@ -679,41 +992,31 @@ static inline void * core_thread(void *arg)
   pthread_barrier_wait(&start_barrier);
   wait_for_start();
 
-  c->last_tsc = util_rdtsc();
-  start_tsc = c->last_tsc;
+  start_tsc = util_rdtsc();
+  now_tsc = start_tsc;
   bytes_per_us = rate / 8.0;
   max_tokens = bytes_per_us * 1000.0;
 
+  for (int i = 0; i < nconns; i++)
+  {
+    struct conn *cn = &c->conns[i];
+
+    if (!cn->active || !cn->connected)
+      continue;
+
+    cn->tokens = 0.0;
+    cn->token_tsc = start_tsc;
+    core_schedule_conn(c, cn, now_tsc, bytes_per_us, max_tokens);
+  }
+  core_rearm_timer(c, now_tsc);
+
   while (1)
   {
-    int active = 0;
-
     elapsed = us_since_tsc(start_tsc);
     if (elapsed >= (__u64) duration * 1000000ULL)
       break;
 
-    tsc_now = util_rdtsc();
-    delta_cycles = (double) (tsc_now - c->last_tsc);
-    delta_us = delta_cycles / clock_tsc_per_us();
-    assert(delta_us >= 0.0);
-    c->last_tsc = tsc_now;
-
-    /* Update tokens for all active connections */
-    for (int i = 0; i < nconns; i++)
-    {
-      struct conn *cn = &c->conns[i];
-
-      if (!cn->active || !cn->connected)
-        continue;
-
-      active++;
-      cn->tokens += delta_us * bytes_per_us;
-      if (cn->tokens > max_tokens)
-        cn->tokens = max_tokens;
-    }
-
-    /* Non-blocking epoll wait (0ms timeout) */
-    nev = epoll_wait(c->epoll_fd, events, nconns, 0);
+    nev = epoll_wait(c->epoll_fd, events, nconns + 1, 1000);
     if (nev < 0)
     {
       if (errno != EINTR)
@@ -721,47 +1024,42 @@ static inline void * core_thread(void *arg)
       continue;
     }
 
-    /* Process epoll events for specific connections */
     for (int i = 0; i < nev; i++)
     {
-      int fd = events[i].data.fd;
       uint32_t ev = events[i].events;
+      struct epoll_item *item = (struct epoll_item *) events[i].data.ptr;
 
-      /* Find connection by fd */
-      struct conn *cn = NULL;
-      for (int j = 0; j < nconns; j++)
-      {
-        if (c->conns[j].active && c->conns[j].fd == fd)
-        {
-          cn = &c->conns[j];
-          break;
-        }
-      }
-
-      if (cn == NULL)
+      if (item == NULL)
         continue;
 
-      /* Handle errors first */
+      if (item->type == EPOLL_ITEM_TIMER)
+      {
+        core_handle_timer(c, util_rdtsc(), bytes_per_us, max_tokens);
+        continue;
+      }
+
+      struct conn *cn = (struct conn *) item->ptr;
+      int err = 0;
+      socklen_t len = sizeof(err);
+
+      if (cn == NULL || !cn->active)
+        continue;
+
       if (ev & (EPOLLERR | EPOLLHUP))
       {
-        int err = 0;
-        socklen_t len = sizeof(err);
-
-        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0)
+        if (getsockopt(cn->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0)
           err = errno;
         core_drop_conn(c, cn, "epoll error", err);
+        core_rearm_timer(c, util_rdtsc());
         continue;
       }
+
+      if (ev & EPOLLIN)
+        core_rx_conn(c, cn);
+
+      if (cn->active && (ev & EPOLLOUT))
+        core_tx_conn(c, cn, util_rdtsc(), bytes_per_us, max_tokens);
     }
-
-    /* Try TX on all connections with sufficient tokens (outside event loop) */
-    if (active > 0)
-    {
-      core_rx(c);
-      core_tx(c);
-    }
-
-
   }
 
   pthread_exit((void *) (intptr_t) 0);
@@ -773,6 +1071,8 @@ static inline void prepare_cores(void)
   {
     memset(&cores[i], 0, sizeof(struct core));
     cores[i].id = i;
+    cores[i].epoll_fd = -1;
+    cores[i].timer_fd = -1;
     memset(&cores[i].dst_addr, 0, sizeof(cores[i].dst_addr));
     cores[i].dst_addr.sin_family = AF_INET;
     cores[i].dst_addr.sin_port = htons((__u16) rem_port);
@@ -924,8 +1224,11 @@ int main(int argc, char **argv)
         free(cores[i].conns[j].rxbuf);
       }
     }
+    if (cores[i].timer_fd >= 0)
+      close(cores[i].timer_fd);
     if (cores[i].epoll_fd >= 0)
       close(cores[i].epoll_fd);
+    free(cores[i].tx_heap);
     free(cores[i].conns);
   }
 

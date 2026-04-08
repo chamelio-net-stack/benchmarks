@@ -26,12 +26,24 @@
 #include <linux/types.h>
 #include "../utils/clock.h"
 
+enum epoll_item_type {
+  EPOLL_ITEM_LISTEN,
+  EPOLL_ITEM_CONN,
+};
+
+struct epoll_item {
+  enum epoll_item_type type;
+  void *ptr;
+};
+
 struct conn {
   int fd;
   int active;
   size_t nrx;
   size_t ntx;
   __u8 *buf;
+  int next_free;
+  struct epoll_item ev_item;
 };
 
 struct core {
@@ -39,11 +51,13 @@ struct core {
   int listen_fd;
   int epoll_fd;
   int nconns;
+  int free_head;
   struct conn *conns;
   __u64 rxb_interval;
   __u64 rxp_interval;
   __u64 txb_interval;
   __u64 txp_interval;
+  struct epoll_item listen_item;
 };
 
 /* Default arg values */
@@ -67,6 +81,8 @@ struct sockaddr_in src_addr;
 static inline void core_rx_conn(struct core *c, struct conn *cn);
 static inline void core_tx_conn(struct core *c, struct conn *cn);
 static inline void core_update_events(struct core *c, struct conn *cn);
+static inline void core_push_free_conn(struct core *c, struct conn *cn);
+static inline struct conn *core_pop_free_conn(struct core *c);
 
 static inline int parse_args(int argc, char **argv)
 {
@@ -192,6 +208,28 @@ static inline void conn_reset(struct conn *cn)
   cn->active = 0;
   cn->nrx = 0;
   cn->ntx = 0;
+  cn->next_free = -1;
+}
+
+static inline void core_push_free_conn(struct core *c, struct conn *cn)
+{
+  cn->next_free = c->free_head;
+  c->free_head = (int) (cn - c->conns);
+}
+
+static inline struct conn *core_pop_free_conn(struct core *c)
+{
+  int idx;
+  struct conn *cn;
+
+  if (c->free_head < 0)
+    return NULL;
+
+  idx = c->free_head;
+  cn = &c->conns[idx];
+  c->free_head = cn->next_free;
+  cn->next_free = -1;
+  return cn;
 }
 
 static inline void core_close_conn(struct core *c, struct conn *cn,
@@ -210,35 +248,28 @@ static inline void core_close_conn(struct core *c, struct conn *cn,
   if (c->nconns > 0)
     c->nconns--;
   conn_reset(cn);
+  core_push_free_conn(c, cn);
 }
 
 static inline int core_accept_conn(struct core *c)
 {
   int fd;
   int opt = 1;
+  struct conn *slot;
 
   if (c->nconns >= mconns)
     return 0;
 
   while (c->nconns < mconns)
   {
-    struct conn *slot = NULL;
-
-    for (int i = 0; i < mconns; i++)
-    {
-      if (!c->conns[i].active)
-      {
-        slot = &c->conns[i];
-        break;
-      }
-    }
-
+    slot = core_pop_free_conn(c);
     if (slot == NULL)
       return 0;
 
     fd = accept4(c->listen_fd, NULL, NULL, SOCK_NONBLOCK);
     if (fd < 0)
     {
+      core_push_free_conn(c, slot);
       if (errno == EAGAIN || errno == EWOULDBLOCK)
         return 0;
 
@@ -258,7 +289,7 @@ static inline int core_accept_conn(struct core *c)
     /* Start with read interest; writable interest is armed only while echo data is pending. */
     struct epoll_event ev;
     ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP | EPOLLET;
-    ev.data.fd = fd;
+    ev.data.ptr = &slot->ev_item;
     if (epoll_ctl(c->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
     {
       fprintf(stderr, "core %d: epoll_ctl add failed: %s\n",
@@ -381,7 +412,7 @@ static inline void core_update_events(struct core *c, struct conn *cn)
     events |= EPOLLOUT;
 
   ev.events = events;
-  ev.data.fd = cn->fd;
+  ev.data.ptr = &cn->ev_item;
   if (epoll_ctl(c->epoll_fd, EPOLL_CTL_MOD, cn->fd, &ev) < 0)
     core_close_conn(c, cn, "epoll_ctl mod failed", errno);
 }
@@ -401,6 +432,8 @@ static inline void core_init(struct core *c)
   {
     conn_reset(&c->conns[i]);
     c->conns[i].buf = (__u8 *) malloc(bsize);
+    c->conns[i].ev_item.type = EPOLL_ITEM_CONN;
+    c->conns[i].ev_item.ptr = &c->conns[i];
     if (c->conns[i].buf == NULL)
     {
       fprintf(stderr, "failed to malloc conn buf\n");
@@ -408,6 +441,9 @@ static inline void core_init(struct core *c)
     }
     memset(c->conns[i].buf, 0, bsize);
   }
+  c->free_head = -1;
+  for (int i = mconns - 1; i >= 0; i--)
+    core_push_free_conn(c, &c->conns[i]);
 
   if (c->id != 0)
     pthread_barrier_wait(&start_barrier);
@@ -459,7 +495,9 @@ static inline void core_init(struct core *c)
 
   struct epoll_event ev;
   ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLET;
-  ev.data.fd = fd;
+  c->listen_item.type = EPOLL_ITEM_LISTEN;
+  c->listen_item.ptr = c;
+  ev.data.ptr = &c->listen_item;
   if (epoll_ctl(c->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
   {
     perror("epoll_ctl add listen");
@@ -502,11 +540,14 @@ static inline void * core_thread(void *arg)
     /* Process all events returned by epoll */
     for (int i = 0; i < nev; i++)
     {
-      int fd = events[i].data.fd;
       uint32_t ev = events[i].events;
+      struct epoll_item *item = (struct epoll_item *) events[i].data.ptr;
+
+      if (item == NULL)
+        continue;
 
       /* Accept on listen socket */
-      if (fd == c->listen_fd)
+      if (item->type == EPOLL_ITEM_LISTEN)
       {
         if (ev & EPOLLIN)
         {
@@ -524,18 +565,8 @@ static inline void * core_thread(void *arg)
         continue;
       }
 
-      /* Find connection by fd */
-      struct conn *cn = NULL;
-      for (int j = 0; j < mconns; j++)
-      {
-        if (c->conns[j].active && c->conns[j].fd == fd)
-        {
-          cn = &c->conns[j];
-          break;
-        }
-      }
-
-      if (cn == NULL)
+      struct conn *cn = (struct conn *) item->ptr;
+      if (cn == NULL || !cn->active)
         continue;
 
       /* Handle errors first */
@@ -571,6 +602,8 @@ static inline void prepare_cores(void)
   {
     memset(&cores[i], 0, sizeof(struct core));
     cores[i].id = i;
+    cores[i].listen_fd = -1;
+    cores[i].epoll_fd = -1;
 
     if (inet_pton(AF_INET, server_ip, &src_addr.sin_addr) != 1)
     {
