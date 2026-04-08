@@ -23,8 +23,6 @@
 #include <pthread.h>
 #include <assert.h>
 #include <fcntl.h>
-#include <stddef.h>
-#include <stdarg.h>
 #include <linux/types.h>
 #include "../utils/clock.h"
 
@@ -43,6 +41,8 @@ struct conn {
   int active;
   size_t nrx;
   size_t ntx;
+  __u64 next_tx_tsc;
+  int heap_idx;
   __u8 *buf;
   int next_free;
   struct epoll_item ev_item;
@@ -54,7 +54,9 @@ struct core {
   int epoll_fd;
   int nconns;
   int free_head;
+  int tx_heap_len;
   struct conn *conns;
+  struct conn **tx_heap;
   __u64 rxb_interval;
   __u64 rxp_interval;
   __u64 txb_interval;
@@ -62,7 +64,6 @@ struct core {
   struct epoll_item listen_item;
 };
 
-/* Default arg values */
 size_t msize = 64;
 size_t bsize = 4096;
 int ncores = 1;
@@ -79,52 +80,6 @@ static pthread_barrier_t start_barrier;
 static pthread_t *threads = NULL;
 static struct core *cores = NULL;
 struct sockaddr_in src_addr;
-static int debug_enabled = 0;
-
-static inline void debug_log_conn(struct core *c, struct conn *cn,
-    const char *fmt, ...)
-{
-  va_list ap;
-
-  if (!debug_enabled)
-    return;
-
-  fprintf(stderr, "[tcp_linux_server] core=%d fd=%d conn=%td t=%llu ",
-      c != NULL ? c->id : -1,
-      cn != NULL ? cn->fd : -1,
-      (c != NULL && cn != NULL && c->conns != NULL) ? (ptrdiff_t) (cn - c->conns) : -1,
-      (unsigned long long) now_ns());
-  va_start(ap, fmt);
-  vfprintf(stderr, fmt, ap);
-  va_end(ap);
-  fputc('\n', stderr);
-  fflush(stderr);
-}
-
-static inline void debug_log_core(struct core *c, const char *fmt, ...)
-{
-  va_list ap;
-
-  if (!debug_enabled)
-    return;
-
-  fprintf(stderr, "[tcp_linux_server] core=%d t=%llu ",
-      c != NULL ? c->id : -1,
-      (unsigned long long) now_ns());
-  va_start(ap, fmt);
-  vfprintf(stderr, fmt, ap);
-  va_end(ap);
-  fputc('\n', stderr);
-  fflush(stderr);
-}
-
-static inline void debug_init(void)
-{
-  const char *env = getenv("TCP_BENCH_DEBUG");
-
-  if (env != NULL && strcmp(env, "0") != 0)
-    debug_enabled = 1;
-}
 
 static inline void core_rx_conn(struct core *c, struct conn *cn);
 static inline void core_tx_conn(struct core *c, struct conn *cn);
@@ -256,6 +211,8 @@ static inline void conn_reset(struct conn *cn)
   cn->active = 0;
   cn->nrx = 0;
   cn->ntx = 0;
+  cn->next_tx_tsc = 0;
+  cn->heap_idx = -1;
   cn->next_free = -1;
 }
 
@@ -263,7 +220,6 @@ static inline void core_push_free_conn(struct core *c, struct conn *cn)
 {
   cn->next_free = c->free_head;
   c->free_head = (int) (cn - c->conns);
-  debug_log_conn(c, cn, "free push free_head=%d", c->free_head);
 }
 
 static inline struct conn *core_pop_free_conn(struct core *c)
@@ -278,8 +234,169 @@ static inline struct conn *core_pop_free_conn(struct core *c)
   cn = &c->conns[idx];
   c->free_head = cn->next_free;
   cn->next_free = -1;
-  debug_log_conn(c, cn, "free pop new_free_head=%d", c->free_head);
   return cn;
+}
+
+static inline void core_heap_swap(struct core *c, int a, int b)
+{
+  struct conn *tmp = c->tx_heap[a];
+
+  c->tx_heap[a] = c->tx_heap[b];
+  c->tx_heap[b] = tmp;
+  c->tx_heap[a]->heap_idx = a;
+  c->tx_heap[b]->heap_idx = b;
+}
+
+static inline void core_heap_sift_up(struct core *c, int idx)
+{
+  while (idx > 0)
+  {
+    int parent = (idx - 1) / 2;
+
+    if (c->tx_heap[parent]->next_tx_tsc <= c->tx_heap[idx]->next_tx_tsc)
+      break;
+
+    core_heap_swap(c, parent, idx);
+    idx = parent;
+  }
+}
+
+static inline void core_heap_sift_down(struct core *c, int idx)
+{
+  while (1)
+  {
+    int left = idx * 2 + 1;
+    int right = left + 1;
+    int smallest = idx;
+
+    if (left < c->tx_heap_len &&
+        c->tx_heap[left]->next_tx_tsc < c->tx_heap[smallest]->next_tx_tsc)
+    {
+      smallest = left;
+    }
+
+    if (right < c->tx_heap_len &&
+        c->tx_heap[right]->next_tx_tsc < c->tx_heap[smallest]->next_tx_tsc)
+    {
+      smallest = right;
+    }
+
+    if (smallest == idx)
+      return;
+
+    core_heap_swap(c, idx, smallest);
+    idx = smallest;
+  }
+}
+
+static inline void core_heap_insert(struct core *c, struct conn *cn)
+{
+  if (cn->heap_idx >= 0)
+  {
+    core_heap_sift_up(c, cn->heap_idx);
+    core_heap_sift_down(c, cn->heap_idx);
+    return;
+  }
+
+  c->tx_heap[c->tx_heap_len] = cn;
+  cn->heap_idx = c->tx_heap_len;
+  c->tx_heap_len++;
+  core_heap_sift_up(c, cn->heap_idx);
+}
+
+static inline void core_heap_remove(struct core *c, struct conn *cn)
+{
+  int idx;
+  int last;
+
+  if (cn->heap_idx < 0)
+    return;
+
+  idx = cn->heap_idx;
+  last = c->tx_heap_len - 1;
+  c->tx_heap_len--;
+  cn->heap_idx = -1;
+
+  if (idx == last)
+    return;
+
+  c->tx_heap[idx] = c->tx_heap[last];
+  c->tx_heap[idx]->heap_idx = idx;
+  core_heap_sift_up(c, idx);
+  core_heap_sift_down(c, idx);
+}
+
+static inline struct conn *core_heap_peek(struct core *c)
+{
+  if (c->tx_heap_len == 0)
+    return NULL;
+
+  return c->tx_heap[0];
+}
+
+static inline __u64 conn_retry_next_tsc(__u64 now_tsc)
+{
+  double retry_cycles = 50.0 * clock_tsc_per_us();
+
+  if (retry_cycles < 1.0)
+    retry_cycles = 1.0;
+
+  return now_tsc + (__u64) retry_cycles;
+}
+
+static inline void core_schedule_tx_retry(struct core *c, struct conn *cn,
+    __u64 now_tsc, int blocked)
+{
+  size_t ready;
+
+  if (!cn->active || cn->fd < 0)
+    return;
+
+  ready = cn->nrx - (cn->nrx % msize);
+  if (ready <= cn->ntx)
+  {
+    core_heap_remove(c, cn);
+    return;
+  }
+
+  if (blocked)
+    cn->next_tx_tsc = conn_retry_next_tsc(now_tsc);
+  else
+    cn->next_tx_tsc = now_tsc;
+
+  core_heap_insert(c, cn);
+}
+
+static inline void core_run_due_tx(struct core *c, __u64 now_tsc)
+{
+  while (1)
+  {
+    struct conn *cn = core_heap_peek(c);
+
+    if (cn == NULL || cn->next_tx_tsc > now_tsc)
+      return;
+
+    core_heap_remove(c, cn);
+    core_tx_conn(c, cn);
+  }
+}
+
+static inline int core_next_timeout_ms(struct core *c, __u64 now_tsc)
+{
+  struct conn *cn = core_heap_peek(c);
+  double delta_us;
+
+  if (cn == NULL)
+    return 1000;
+
+  if (cn->next_tx_tsc <= now_tsc)
+    return 0;
+
+  delta_us = (double) (cn->next_tx_tsc - now_tsc) / clock_tsc_per_us();
+  if (delta_us < 1000.0)
+    return 0;
+
+  return (int) ((delta_us + 999.0) / 1000.0);
 }
 
 static inline void core_close_conn(struct core *c, struct conn *cn,
@@ -297,8 +414,7 @@ static inline void core_close_conn(struct core *c, struct conn *cn,
   }
   if (c->nconns > 0)
     c->nconns--;
-  debug_log_conn(c, cn, "close active=%d nrx=%zu ntx=%zu remaining=%d",
-      cn->active, cn->nrx, cn->ntx, c->nconns);
+  core_heap_remove(c, cn);
   conn_reset(cn);
   core_push_free_conn(c, cn);
 }
@@ -314,6 +430,8 @@ static inline int core_accept_conn(struct core *c)
 
   while (c->nconns < mconns)
   {
+    struct epoll_event ev;
+
     slot = core_pop_free_conn(c);
     if (slot == NULL)
       return 0;
@@ -337,10 +455,7 @@ static inline int core_accept_conn(struct core *c)
     slot->nrx = 0;
     slot->ntx = 0;
     c->nconns++;
-    debug_log_conn(c, slot, "accepted nconns=%d", c->nconns);
 
-    /* Start with read interest; writable interest is armed only while echo data is pending. */
-    struct epoll_event ev;
     ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
     ev.data.ptr = &slot->ev_item;
     if (epoll_ctl(c->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
@@ -352,13 +467,10 @@ static inline int core_accept_conn(struct core *c)
       if (c->nconns > 0)
         c->nconns--;
       conn_reset(slot);
+      core_push_free_conn(c, slot);
       return -1;
     }
 
-    /*
-     * In ET mode the peer may have already queued data before this accepted
-     * socket was added to epoll, so try to drain it immediately once.
-     */
     core_rx_conn(c, slot);
     if (slot->active)
       core_tx_conn(c, slot);
@@ -378,11 +490,7 @@ static inline void core_rx_conn(struct core *c, struct conn *cn)
     if (nrx < 0)
     {
       if (errno == EAGAIN || errno == EWOULDBLOCK)
-      {
-        debug_log_conn(c, cn, "recv would block nrx=%zu ntx=%zu",
-            cn->nrx, cn->ntx);
         return;
-      }
 
       core_close_conn(c, cn, "recv failed", errno);
       return;
@@ -403,14 +511,13 @@ static inline void core_rx_conn(struct core *c, struct conn *cn)
       __sync_fetch_and_add(&c->rxp_interval, delta_msgs);
       __sync_fetch_and_add(&c->rxb_interval, delta_msgs * msize);
     }
-    debug_log_conn(c, cn, "recv progress nrx=%d total_buf=%zu delta_msgs=%zu",
-        nrx, cn->nrx, delta_msgs);
   }
 }
 
 static inline void core_tx_conn(struct core *c, struct conn *cn)
 {
   size_t ready = cn->nrx - (cn->nrx % msize);
+  int blocked = 0;
 
   while (cn->ntx < ready)
   {
@@ -422,8 +529,7 @@ static inline void core_tx_conn(struct core *c, struct conn *cn)
     {
       if (errno == EAGAIN || errno == EWOULDBLOCK)
       {
-        debug_log_conn(c, cn, "send would block ready=%zu ntx=%zu",
-            ready, cn->ntx);
+        blocked = 1;
         break;
       }
 
@@ -446,8 +552,6 @@ static inline void core_tx_conn(struct core *c, struct conn *cn)
       __sync_fetch_and_add(&c->txp_interval, delta_msgs);
       __sync_fetch_and_add(&c->txb_interval, delta_msgs * msize);
     }
-    debug_log_conn(c, cn, "send progress ntx=%d sent_off=%zu delta_msgs=%zu",
-        ntx, cn->ntx, delta_msgs);
   }
 
   if (cn->ntx == ready && ready > 0)
@@ -460,26 +564,20 @@ static inline void core_tx_conn(struct core *c, struct conn *cn)
     cn->nrx = left;
     cn->ntx = 0;
   }
+
+  if (cn->active)
+    core_schedule_tx_retry(c, cn, util_rdtsc(), blocked);
 }
 
 static inline void core_update_events(struct core *c, struct conn *cn)
 {
   struct epoll_event ev;
-  size_t ready;
-  uint32_t events;
 
   if (!cn->active || cn->fd < 0)
     return;
 
-  ready = cn->nrx - (cn->nrx % msize);
-  events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
-  if (ready > cn->ntx)
-    events |= EPOLLOUT;
-
-  ev.events = events;
+  ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
   ev.data.ptr = &cn->ev_item;
-  debug_log_conn(c, cn, "epoll mod events=0x%x ready=%zu ntx=%zu",
-      events, ready, cn->ntx);
   if (epoll_ctl(c->epoll_fd, EPOLL_CTL_MOD, cn->fd, &ev) < 0)
     core_close_conn(c, cn, "epoll_ctl mod failed", errno);
 }
@@ -487,6 +585,7 @@ static inline void core_update_events(struct core *c, struct conn *cn)
 static inline void core_init(struct core *c)
 {
   int ret, opt, fd;
+  struct epoll_event ev;
 
   c->conns = (struct conn *) calloc((size_t) mconns, sizeof(struct conn));
   if (c->conns == NULL)
@@ -511,6 +610,13 @@ static inline void core_init(struct core *c)
   c->free_head = -1;
   for (int i = mconns - 1; i >= 0; i--)
     core_push_free_conn(c, &c->conns[i]);
+
+  c->tx_heap = (struct conn **) calloc((size_t) mconns, sizeof(struct conn *));
+  if (c->tx_heap == NULL)
+  {
+    fprintf(stderr, "failed to calloc tx heap\n");
+    abort();
+  }
 
   if (c->id != 0)
     pthread_barrier_wait(&start_barrier);
@@ -551,8 +657,6 @@ static inline void core_init(struct core *c)
   }
 
   c->listen_fd = fd;
-
-  /* Create epoll and add listen socket */
   c->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
   if (c->epoll_fd < 0)
   {
@@ -560,7 +664,6 @@ static inline void core_init(struct core *c)
     abort();
   }
 
-  struct epoll_event ev;
   ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
   c->listen_item.type = EPOLL_ITEM_LISTEN;
   c->listen_item.ptr = c;
@@ -572,12 +675,11 @@ static inline void core_init(struct core *c)
   }
 
   c->nconns = 0;
+  c->tx_heap_len = 0;
   c->rxb_interval = 0;
   c->rxp_interval = 0;
   c->txb_interval = 0;
   c->txp_interval = 0;
-  debug_log_core(c, "core init listen_fd=%d epoll_fd=%d", c->listen_fd,
-      c->epoll_fd);
 }
 
 static inline void * core_thread(void *arg)
@@ -593,9 +695,9 @@ static inline void * core_thread(void *arg)
 
   while (1)
   {
-    /* Non-blocking epoll wait (0ms timeout) */
-    nev = epoll_wait(c->epoll_fd, events, mconns + 1, 0);
-    debug_log_core(c, "epoll_wait nev=%d nconns=%d", nev, c->nconns);
+    core_run_due_tx(c, util_rdtsc());
+    nev = epoll_wait(c->epoll_fd, events, mconns + 1,
+        core_next_timeout_ms(c, util_rdtsc()));
 
     if (nev < 0)
     {
@@ -607,7 +709,6 @@ static inline void * core_thread(void *arg)
       continue;
     }
 
-    /* Process all events returned by epoll */
     for (int i = 0; i < nev; i++)
     {
       uint32_t ev = events[i].events;
@@ -616,10 +717,8 @@ static inline void * core_thread(void *arg)
       if (item == NULL)
         continue;
 
-      /* Accept on listen socket */
       if (item->type == EPOLL_ITEM_LISTEN)
       {
-        debug_log_core(c, "listen event events=0x%x", ev);
         if (ev & EPOLLIN)
         {
           while (1)
@@ -636,35 +735,31 @@ static inline void * core_thread(void *arg)
         continue;
       }
 
-      struct conn *cn = (struct conn *) item->ptr;
-      if (cn == NULL || !cn->active)
-        continue;
-
-      debug_log_conn(c, cn, "conn event events=0x%x nrx=%zu ntx=%zu",
-          ev, cn->nrx, cn->ntx);
-
-      /* Handle errors first */
-      if (ev & (EPOLLERR | EPOLLHUP))
       {
-        core_close_conn(c, cn, "epoll error", 0);
-        continue;
+        struct conn *cn = (struct conn *) item->ptr;
+
+        if (cn == NULL || !cn->active)
+          continue;
+
+        if (ev & (EPOLLERR | EPOLLHUP))
+        {
+          core_close_conn(c, cn, "epoll error", 0);
+          continue;
+        }
+
+        if (ev & EPOLLIN)
+          core_rx_conn(c, cn);
+
+        if (cn->active)
+          core_tx_conn(c, cn);
+
+        if (cn->active)
+          core_update_events(c, cn);
       }
-
-      if (ev & EPOLLIN)
-        core_rx_conn(c, cn);
-
-      if (cn->active)
-        core_tx_conn(c, cn);
-
-      if (cn->active)
-        core_update_events(c, cn);
     }
 
-    /* Try to accept if we have room and got no events */
     if (nev == 0)
-    {
       core_accept_conn(c);
-    }
   }
 
   pthread_exit((void *) (intptr_t) 0);
@@ -714,7 +809,6 @@ static inline void init_server(void)
 
   cores = (struct core *) calloc((size_t) ncores, sizeof(struct core));
   threads = (pthread_t *) calloc((size_t) ncores, sizeof(pthread_t));
-  debug_init();
   if (!cores || !threads)
   {
     perror("calloc cores/threads");
@@ -745,13 +839,6 @@ int main(int argc, char **argv)
   }
 
   init_server();
-  if (debug_enabled)
-  {
-    fprintf(stderr,
-        "[tcp_linux_server] debug enabled bind=%s:%d msize=%zu bsize=%zu ncores=%d mconns=%d\n",
-        server_ip, port, msize, bsize, ncores, mconns);
-    fflush(stderr);
-  }
   prepare_cores();
   start_cores();
 
@@ -778,6 +865,4 @@ int main(int argc, char **argv)
       nanosleep(&ts, NULL);
     }
   }
-
-  return 0;
 }
