@@ -288,7 +288,7 @@ static inline int core_accept_conn(struct core *c)
 
     /* Start with read interest; writable interest is armed only while echo data is pending. */
     struct epoll_event ev;
-    ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP | EPOLLET;
+    ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
     ev.data.ptr = &slot->ev_item;
     if (epoll_ctl(c->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
     {
@@ -407,7 +407,7 @@ static inline void core_update_events(struct core *c, struct conn *cn)
     return;
 
   ready = cn->nrx - (cn->nrx % msize);
-  events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP | EPOLLET;
+  events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
   if (ready > cn->ntx)
     events |= EPOLLOUT;
 
@@ -494,7 +494,7 @@ static inline void core_init(struct core *c)
   }
 
   struct epoll_event ev;
-  ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLET;
+  ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
   c->listen_item.type = EPOLL_ITEM_LISTEN;
   c->listen_item.ptr = c;
   ev.data.ptr = &c->listen_item;

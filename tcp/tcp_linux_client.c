@@ -23,14 +23,12 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
-#include <sys/timerfd.h>
 #include <stdio.h>
 #include <time.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <fcntl.h>
-#include <stdint.h>
 #include <linux/types.h>
 #include "../utils/clock.h"
 #include "../utils/hist.h"
@@ -38,16 +36,6 @@
 struct payload_hdr {
   __u64 tsc;
 }__attribute__((packed));
-
-enum epoll_item_type {
-  EPOLL_ITEM_CONN,
-  EPOLL_ITEM_TIMER,
-};
-
-struct epoll_item {
-  enum epoll_item_type type;
-  void *ptr;
-};
 
 struct conn {
   int fd;
@@ -65,14 +53,12 @@ struct conn {
   __u64 total_rx_pkts;
   int next_free;
   int heap_idx;
-  struct epoll_item ev_item;
 };
 
 /* Per-core context */
 struct core {
   int id;
   int epoll_fd;
-  int timer_fd;
   int free_head;
   int heap_len;
   struct conn *conns;
@@ -85,7 +71,6 @@ struct core {
   __u64 txp_tp_interval;
   int established_conns;
   int pending_conns;
-  struct epoll_item timer_item;
 };
 
 /* Default arg values */
@@ -499,12 +484,11 @@ static inline __u64 conn_compute_next_tsc(struct conn *cn, __u64 now_tsc,
 static inline int core_update_conn_events(struct core *c, struct conn *cn)
 {
   struct epoll_event ev;
-  uint32_t events;
+  uint32_t events = EPOLLERR | EPOLLHUP | EPOLLRDHUP;
 
   if (!cn->active || cn->fd < 0)
     return 0;
 
-  events = EPOLLERR | EPOLLHUP | EPOLLET;
   if (cn->connected)
   {
     events |= EPOLLIN;
@@ -517,40 +501,8 @@ static inline int core_update_conn_events(struct core *c, struct conn *cn)
   }
 
   ev.events = events;
-  ev.data.ptr = &cn->ev_item;
+  ev.data.ptr = cn;
   return epoll_ctl(c->epoll_fd, EPOLL_CTL_MOD, cn->fd, &ev);
-}
-
-static inline void core_rearm_timer(struct core *c, __u64 now_tsc)
-{
-  struct itimerspec its;
-  struct conn *cn = core_heap_peek(c);
-  __u64 delta_tsc;
-  __u64 delta_ns;
-
-  memset(&its, 0, sizeof(its));
-  if (cn == NULL)
-  {
-    timerfd_settime(c->timer_fd, 0, &its, NULL);
-    return;
-  }
-
-  if (cn->next_tx_tsc <= now_tsc)
-  {
-    its.it_value.tv_nsec = 1;
-  }
-  else
-  {
-    delta_tsc = cn->next_tx_tsc - now_tsc;
-    delta_ns = (__u64) (((double) delta_tsc * 1000.0) / clock_tsc_per_us());
-    if (delta_ns == 0)
-      delta_ns = 1;
-
-    its.it_value.tv_sec = (time_t) (delta_ns / 1000000000ULL);
-    its.it_value.tv_nsec = (long) (delta_ns % 1000000000ULL);
-  }
-
-  timerfd_settime(c->timer_fd, 0, &its, NULL);
 }
 
 static inline void core_drop_conn(struct core *c, struct conn *cn,
@@ -624,13 +576,13 @@ static inline int core_start_conn(struct core *c, struct conn *cn)
   cn->token_tsc = 0;
   cn->next_tx_tsc = 0;
 
-  ev.data.ptr = &cn->ev_item;
+  ev.data.ptr = cn;
   ret = connect(fd, (struct sockaddr *) &c->dst_addr, c->dst_len);
   if (ret == 0)
   {
     cn->connected = true;
     c->established_conns++;
-    ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLET;
+    ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
     if (epoll_ctl(c->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
     {
       err = errno;
@@ -645,7 +597,7 @@ static inline int core_start_conn(struct core *c, struct conn *cn)
   if (errno == EINPROGRESS)
   {
     c->pending_conns++;
-    ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLET;
+    ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
     if (epoll_ctl(c->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
     {
       err = errno;
@@ -707,15 +659,10 @@ static inline void core_connect_all(struct core *c)
     for (int i = 0; i < nev; i++)
     {
       uint32_t ev = events[i].events;
-      struct epoll_item *item = (struct epoll_item *) events[i].data.ptr;
-      struct conn *cn;
+      struct conn *cn = (struct conn *) events[i].data.ptr;
       int err = 0;
       socklen_t len = sizeof(err);
 
-      if (item == NULL || item->type != EPOLL_ITEM_CONN)
-        continue;
-
-      cn = (struct conn *) item->ptr;
       if (cn == NULL || !cn->active || cn->connected)
         continue;
 
@@ -764,8 +711,6 @@ static inline void core_init(struct core *c)
   for (int i = 0; i < nconns; i++)
   {
     conn_reset(&c->conns[i]);
-    c->conns[i].ev_item.type = EPOLL_ITEM_CONN;
-    c->conns[i].ev_item.ptr = &c->conns[i];
     c->conns[i].txbuf = (__u8 *) malloc(msize);
     c->conns[i].rxbuf = (__u8 *) malloc(msize);
     if (c->conns[i].txbuf == NULL || c->conns[i].rxbuf == NULL)
@@ -793,27 +738,6 @@ static inline void core_init(struct core *c)
   {
     perror("epoll_create1");
     pthread_exit((void *) (intptr_t) -1);
-  }
-
-  c->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
-  if (c->timer_fd < 0)
-  {
-    perror("timerfd_create");
-    pthread_exit((void *) (intptr_t) -1);
-  }
-
-  c->timer_item.type = EPOLL_ITEM_TIMER;
-  c->timer_item.ptr = c;
-  {
-    struct epoll_event ev;
-
-    ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLET;
-    ev.data.ptr = &c->timer_item;
-    if (epoll_ctl(c->epoll_fd, EPOLL_CTL_ADD, c->timer_fd, &ev) < 0)
-    {
-      perror("epoll_ctl add timerfd");
-      pthread_exit((void *) (intptr_t) -1);
-    }
   }
 
   c->heap_len = 0;
@@ -946,26 +870,37 @@ static inline void core_rx_conn(struct core *c, struct conn *cn)
   }
 }
 
-static inline void core_handle_timer(struct core *c, __u64 now_tsc,
+static inline void core_run_due(struct core *c, __u64 now_tsc,
     double bytes_per_us, double max_tokens)
 {
-  uint64_t expirations;
-
-  while (read(c->timer_fd, &expirations, sizeof(expirations)) > 0)
-    ;
-
   while (1)
   {
     struct conn *cn = core_heap_peek(c);
 
     if (cn == NULL || cn->next_tx_tsc > now_tsc)
-      break;
+      return;
 
     core_heap_remove(c, cn);
     core_tx_conn(c, cn, now_tsc, bytes_per_us, max_tokens);
   }
+}
 
-  core_rearm_timer(c, util_rdtsc());
+static inline int core_next_timeout_ms(struct core *c, __u64 now_tsc)
+{
+  struct conn *cn = core_heap_peek(c);
+  double delta_us;
+
+  if (cn == NULL)
+    return 1000;
+
+  if (cn->next_tx_tsc <= now_tsc)
+    return 0;
+
+  delta_us = (double) (cn->next_tx_tsc - now_tsc) / clock_tsc_per_us();
+  if (delta_us < 1000.0)
+    return 0;
+
+  return (int) ((delta_us + 999.0) / 1000.0);
 }
 
 static inline void wait_for_start(void)
@@ -980,9 +915,9 @@ static inline void wait_for_start(void)
 static inline void * core_thread(void *arg)
 {
   struct core *c;
-  __u64 start_tsc, elapsed, now_tsc;
+  __u64 start_tsc, elapsed;
   double bytes_per_us, max_tokens;
-  struct epoll_event events[nconns + 1];
+  struct epoll_event events[nconns];
   int nev;
 
   c = (struct core *) arg;
@@ -993,7 +928,6 @@ static inline void * core_thread(void *arg)
   wait_for_start();
 
   start_tsc = util_rdtsc();
-  now_tsc = start_tsc;
   bytes_per_us = rate / 8.0;
   max_tokens = bytes_per_us * 1000.0;
 
@@ -1006,17 +940,21 @@ static inline void * core_thread(void *arg)
 
     cn->tokens = 0.0;
     cn->token_tsc = start_tsc;
-    core_schedule_conn(c, cn, now_tsc, bytes_per_us, max_tokens);
+    core_schedule_conn(c, cn, start_tsc, bytes_per_us, max_tokens);
   }
-  core_rearm_timer(c, now_tsc);
 
   while (1)
   {
+    __u64 now_tsc = util_rdtsc();
+
     elapsed = us_since_tsc(start_tsc);
     if (elapsed >= (__u64) duration * 1000000ULL)
       break;
 
-    nev = epoll_wait(c->epoll_fd, events, nconns + 1, 1000);
+    core_run_due(c, now_tsc, bytes_per_us, max_tokens);
+
+    nev = epoll_wait(c->epoll_fd, events, nconns,
+        core_next_timeout_ms(c, util_rdtsc()));
     if (nev < 0)
     {
       if (errno != EINTR)
@@ -1027,18 +965,7 @@ static inline void * core_thread(void *arg)
     for (int i = 0; i < nev; i++)
     {
       uint32_t ev = events[i].events;
-      struct epoll_item *item = (struct epoll_item *) events[i].data.ptr;
-
-      if (item == NULL)
-        continue;
-
-      if (item->type == EPOLL_ITEM_TIMER)
-      {
-        core_handle_timer(c, util_rdtsc(), bytes_per_us, max_tokens);
-        continue;
-      }
-
-      struct conn *cn = (struct conn *) item->ptr;
+      struct conn *cn = (struct conn *) events[i].data.ptr;
       int err = 0;
       socklen_t len = sizeof(err);
 
@@ -1050,7 +977,6 @@ static inline void * core_thread(void *arg)
         if (getsockopt(cn->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0)
           err = errno;
         core_drop_conn(c, cn, "epoll error", err);
-        core_rearm_timer(c, util_rdtsc());
         continue;
       }
 
@@ -1072,7 +998,6 @@ static inline void prepare_cores(void)
     memset(&cores[i], 0, sizeof(struct core));
     cores[i].id = i;
     cores[i].epoll_fd = -1;
-    cores[i].timer_fd = -1;
     memset(&cores[i].dst_addr, 0, sizeof(cores[i].dst_addr));
     cores[i].dst_addr.sin_family = AF_INET;
     cores[i].dst_addr.sin_port = htons((__u16) rem_port);
@@ -1224,8 +1149,6 @@ int main(int argc, char **argv)
         free(cores[i].conns[j].rxbuf);
       }
     }
-    if (cores[i].timer_fd >= 0)
-      close(cores[i].timer_fd);
     if (cores[i].epoll_fd >= 0)
       close(cores[i].epoll_fd);
     free(cores[i].tx_heap);
