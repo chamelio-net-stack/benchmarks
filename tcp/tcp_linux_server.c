@@ -23,6 +23,8 @@
 #include <pthread.h>
 #include <assert.h>
 #include <fcntl.h>
+#include <stddef.h>
+#include <stdarg.h>
 #include <linux/types.h>
 #include "../utils/clock.h"
 
@@ -77,6 +79,52 @@ static pthread_barrier_t start_barrier;
 static pthread_t *threads = NULL;
 static struct core *cores = NULL;
 struct sockaddr_in src_addr;
+static int debug_enabled = 0;
+
+static inline void debug_log_conn(struct core *c, struct conn *cn,
+    const char *fmt, ...)
+{
+  va_list ap;
+
+  if (!debug_enabled)
+    return;
+
+  fprintf(stderr, "[tcp_linux_server] core=%d fd=%d conn=%td t=%llu ",
+      c != NULL ? c->id : -1,
+      cn != NULL ? cn->fd : -1,
+      (c != NULL && cn != NULL && c->conns != NULL) ? (ptrdiff_t) (cn - c->conns) : -1,
+      (unsigned long long) now_ns());
+  va_start(ap, fmt);
+  vfprintf(stderr, fmt, ap);
+  va_end(ap);
+  fputc('\n', stderr);
+  fflush(stderr);
+}
+
+static inline void debug_log_core(struct core *c, const char *fmt, ...)
+{
+  va_list ap;
+
+  if (!debug_enabled)
+    return;
+
+  fprintf(stderr, "[tcp_linux_server] core=%d t=%llu ",
+      c != NULL ? c->id : -1,
+      (unsigned long long) now_ns());
+  va_start(ap, fmt);
+  vfprintf(stderr, fmt, ap);
+  va_end(ap);
+  fputc('\n', stderr);
+  fflush(stderr);
+}
+
+static inline void debug_init(void)
+{
+  const char *env = getenv("TCP_BENCH_DEBUG");
+
+  if (env != NULL && strcmp(env, "0") != 0)
+    debug_enabled = 1;
+}
 
 static inline void core_rx_conn(struct core *c, struct conn *cn);
 static inline void core_tx_conn(struct core *c, struct conn *cn);
@@ -215,6 +263,7 @@ static inline void core_push_free_conn(struct core *c, struct conn *cn)
 {
   cn->next_free = c->free_head;
   c->free_head = (int) (cn - c->conns);
+  debug_log_conn(c, cn, "free push free_head=%d", c->free_head);
 }
 
 static inline struct conn *core_pop_free_conn(struct core *c)
@@ -229,6 +278,7 @@ static inline struct conn *core_pop_free_conn(struct core *c)
   cn = &c->conns[idx];
   c->free_head = cn->next_free;
   cn->next_free = -1;
+  debug_log_conn(c, cn, "free pop new_free_head=%d", c->free_head);
   return cn;
 }
 
@@ -247,6 +297,8 @@ static inline void core_close_conn(struct core *c, struct conn *cn,
   }
   if (c->nconns > 0)
     c->nconns--;
+  debug_log_conn(c, cn, "close active=%d nrx=%zu ntx=%zu remaining=%d",
+      cn->active, cn->nrx, cn->ntx, c->nconns);
   conn_reset(cn);
   core_push_free_conn(c, cn);
 }
@@ -285,6 +337,7 @@ static inline int core_accept_conn(struct core *c)
     slot->nrx = 0;
     slot->ntx = 0;
     c->nconns++;
+    debug_log_conn(c, slot, "accepted nconns=%d", c->nconns);
 
     /* Start with read interest; writable interest is armed only while echo data is pending. */
     struct epoll_event ev;
@@ -325,7 +378,11 @@ static inline void core_rx_conn(struct core *c, struct conn *cn)
     if (nrx < 0)
     {
       if (errno == EAGAIN || errno == EWOULDBLOCK)
+      {
+        debug_log_conn(c, cn, "recv would block nrx=%zu ntx=%zu",
+            cn->nrx, cn->ntx);
         return;
+      }
 
       core_close_conn(c, cn, "recv failed", errno);
       return;
@@ -346,6 +403,8 @@ static inline void core_rx_conn(struct core *c, struct conn *cn)
       __sync_fetch_and_add(&c->rxp_interval, delta_msgs);
       __sync_fetch_and_add(&c->rxb_interval, delta_msgs * msize);
     }
+    debug_log_conn(c, cn, "recv progress nrx=%d total_buf=%zu delta_msgs=%zu",
+        nrx, cn->nrx, delta_msgs);
   }
 }
 
@@ -362,7 +421,11 @@ static inline void core_tx_conn(struct core *c, struct conn *cn)
     if (ntx < 0)
     {
       if (errno == EAGAIN || errno == EWOULDBLOCK)
+      {
+        debug_log_conn(c, cn, "send would block ready=%zu ntx=%zu",
+            ready, cn->ntx);
         break;
+      }
 
       core_close_conn(c, cn, "send failed", errno);
       return;
@@ -383,6 +446,8 @@ static inline void core_tx_conn(struct core *c, struct conn *cn)
       __sync_fetch_and_add(&c->txp_interval, delta_msgs);
       __sync_fetch_and_add(&c->txb_interval, delta_msgs * msize);
     }
+    debug_log_conn(c, cn, "send progress ntx=%d sent_off=%zu delta_msgs=%zu",
+        ntx, cn->ntx, delta_msgs);
   }
 
   if (cn->ntx == ready && ready > 0)
@@ -413,6 +478,8 @@ static inline void core_update_events(struct core *c, struct conn *cn)
 
   ev.events = events;
   ev.data.ptr = &cn->ev_item;
+  debug_log_conn(c, cn, "epoll mod events=0x%x ready=%zu ntx=%zu",
+      events, ready, cn->ntx);
   if (epoll_ctl(c->epoll_fd, EPOLL_CTL_MOD, cn->fd, &ev) < 0)
     core_close_conn(c, cn, "epoll_ctl mod failed", errno);
 }
@@ -509,6 +576,8 @@ static inline void core_init(struct core *c)
   c->rxp_interval = 0;
   c->txb_interval = 0;
   c->txp_interval = 0;
+  debug_log_core(c, "core init listen_fd=%d epoll_fd=%d", c->listen_fd,
+      c->epoll_fd);
 }
 
 static inline void * core_thread(void *arg)
@@ -526,6 +595,7 @@ static inline void * core_thread(void *arg)
   {
     /* Non-blocking epoll wait (0ms timeout) */
     nev = epoll_wait(c->epoll_fd, events, mconns + 1, 0);
+    debug_log_core(c, "epoll_wait nev=%d nconns=%d", nev, c->nconns);
 
     if (nev < 0)
     {
@@ -549,6 +619,7 @@ static inline void * core_thread(void *arg)
       /* Accept on listen socket */
       if (item->type == EPOLL_ITEM_LISTEN)
       {
+        debug_log_core(c, "listen event events=0x%x", ev);
         if (ev & EPOLLIN)
         {
           while (1)
@@ -568,6 +639,9 @@ static inline void * core_thread(void *arg)
       struct conn *cn = (struct conn *) item->ptr;
       if (cn == NULL || !cn->active)
         continue;
+
+      debug_log_conn(c, cn, "conn event events=0x%x nrx=%zu ntx=%zu",
+          ev, cn->nrx, cn->ntx);
 
       /* Handle errors first */
       if (ev & (EPOLLERR | EPOLLHUP))
@@ -640,6 +714,7 @@ static inline void init_server(void)
 
   cores = (struct core *) calloc((size_t) ncores, sizeof(struct core));
   threads = (pthread_t *) calloc((size_t) ncores, sizeof(pthread_t));
+  debug_init();
   if (!cores || !threads)
   {
     perror("calloc cores/threads");
@@ -670,6 +745,13 @@ int main(int argc, char **argv)
   }
 
   init_server();
+  if (debug_enabled)
+  {
+    fprintf(stderr,
+        "[tcp_linux_server] debug enabled bind=%s:%d msize=%zu bsize=%zu ncores=%d mconns=%d\n",
+        server_ip, port, msize, bsize, ncores, mconns);
+    fflush(stderr);
+  }
   prepare_cores();
   start_cores();
 
