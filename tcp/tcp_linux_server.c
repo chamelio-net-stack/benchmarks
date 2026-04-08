@@ -66,6 +66,10 @@ static pthread_t *threads = NULL;
 static struct core *cores = NULL;
 struct sockaddr_in src_addr;
 
+static inline void core_rx_conn(struct core *c, struct conn *cn);
+static inline void core_tx_conn(struct core *c, struct conn *cn);
+static inline void core_update_events(struct core *c, struct conn *cn);
+
 static inline int parse_args(int argc, char **argv)
 {
   if (argc < 3)
@@ -297,9 +301,9 @@ static inline int core_accept_conn(struct core *c)
     slot->warned_stalled_tx = 0;
     server_log(c, slot, "ACCEPT", "accepted connection (total=%d)", c->nconns);
 
-    /* Add to epoll */
+    /* Start with read interest; writable interest is armed only while echo data is pending. */
     struct epoll_event ev;
-    ev.events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLET;
+    ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP | EPOLLET;
     ev.data.fd = fd;
     if (epoll_ctl(c->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
     {
@@ -312,6 +316,14 @@ static inline int core_accept_conn(struct core *c)
       conn_reset(slot);
       return -1;
     }
+
+    /*
+     * In ET mode the peer may have already queued data before this accepted
+     * socket was added to epoll, so try to drain it immediately once.
+     */
+    core_rx_conn(c, slot);
+    if (slot->active)
+      core_tx_conn(c, slot);
   }
 
   return 0;
@@ -416,6 +428,29 @@ static inline void core_tx_conn(struct core *c, struct conn *cn)
     cn->ntx = 0;
     cn->warned_stalled_tx = 0;
     server_log(c, cn, "TX", "echo buffer drained, leftover=%zu", left);
+  }
+}
+
+static inline void core_update_events(struct core *c, struct conn *cn)
+{
+  struct epoll_event ev;
+  size_t ready;
+  uint32_t events;
+
+  if (!cn->active || cn->fd < 0)
+    return;
+
+  ready = cn->nrx - (cn->nrx % msize);
+  events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP | EPOLLET;
+  if (ready > cn->ntx)
+    events |= EPOLLOUT;
+
+  ev.events = events;
+  ev.data.fd = cn->fd;
+  if (epoll_ctl(c->epoll_fd, EPOLL_CTL_MOD, cn->fd, &ev) < 0)
+  {
+    server_log(c, cn, "EPOLL", "epoll_ctl mod failed: %s", strerror(errno));
+    core_close_conn(c, cn, "epoll_ctl mod failed", errno);
   }
 }
 
@@ -587,7 +622,7 @@ static inline void * core_thread(void *arg)
       if (ev & EPOLLIN)
         core_rx_conn(c, cn);
 
-      if ((ev & EPOLLOUT) && cn->active)
+      if (cn->active)
         core_tx_conn(c, cn);
 
       if (cn->active)
@@ -601,6 +636,8 @@ static inline void * core_thread(void *arg)
               "have %zu bytes ready to echo but no EPOLLOUT in ET mode; next write may never trigger",
               ready - cn->ntx);
         }
+
+        core_update_events(c, cn);
       }
     }
 
