@@ -657,12 +657,12 @@ static inline void core_connect_all(struct core *c)
     if (nevents < 0)
     {
       fprintf(stderr, "core %d: tcp_wait failed: %s\n", c->id, strerror(errno));
-      pthread_exit((void *) (intptr_t) -1);
+      pthread_exit(-1);
     }
 
     for (int i = 0; i < nevents; i++)
     {
-      struct conn *cn = (struct conn *) (uintptr_t) c->events[i].data;
+      struct conn *cn = (struct conn *) c->events[i].data;
 
       if (cn == NULL || !cn->active || cn->connected || cn->fd != c->events[i].sockfd)
         continue;
@@ -684,23 +684,23 @@ static inline void core_init(struct core *c)
   if (c->tcp_ctx == NULL)
   {
     fprintf(stderr, "core %d: failed to create TCP context\n", c->id);
-    pthread_exit((void *) (intptr_t) -1);
+    pthread_exit(-1);
   }
 
   c->wait = tcp_wait_new(c->tcp_ctx);
   if (c->wait == NULL)
   {
     fprintf(stderr, "core %d: failed to create TCP wait handle\n", c->id);
-    pthread_exit((void *) (intptr_t) -1);
+    pthread_exit(-1);
   }
 
   c->conns = (struct conn *) calloc((size_t) nconns, sizeof(struct conn));
-  c->events = calloc((size_t) nconns, sizeof(*c->events));
-  c->txq = calloc((size_t) nconns, sizeof(*c->txq));
+  c->events = calloc(nconns, sizeof(*c->events));
+  c->txq = calloc(nconns, sizeof(*c->txq));
   if (c->conns == NULL || c->events == NULL || c->txq == NULL)
   {
     perror("calloc conn state");
-    pthread_exit((void *) (intptr_t) -1);
+    pthread_exit(-1);
   }
 
   for (int i = 0; i < nconns; i++)
@@ -711,7 +711,7 @@ static inline void core_init(struct core *c)
     if (c->conns[i].txbuf == NULL || c->conns[i].rxbuf == NULL)
     {
       perror("malloc buffers");
-      pthread_exit((void *) (intptr_t) -1);
+      pthread_exit(-1);
     }
     memset(c->conns[i].txbuf, 0, msize);
     memset(c->conns[i].rxbuf, 0, msize);
@@ -838,7 +838,7 @@ static inline void core_run_tx(struct core *c, double now_tsc)
   {
     if (!cn->active || !cn->connected)
     {
-      (void) txq_pop(c);
+      txq_pop(c);
       continue;
     }
 
@@ -907,7 +907,7 @@ static inline int core_process_events(struct core *c, double now_tsc)
   for (int i = 0; i < nevents; i++)
   {
     struct tcp_wait_event *ev = &c->events[i];
-    struct conn *cn = (struct conn *) (uintptr_t) ev->data;
+    struct conn *cn = (struct conn *) ev->data;
 
     if (cn == NULL || !cn->active || !cn->connected || cn->fd != ev->sockfd)
       continue;
@@ -937,7 +937,7 @@ static inline void * core_thread(void *arg)
   if (core_list_len > 0)
   {
     if (pin_thread_to_core(core_list[c->id + 1]) != 0)
-      pthread_exit((void *) (intptr_t) -1);
+      pthread_exit(-1);
   }
 
   core_init(c);
@@ -947,7 +947,7 @@ static inline void * core_thread(void *arg)
   wait_for_start();
 
   start_tsc = util_rdtsc();
-  core_prepare_tx_schedule(c, (double) start_tsc);
+  core_prepare_tx_schedule(c, start_tsc);
 
   while (1)
   {
@@ -955,17 +955,17 @@ static inline void * core_thread(void *arg)
     if (elapsed >= (__u64) duration * 1000000ULL)
       break;
 
-    now_tsc = (double) util_rdtsc();
+    now_tsc = util_rdtsc();
     core_run_tx(c, now_tsc);
     tcp_poll_fast(c->tcp_ctx);
-    (void) core_process_events(c, (double) util_rdtsc());
-    now_tsc = (double) util_rdtsc();
+    core_process_events(c, util_rdtsc());
+    now_tsc = util_rdtsc();
     core_run_tx(c, now_tsc);
     tcp_poll_fast(c->tcp_ctx);
-    (void) core_process_events(c, (double) util_rdtsc());
+    core_process_events(c, util_rdtsc());
   }
 
-  pthread_exit((void *) (intptr_t) 0);
+  pthread_exit(0);
 }
 
 static inline void prepare_cores(void)

@@ -30,6 +30,7 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <stdarg.h>
 #include <linux/types.h>
 #include "../utils/clock.h"
 #include "../utils/hist.h"
@@ -49,6 +50,7 @@ struct conn {
   double tokens;
   __u64 total_tx_pkts;
   __u64 total_rx_pkts;
+  int logged_connect;
 };
 
 /* Per-core context */
@@ -304,6 +306,49 @@ static inline void conn_reset(struct conn *cn)
   cn->tx_off = 0;
   cn->rx_off = 0;
   cn->tokens = 0.0;
+  cn->logged_connect = 0;
+}
+
+static void client_log(struct core *c, struct conn *cn, const char *tag,
+    const char *fmt, ...)
+{
+  va_list ap;
+
+  fprintf(stderr, "[%s] core=%d", tag, c->id);
+  if (cn != NULL)
+    fprintf(stderr, " fd=%d", cn->fd);
+
+  fputs(": ", stderr);
+  va_start(ap, fmt);
+  vfprintf(stderr, fmt, ap);
+  va_end(ap);
+  fputc('\n', stderr);
+  fflush(stderr);
+}
+
+static const char *epoll_flags_str(uint32_t events, char *buf, size_t len)
+{
+  int off = 0;
+
+  if (len == 0)
+    return "";
+
+  if (events & EPOLLIN)
+    off += snprintf(buf + off, len - (size_t) off, "%sIN", off == 0 ? "" : "|");
+  if (events & EPOLLOUT)
+    off += snprintf(buf + off, len - (size_t) off, "%sOUT", off == 0 ? "" : "|");
+  if (events & EPOLLERR)
+    off += snprintf(buf + off, len - (size_t) off, "%sERR", off == 0 ? "" : "|");
+  if (events & EPOLLHUP)
+    off += snprintf(buf + off, len - (size_t) off, "%sHUP", off == 0 ? "" : "|");
+  if (events & EPOLLRDHUP)
+    off += snprintf(buf + off, len - (size_t) off, "%sRDHUP", off == 0 ? "" : "|");
+  if (events & EPOLLET)
+    off += snprintf(buf + off, len - (size_t) off, "%sET", off == 0 ? "" : "|");
+  if (off == 0)
+    snprintf(buf, len, "0");
+
+  return buf;
 }
 
 static inline void core_drop_conn(struct core *c, struct conn *cn,
@@ -328,10 +373,13 @@ static inline void core_drop_conn(struct core *c, struct conn *cn,
     }
   }
 
-  fprintf(stderr, "core %d fd=%d: %s: %s\n",
-      c->id, cn->fd, op,
-      err == 0 ? "connection closed" : strerror(err));
-  fflush(stderr);
+  client_log(c, cn, "CLOSE",
+      "%s: %s (connected=%d tx=%llu rx=%llu tx_off=%zu rx_off=%zu)",
+      op, err == 0 ? "connection closed" : strerror(err),
+      cn->connected ? 1 : 0,
+      (unsigned long long) cn->total_tx_pkts,
+      (unsigned long long) cn->total_rx_pkts,
+      cn->tx_off, cn->rx_off);
 
   conn_reset(cn);
 }
@@ -369,12 +417,14 @@ static inline int core_start_conn(struct core *c, struct conn *cn)
   cn->tx_off = 0;
   cn->rx_off = 0;
   cn->tokens = 0.0;
+  cn->logged_connect = 0;
 
   ret = connect(fd, (struct sockaddr *) &c->dst_addr, c->dst_len);
   if (ret == 0)
   {
     cn->connected = true;
     c->established_conns++;
+    client_log(c, cn, "CONNECT", "connected immediately");
     /* Add to epoll for I/O */
     struct epoll_event ev;
     ev.events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLET;
@@ -393,6 +443,8 @@ static inline int core_start_conn(struct core *c, struct conn *cn)
   if (errno == EINPROGRESS)
   {
     c->pending_conns++;
+    client_log(c, cn, "CONNECT", "connect in progress (pending=%d)",
+        c->pending_conns);
     /* Add to epoll for connection completion */
     struct epoll_event ev;
     ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLET;
@@ -422,6 +474,9 @@ static inline void core_connect_all(struct core *c)
   struct epoll_event events[nconns];
   int nev;
 
+  client_log(c, NULL, "CONNECT", "starting connection phase target=%d pending_limit=%d",
+      nconns, mpending);
+
   /* Try to initiate all connects */
   for (int i = 0; i < nconns; i++)
   {
@@ -449,6 +504,7 @@ static inline void core_connect_all(struct core *c)
     {
       int fd = events[i].data.fd;
       uint32_t ev = events[i].events;
+      char evbuf[64];
 
       struct conn *cn = NULL;
       for (int j = 0; j < nconns; j++)
@@ -462,6 +518,10 @@ static inline void core_connect_all(struct core *c)
 
       if (cn == NULL)
         continue;
+
+      client_log(c, cn, "EPOLL-CONNECT", "events=%s connected=%d pending=%d established=%d",
+          epoll_flags_str(ev, evbuf, sizeof(evbuf)),
+          cn->connected ? 1 : 0, c->pending_conns, c->established_conns);
 
       /* Check for errors */
       if (ev & (EPOLLERR | EPOLLHUP))
@@ -487,6 +547,8 @@ static inline void core_connect_all(struct core *c)
           if (c->pending_conns > 0)
             c->pending_conns--;
           c->established_conns++;
+          client_log(c, cn, "CONNECT", "connection established (established=%d pending=%d)",
+              c->established_conns, c->pending_conns);
 
           /* Modify epoll mask for established connection (add EPOLLIN) */
           struct epoll_event ev_mod;
@@ -726,6 +788,7 @@ static inline void * core_thread(void *arg)
     {
       int fd = events[i].data.fd;
       uint32_t ev = events[i].events;
+      char evbuf[64];
 
       /* Find connection by fd */
       struct conn *cn = NULL;
@@ -744,119 +807,31 @@ static inline void * core_thread(void *arg)
       /* Handle errors first */
       if (ev & (EPOLLERR | EPOLLHUP))
       {
-        core_drop_conn(c, cn, "epoll error", 0);
+        int err = 0;
+        socklen_t len = sizeof(err);
+
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0)
+          err = errno;
+        client_log(c, cn, "EPOLL", "events=%s so_error=%s",
+            epoll_flags_str(ev, evbuf, sizeof(evbuf)),
+            err == 0 ? "connection closed" : strerror(err));
+        core_drop_conn(c, cn, "epoll error", err);
         continue;
       }
 
-      /* Handle read events - receive data for this connection */
-      if (ev & EPOLLIN)
+      if ((ev & (EPOLLIN | EPOLLOUT)) && !cn->logged_connect)
       {
-        if (cn->active && cn->connected)
-        {
-          while (1)
-          {
-            int nrx = recv(cn->fd, cn->rxbuf + cn->rx_off, msize - cn->rx_off, 0);
-            if (nrx < 0)
-            {
-              if (errno == EAGAIN || errno == EWOULDBLOCK)
-                break;
-              core_drop_conn(c, cn, "recv failed", errno);
-              break;
-            }
-            if (nrx == 0)
-            {
-              core_drop_conn(c, cn, "recv failed", 0);
-              break;
-            }
-            cn->rx_off += (size_t) nrx;
-            if (cn->rx_off < msize)
-              continue;
-            /* Got a complete message */
-            struct payload_hdr *ph = (struct payload_hdr *) cn->rxbuf;
-            __u64 rtt_us = us_since_tsc(ph->tsc);
-            cn->rx_off = 0;
-            cn->total_rx_pkts++;
-            __sync_fetch_and_add(&c->txb_tp_interval, msize);
-            __sync_fetch_and_add(&c->txp_tp_interval, 1);
-            hist_add(&rtt_hist, rtt_us);
-          }
-        }
-      }
-
-      /* Handle write events - send data for this connection if we have tokens */
-      if ((ev & EPOLLOUT) && cn->active && cn->connected && cn->tokens >= (double) msize)
-      {
-        struct payload_hdr *ph;
-        int ntx;
-        if (cn->tx_off == 0)
-        {
-          ph = (struct payload_hdr *) cn->txbuf;
-          ph->tsc = util_rdtsc();
-        }
-        ntx = send(cn->fd, cn->txbuf + cn->tx_off, msize - cn->tx_off, 0);
-        if (ntx < 0)
-        {
-          if (errno != EAGAIN && errno != EWOULDBLOCK)
-            core_drop_conn(c, cn, "send failed", errno);
-        }
-        else if (ntx == 0)
-        {
-          core_drop_conn(c, cn, "send failed", 0);
-        }
-        else
-        {
-          cn->tx_off += (size_t) ntx;
-          if (cn->tx_off == msize)
-          {
-            cn->tx_off = 0;
-            cn->tokens -= (double) msize;
-            cn->total_tx_pkts++;
-            __sync_fetch_and_add(&c->txb_load_interval, msize);
-            __sync_fetch_and_add(&c->txp_load_interval, 1);
-          }
-        }
+        cn->logged_connect = 1;
+        client_log(c, cn, "EPOLL", "first data-path event=%s tokens=%.0f",
+            epoll_flags_str(ev, evbuf, sizeof(evbuf)), cn->tokens);
       }
     }
 
     /* Try TX on all connections with sufficient tokens (outside event loop) */
     if (active > 0)
     {
-      for (int i = 0; i < nconns; i++)
-      {
-        struct conn *cn = &c->conns[i];
-        if (!cn->active || !cn->connected || cn->tokens < (double) msize)
-          continue;
-
-        struct payload_hdr *ph;
-        int ntx;
-        if (cn->tx_off == 0)
-        {
-          ph = (struct payload_hdr *) cn->txbuf;
-          ph->tsc = util_rdtsc();
-        }
-        ntx = send(cn->fd, cn->txbuf + cn->tx_off, msize - cn->tx_off, 0);
-        if (ntx < 0)
-        {
-          if (errno != EAGAIN && errno != EWOULDBLOCK)
-            core_drop_conn(c, cn, "send failed", errno);
-        }
-        else if (ntx == 0)
-        {
-          core_drop_conn(c, cn, "send failed", 0);
-        }
-        else
-        {
-          cn->tx_off += (size_t) ntx;
-          if (cn->tx_off == msize)
-          {
-            cn->tx_off = 0;
-            cn->tokens -= (double) msize;
-            cn->total_tx_pkts++;
-            __sync_fetch_and_add(&c->txb_load_interval, msize);
-            __sync_fetch_and_add(&c->txp_load_interval, 1);
-          }
-        }
-      }
+      core_rx(c);
+      core_tx(c);
     }
 
 
