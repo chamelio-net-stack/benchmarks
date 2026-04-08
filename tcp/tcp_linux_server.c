@@ -23,7 +23,6 @@
 #include <pthread.h>
 #include <assert.h>
 #include <fcntl.h>
-#include <stdarg.h>
 #include <linux/types.h>
 #include "../utils/clock.h"
 
@@ -33,7 +32,6 @@ struct conn {
   size_t nrx;
   size_t ntx;
   __u8 *buf;
-  int warned_stalled_tx;
 };
 
 struct core {
@@ -194,57 +192,15 @@ static inline void conn_reset(struct conn *cn)
   cn->active = 0;
   cn->nrx = 0;
   cn->ntx = 0;
-  cn->warned_stalled_tx = 0;
-}
-
-static void server_log(struct core *c, struct conn *cn, const char *tag,
-    const char *fmt, ...)
-{
-  va_list ap;
-
-  fprintf(stderr, "[%s] core=%d", tag, c->id);
-  if (cn != NULL)
-    fprintf(stderr, " fd=%d", cn->fd);
-
-  fputs(": ", stderr);
-  va_start(ap, fmt);
-  vfprintf(stderr, fmt, ap);
-  va_end(ap);
-  fputc('\n', stderr);
-  fflush(stderr);
-}
-
-static const char *epoll_flags_str(uint32_t events, char *buf, size_t len)
-{
-  int off = 0;
-
-  if (len == 0)
-    return "";
-
-  if (events & EPOLLIN)
-    off += snprintf(buf + off, len - (size_t) off, "%sIN", off == 0 ? "" : "|");
-  if (events & EPOLLOUT)
-    off += snprintf(buf + off, len - (size_t) off, "%sOUT", off == 0 ? "" : "|");
-  if (events & EPOLLERR)
-    off += snprintf(buf + off, len - (size_t) off, "%sERR", off == 0 ? "" : "|");
-  if (events & EPOLLHUP)
-    off += snprintf(buf + off, len - (size_t) off, "%sHUP", off == 0 ? "" : "|");
-  if (events & EPOLLRDHUP)
-    off += snprintf(buf + off, len - (size_t) off, "%sRDHUP", off == 0 ? "" : "|");
-  if (events & EPOLLET)
-    off += snprintf(buf + off, len - (size_t) off, "%sET", off == 0 ? "" : "|");
-  if (off == 0)
-    snprintf(buf, len, "0");
-
-  return buf;
 }
 
 static inline void core_close_conn(struct core *c, struct conn *cn,
     const char *op, int err)
 {
-  server_log(c, cn, "CLOSE", "%s: %s (nrx=%zu ntx=%zu)",
-      op, err == 0 ? "connection closed" : strerror(err),
-      cn->nrx, cn->ntx);
+  fprintf(stderr, "core %d fd=%d: %s: %s\n",
+      c->id, cn->fd, op,
+      err == 0 ? "connection closed" : strerror(err));
+  fflush(stderr);
 
   if (cn->fd >= 0)
   {
@@ -298,8 +254,6 @@ static inline int core_accept_conn(struct core *c)
     slot->nrx = 0;
     slot->ntx = 0;
     c->nconns++;
-    slot->warned_stalled_tx = 0;
-    server_log(c, slot, "ACCEPT", "accepted connection (total=%d)", c->nconns);
 
     /* Start with read interest; writable interest is armed only while echo data is pending. */
     struct epoll_event ev;
@@ -331,8 +285,6 @@ static inline int core_accept_conn(struct core *c)
 
 static inline void core_rx_conn(struct core *c, struct conn *cn)
 {
-  size_t start_nrx = cn->nrx;
-
   while (cn->nrx < bsize)
   {
     int nrx;
@@ -364,20 +316,11 @@ static inline void core_rx_conn(struct core *c, struct conn *cn)
       __sync_fetch_and_add(&c->rxb_interval, delta_msgs * msize);
     }
   }
-
-  if (cn->nrx != start_nrx)
-  {
-    size_t ready = cn->nrx - (cn->nrx % msize);
-
-    server_log(c, cn, "RX", "buffered=%zu ready=%zu pending_tx=%zu",
-        cn->nrx, ready, ready > cn->ntx ? ready - cn->ntx : 0);
-  }
 }
 
 static inline void core_tx_conn(struct core *c, struct conn *cn)
 {
   size_t ready = cn->nrx - (cn->nrx % msize);
-  size_t start_ntx = cn->ntx;
 
   while (cn->ntx < ready)
   {
@@ -411,12 +354,6 @@ static inline void core_tx_conn(struct core *c, struct conn *cn)
     }
   }
 
-  if (cn->ntx != start_ntx)
-  {
-    server_log(c, cn, "TX", "sent=%zu/%zu buffered=%zu",
-        cn->ntx, ready, cn->nrx);
-  }
-
   if (cn->ntx == ready && ready > 0)
   {
     size_t left = cn->nrx - ready;
@@ -426,8 +363,6 @@ static inline void core_tx_conn(struct core *c, struct conn *cn)
 
     cn->nrx = left;
     cn->ntx = 0;
-    cn->warned_stalled_tx = 0;
-    server_log(c, cn, "TX", "echo buffer drained, leftover=%zu", left);
   }
 }
 
@@ -448,10 +383,7 @@ static inline void core_update_events(struct core *c, struct conn *cn)
   ev.events = events;
   ev.data.fd = cn->fd;
   if (epoll_ctl(c->epoll_fd, EPOLL_CTL_MOD, cn->fd, &ev) < 0)
-  {
-    server_log(c, cn, "EPOLL", "epoll_ctl mod failed: %s", strerror(errno));
     core_close_conn(c, cn, "epoll_ctl mod failed", errno);
-  }
 }
 
 static inline void core_init(struct core *c)
@@ -572,13 +504,10 @@ static inline void * core_thread(void *arg)
     {
       int fd = events[i].data.fd;
       uint32_t ev = events[i].events;
-      char evbuf[64];
 
       /* Accept on listen socket */
       if (fd == c->listen_fd)
       {
-        server_log(c, NULL, "EPOLL", "listen socket events=%s",
-            epoll_flags_str(ev, evbuf, sizeof(evbuf)));
         if (ev & EPOLLIN)
         {
           while (1)
@@ -616,9 +545,6 @@ static inline void * core_thread(void *arg)
         continue;
       }
 
-      server_log(c, cn, "EPOLL", "events=%s nrx=%zu ntx=%zu",
-          epoll_flags_str(ev, evbuf, sizeof(evbuf)), cn->nrx, cn->ntx);
-
       if (ev & EPOLLIN)
         core_rx_conn(c, cn);
 
@@ -626,19 +552,7 @@ static inline void * core_thread(void *arg)
         core_tx_conn(c, cn);
 
       if (cn->active)
-      {
-        size_t ready = cn->nrx - (cn->nrx % msize);
-
-        if (ready > cn->ntx && !(ev & EPOLLOUT) && !cn->warned_stalled_tx)
-        {
-          cn->warned_stalled_tx = 1;
-          server_log(c, cn, "STALL",
-              "have %zu bytes ready to echo but no EPOLLOUT in ET mode; next write may never trigger",
-              ready - cn->ntx);
-        }
-
         core_update_events(c, cn);
-      }
     }
 
     /* Try to accept if we have room and got no events */
