@@ -721,7 +721,7 @@ static inline void * core_thread(void *arg)
       continue;
     }
 
-    /* Process epoll events (ET mode - drain all available) */
+    /* Process epoll events for specific connections */
     for (int i = 0; i < nev; i++)
     {
       int fd = events[i].data.fd;
@@ -748,42 +748,118 @@ static inline void * core_thread(void *arg)
         continue;
       }
 
-      /* Drain all available data (for ET mode) */
+      /* Handle read events - receive data for this connection */
       if (ev & EPOLLIN)
       {
-        while (1)
+        if (cn->active && cn->connected)
         {
-          core_rx(c);
-          if (!cn->active)
-            break;
-          /* For ET mode, check if there's more data */
-          int nrx = recv(cn->fd, cn->rxbuf + cn->rx_off, msize - cn->rx_off, MSG_PEEK);
-          if (nrx <= 0)
-            break;
+          while (1)
+          {
+            int nrx = recv(cn->fd, cn->rxbuf + cn->rx_off, msize - cn->rx_off, 0);
+            if (nrx < 0)
+            {
+              if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
+              core_drop_conn(c, cn, "recv failed", errno);
+              break;
+            }
+            if (nrx == 0)
+            {
+              core_drop_conn(c, cn, "recv failed", 0);
+              break;
+            }
+            cn->rx_off += (size_t) nrx;
+            if (cn->rx_off < msize)
+              continue;
+            /* Got a complete message */
+            struct payload_hdr *ph = (struct payload_hdr *) cn->rxbuf;
+            __u64 rtt_us = us_since_tsc(ph->tsc);
+            cn->rx_off = 0;
+            cn->total_rx_pkts++;
+            __sync_fetch_and_add(&c->txb_tp_interval, msize);
+            __sync_fetch_and_add(&c->txp_tp_interval, 1);
+            hist_add(&rtt_hist, rtt_us);
+          }
         }
       }
 
-      /* Send if we have tokens */
-      if (ev & EPOLLOUT)
+      /* Handle write events - send data for this connection if we have tokens */
+      if ((ev & EPOLLOUT) && cn->active && cn->connected && cn->tokens >= (double) msize)
       {
-        while (cn->active && cn->connected && cn->tokens >= (double) msize)
+        struct payload_hdr *ph;
+        int ntx;
+        if (cn->tx_off == 0)
         {
-          core_tx(c);
-          if (!cn->active || !cn->connected)
-            break;
+          ph = (struct payload_hdr *) cn->txbuf;
+          ph->tsc = util_rdtsc();
+        }
+        ntx = send(cn->fd, cn->txbuf + cn->tx_off, msize - cn->tx_off, 0);
+        if (ntx < 0)
+        {
+          if (errno != EAGAIN && errno != EWOULDBLOCK)
+            core_drop_conn(c, cn, "send failed", errno);
+        }
+        else if (ntx == 0)
+        {
+          core_drop_conn(c, cn, "send failed", 0);
+        }
+        else
+        {
+          cn->tx_off += (size_t) ntx;
+          if (cn->tx_off == msize)
+          {
+            cn->tx_off = 0;
+            cn->tokens -= (double) msize;
+            cn->total_tx_pkts++;
+            __sync_fetch_and_add(&c->txb_load_interval, msize);
+            __sync_fetch_and_add(&c->txp_load_interval, 1);
+          }
         }
       }
     }
 
-    /* Try TX even without EPOLLOUT events (for draining tokens) */
+    /* Try TX on all connections with sufficient tokens (outside event loop) */
     if (active > 0)
-      core_tx(c);
-
-    if (active == 0)
     {
-      struct timespec ts = { .tv_sec = 0, .tv_nsec = 2000000 };
-      nanosleep(&ts, NULL);
+      for (int i = 0; i < nconns; i++)
+      {
+        struct conn *cn = &c->conns[i];
+        if (!cn->active || !cn->connected || cn->tokens < (double) msize)
+          continue;
+
+        struct payload_hdr *ph;
+        int ntx;
+        if (cn->tx_off == 0)
+        {
+          ph = (struct payload_hdr *) cn->txbuf;
+          ph->tsc = util_rdtsc();
+        }
+        ntx = send(cn->fd, cn->txbuf + cn->tx_off, msize - cn->tx_off, 0);
+        if (ntx < 0)
+        {
+          if (errno != EAGAIN && errno != EWOULDBLOCK)
+            core_drop_conn(c, cn, "send failed", errno);
+        }
+        else if (ntx == 0)
+        {
+          core_drop_conn(c, cn, "send failed", 0);
+        }
+        else
+        {
+          cn->tx_off += (size_t) ntx;
+          if (cn->tx_off == msize)
+          {
+            cn->tx_off = 0;
+            cn->tokens -= (double) msize;
+            cn->total_tx_pkts++;
+            __sync_fetch_and_add(&c->txb_load_interval, msize);
+            __sync_fetch_and_add(&c->txp_load_interval, 1);
+          }
+        }
+      }
     }
+
+
   }
 
   pthread_exit((void *) (intptr_t) 0);

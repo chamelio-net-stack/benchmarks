@@ -513,29 +513,71 @@ static inline void * core_thread(void *arg)
         continue;
       }
 
-      /* Drain all available data (for ET mode) */
+      /* Handle read events (ET mode) - drain all available data */
       if (ev & EPOLLIN)
       {
-        while (1)
+        while (cn->active && cn->nrx < bsize)
         {
-          core_rx_conn(c, cn);
-          if (!cn->active)
+          int nrx = recv(cn->fd, cn->buf + cn->nrx, bsize - cn->nrx, 0);
+          if (nrx < 0)
+          {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+              break;
+            core_close_conn(c, cn, "recv failed", errno);
             break;
-          /* For ET mode, try to read again to ensure we got everything */
-          int nrx = recv(cn->fd, cn->buf + cn->nrx, bsize - cn->nrx, MSG_PEEK);
-          if (nrx <= 0)
+          }
+          if (nrx == 0)
+          {
+            core_close_conn(c, cn, "recv failed", 0);
             break;
+          }
+          size_t before_msgs = cn->nrx / msize;
+          cn->nrx += (size_t) nrx;
+          size_t after_msgs = cn->nrx / msize;
+          if (after_msgs > before_msgs)
+          {
+            __sync_fetch_and_add(&c->rxp_interval, after_msgs - before_msgs);
+            __sync_fetch_and_add(&c->rxb_interval, (after_msgs - before_msgs) * msize);
+          }
         }
       }
 
-      if (ev & EPOLLOUT)
+      /* Handle write events (ET mode) - drain all pending data */
+      if ((ev & EPOLLOUT) && cn->active)
       {
-        while (cn->active)
+        size_t ready = cn->nrx - (cn->nrx % msize);
+        while (cn->active && cn->ntx < ready)
         {
-          core_tx_conn(c, cn);
-          /* For ET mode, check if there's still data to send */
-          if (cn->nrx <= cn->ntx || !cn->active)
+          int ntx = send(cn->fd, cn->buf + cn->ntx, ready - cn->ntx, 0);
+          if (ntx < 0)
+          {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+              break;
+            core_close_conn(c, cn, "send failed", errno);
             break;
+          }
+          if (ntx == 0)
+          {
+            core_close_conn(c, cn, "send failed", 0);
+            break;
+          }
+          size_t before_msgs = cn->ntx / msize;
+          cn->ntx += (size_t) ntx;
+          size_t after_msgs = cn->ntx / msize;
+          if (after_msgs > before_msgs)
+          {
+            __sync_fetch_and_add(&c->txp_interval, after_msgs - before_msgs);
+            __sync_fetch_and_add(&c->txb_interval, (after_msgs - before_msgs) * msize);
+          }
+        }
+        /* Reset buffer if all data was sent */
+        if (cn->ntx == ready && ready > 0)
+        {
+          size_t left = cn->nrx - ready;
+          if (left > 0)
+            memmove(cn->buf, cn->buf + ready, left);
+          cn->nrx = left;
+          cn->ntx = 0;
         }
       }
     }
