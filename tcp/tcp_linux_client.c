@@ -22,6 +22,7 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/epoll.h>
 #include <stdio.h>
 #include <time.h>
 #include <stdbool.h>
@@ -53,9 +54,8 @@ struct conn {
 /* Per-core context */
 struct core {
   int id;
+  int epoll_fd;
   struct conn *conns;
-  struct pollfd *pfds;
-  int *pidx;
   struct sockaddr_in dst_addr;
   socklen_t dst_len;
   __u64 txb_load_interval;
@@ -310,7 +310,10 @@ static inline void core_drop_conn(struct core *c, struct conn *cn,
     const char *op, int err)
 {
   if (cn->fd >= 0)
+  {
+    epoll_ctl(c->epoll_fd, EPOLL_CTL_DEL, cn->fd, NULL);
     close(cn->fd);
+  }
 
   if (cn->active)
   {
@@ -372,12 +375,36 @@ static inline int core_start_conn(struct core *c, struct conn *cn)
   {
     cn->connected = true;
     c->established_conns++;
+    /* Add to epoll for I/O */
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLET;
+    ev.data.fd = fd;
+    if (epoll_ctl(c->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
+    {
+      err = errno;
+      close(fd);
+      conn_reset(cn);
+      errno = err;
+      return -1;
+    }
     return 0;
   }
 
   if (errno == EINPROGRESS)
   {
     c->pending_conns++;
+    /* Add to epoll for connection completion */
+    struct epoll_event ev;
+    ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLET;
+    ev.data.fd = fd;
+    if (epoll_ctl(c->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
+    {
+      err = errno;
+      close(fd);
+      conn_reset(cn);
+      errno = err;
+      return -1;
+    }
     return 0;
   }
 
@@ -388,107 +415,103 @@ static inline int core_start_conn(struct core *c, struct conn *cn)
   return -1;
 }
 
-static inline int core_open_pending(struct core *c)
-{
-  int started = 0;
 
-  while ((c->established_conns + c->pending_conns) < nconns &&
-      c->pending_conns < mpending)
-  {
-    bool found = false;
-
-    for (int i = 0; i < nconns; i++)
-    {
-      if (c->conns[i].active)
-        continue;
-
-      found = true;
-      if (core_start_conn(c, &c->conns[i]) != 0)
-      {
-        fprintf(stderr, "core %d: connect setup failed: %s\n",
-            c->id, strerror(errno));
-        fflush(stderr);
-      }
-      else
-      {
-        started++;
-      }
-      break;
-    }
-
-    if (!found)
-      break;
-  }
-
-  return started;
-}
-
-static inline int core_poll_pending(struct core *c)
-{
-  int npfds = 0;
-  int ret;
-
-  if (c->pending_conns == 0)
-    return 0;
-
-  for (int i = 0; i < nconns; i++)
-  {
-    if (!c->conns[i].active || c->conns[i].connected)
-      continue;
-
-    c->pfds[npfds].fd = c->conns[i].fd;
-    c->pfds[npfds].events = POLLOUT | POLLERR | POLLHUP;
-    c->pfds[npfds].revents = 0;
-    c->pidx[npfds] = i;
-    npfds++;
-  }
-
-  ret = poll(c->pfds, (nfds_t) npfds, 1);
-  if (ret <= 0)
-    return 0;
-
-  for (int i = 0; i < npfds; i++)
-  {
-    struct conn *cn;
-    int err = 0;
-    socklen_t len = sizeof(err);
-
-    if (c->pfds[i].revents == 0)
-      continue;
-
-    cn = &c->conns[c->pidx[i]];
-    if (!cn->active || cn->connected)
-      continue;
-
-    if (getsockopt(cn->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0)
-      err = errno;
-
-    if (err == 0)
-    {
-      cn->connected = true;
-      if (c->pending_conns > 0)
-        c->pending_conns--;
-      c->established_conns++;
-      continue;
-    }
-
-    core_drop_conn(c, cn, "connect failed", err);
-  }
-
-  return 1;
-}
 
 static inline void core_connect_all(struct core *c)
 {
+  struct epoll_event events[nconns];
+  int nev;
+
+  /* Try to initiate all connects */
+  for (int i = 0; i < nconns; i++)
+  {
+    if (core_start_conn(c, &c->conns[i]) != 0)
+    {
+      fprintf(stderr, "core %d: connect setup failed: %s\n",
+          c->id, strerror(errno));
+    }
+  }
+
+  /* Wait for all connections to complete (using epoll) */
   while (c->established_conns < nconns)
   {
-    int opened = core_open_pending(c);
-    int progress = core_poll_pending(c);
-
-    if (opened == 0 && progress == 0)
+    nev = epoll_wait(c->epoll_fd, events, nconns, 1);
+    if (nev < 0)
     {
-      struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };
-      nanosleep(&ts, NULL);
+      if (errno == EINTR)
+        continue;
+      perror("epoll_wait");
+      pthread_exit((void *) (intptr_t) -1);
+    }
+
+    /* Process connection completion events */
+    for (int i = 0; i < nev; i++)
+    {
+      int fd = events[i].data.fd;
+      uint32_t ev = events[i].events;
+
+      struct conn *cn = NULL;
+      for (int j = 0; j < nconns; j++)
+      {
+        if (c->conns[j].active && c->conns[j].fd == fd)
+        {
+          cn = &c->conns[j];
+          break;
+        }
+      }
+
+      if (cn == NULL)
+        continue;
+
+      /* Check for errors */
+      if (ev & (EPOLLERR | EPOLLHUP))
+      {
+        int err = 0;
+        socklen_t len = sizeof(err);
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+        core_drop_conn(c, cn, "connect failed", err);
+        continue;
+      }
+
+      /* Connection successful */
+      if (ev & EPOLLOUT)
+      {
+        int err = 0;
+        socklen_t len = sizeof(err);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0)
+          err = errno;
+
+        if (err == 0 && !cn->connected)
+        {
+          cn->connected = true;
+          if (c->pending_conns > 0)
+            c->pending_conns--;
+          c->established_conns++;
+
+          /* Modify epoll mask for established connection (add EPOLLIN) */
+          struct epoll_event ev_mod;
+          ev_mod.events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLET;
+          ev_mod.data.fd = fd;
+          epoll_ctl(c->epoll_fd, EPOLL_CTL_MOD, fd, &ev_mod);
+        }
+        else if (err != 0)
+        {
+          core_drop_conn(c, cn, "connect failed", err);
+        }
+      }
+    }
+
+    /* Initiate more connects if we have room */
+    for (int i = 0; i < nconns; i++)
+    {
+      if (!c->conns[i].active && c->pending_conns < mpending)
+      {
+        if (core_start_conn(c, &c->conns[i]) != 0)
+        {
+          fprintf(stderr, "core %d: connect setup failed: %s\n",
+              c->id, strerror(errno));
+        }
+      }
     }
   }
 }
@@ -496,9 +519,7 @@ static inline void core_connect_all(struct core *c)
 static inline void core_init(struct core *c)
 {
   c->conns = (struct conn *) calloc((size_t) nconns, sizeof(struct conn));
-  c->pfds = (struct pollfd *) calloc((size_t) nconns, sizeof(struct pollfd));
-  c->pidx = (int *) calloc((size_t) nconns, sizeof(int));
-  if (c->conns == NULL || c->pfds == NULL || c->pidx == NULL)
+  if (c->conns == NULL)
   {
     perror("calloc core state");
     pthread_exit((void *) (intptr_t) -1);
@@ -516,6 +537,13 @@ static inline void core_init(struct core *c)
     }
     memset(c->conns[i].txbuf, 0, msize);
     memset(c->conns[i].rxbuf, 0, msize);
+  }
+
+  c->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+  if (c->epoll_fd < 0)
+  {
+    perror("epoll_create1");
+    pthread_exit((void *) (intptr_t) -1);
   }
 
   c->txb_load_interval = 0;
@@ -641,6 +669,8 @@ static inline void * core_thread(void *arg)
   struct core *c;
   __u64 start_tsc, elapsed, tsc_now;
   double bytes_per_us, delta_cycles, delta_us, max_tokens;
+  struct epoll_event events[nconns];
+  int nev;
 
   c = (struct core *) arg;
   core_init(c);
@@ -668,6 +698,7 @@ static inline void * core_thread(void *arg)
     assert(delta_us >= 0.0);
     c->last_tsc = tsc_now;
 
+    /* Update tokens for all active connections */
     for (int i = 0; i < nconns; i++)
     {
       struct conn *cn = &c->conns[i];
@@ -681,8 +712,72 @@ static inline void * core_thread(void *arg)
         cn->tokens = max_tokens;
     }
 
-    core_tx(c);
-    core_rx(c);
+    /* Non-blocking epoll wait (0ms timeout) */
+    nev = epoll_wait(c->epoll_fd, events, nconns, 0);
+    if (nev < 0)
+    {
+      if (errno != EINTR)
+        perror("epoll_wait");
+      continue;
+    }
+
+    /* Process epoll events (ET mode - drain all available) */
+    for (int i = 0; i < nev; i++)
+    {
+      int fd = events[i].data.fd;
+      uint32_t ev = events[i].events;
+
+      /* Find connection by fd */
+      struct conn *cn = NULL;
+      for (int j = 0; j < nconns; j++)
+      {
+        if (c->conns[j].active && c->conns[j].fd == fd)
+        {
+          cn = &c->conns[j];
+          break;
+        }
+      }
+
+      if (cn == NULL)
+        continue;
+
+      /* Handle errors first */
+      if (ev & (EPOLLERR | EPOLLHUP))
+      {
+        core_drop_conn(c, cn, "epoll error", 0);
+        continue;
+      }
+
+      /* Drain all available data (for ET mode) */
+      if (ev & EPOLLIN)
+      {
+        while (1)
+        {
+          core_rx(c);
+          if (!cn->active)
+            break;
+          /* For ET mode, check if there's more data */
+          int nrx = recv(cn->fd, cn->rxbuf + cn->rx_off, msize - cn->rx_off, MSG_PEEK);
+          if (nrx <= 0)
+            break;
+        }
+      }
+
+      /* Send if we have tokens */
+      if (ev & EPOLLOUT)
+      {
+        while (cn->active && cn->connected && cn->tokens >= (double) msize)
+        {
+          core_tx(c);
+          if (!cn->active || !cn->connected)
+            break;
+        }
+      }
+    }
+
+    /* Try TX even without EPOLLOUT events (for draining tokens) */
+    if (active > 0)
+      core_tx(c);
 
     if (active == 0)
     {
@@ -851,9 +946,9 @@ int main(int argc, char **argv)
         free(cores[i].conns[j].rxbuf);
       }
     }
+    if (cores[i].epoll_fd >= 0)
+      close(cores[i].epoll_fd);
     free(cores[i].conns);
-    free(cores[i].pfds);
-    free(cores[i].pidx);
   }
 
   free(cores);

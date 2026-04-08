@@ -17,6 +17,7 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/epoll.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -36,6 +37,7 @@ struct conn {
 struct core {
   int id;
   int listen_fd;
+  int epoll_fd;
   int nconns;
   struct conn *conns;
   __u64 rxb_interval;
@@ -197,7 +199,10 @@ static inline void core_close_conn(struct core *c, struct conn *cn,
   fflush(stderr);
 
   if (cn->fd >= 0)
+  {
+    epoll_ctl(c->epoll_fd, EPOLL_CTL_DEL, cn->fd, NULL);
     close(cn->fd);
+  }
   if (c->nconns > 0)
     c->nconns--;
   conn_reset(cn);
@@ -245,6 +250,22 @@ static inline int core_accept_conn(struct core *c)
     slot->nrx = 0;
     slot->ntx = 0;
     c->nconns++;
+
+    /* Add to epoll */
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLET;
+    ev.data.fd = fd;
+    if (epoll_ctl(c->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
+    {
+      fprintf(stderr, "core %d: epoll_ctl add failed: %s\n",
+          c->id, strerror(errno));
+      fflush(stderr);
+      close(fd);
+      if (c->nconns > 0)
+        c->nconns--;
+      conn_reset(slot);
+      return -1;
+    }
   }
 
   return 0;
@@ -395,6 +416,24 @@ static inline void core_init(struct core *c)
   }
 
   c->listen_fd = fd;
+
+  /* Create epoll and add listen socket */
+  c->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+  if (c->epoll_fd < 0)
+  {
+    perror("epoll_create1");
+    abort();
+  }
+
+  struct epoll_event ev;
+  ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLET;
+  ev.data.fd = fd;
+  if (epoll_ctl(c->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
+  {
+    perror("epoll_ctl add listen");
+    abort();
+  }
+
   c->nconns = 0;
   c->rxb_interval = 0;
   c->rxp_interval = 0;
@@ -405,6 +444,8 @@ static inline void core_init(struct core *c)
 static inline void * core_thread(void *arg)
 {
   struct core *c = (struct core *) arg;
+  struct epoll_event events[mconns + 1];
+  int nev;
 
   core_init(c);
 
@@ -413,16 +454,96 @@ static inline void * core_thread(void *arg)
 
   while (1)
   {
-    core_accept_conn(c);
+    /* Non-blocking epoll wait (0ms timeout) */
+    nev = epoll_wait(c->epoll_fd, events, mconns + 1, 0);
 
-    for (int i = 0; i < mconns; i++)
+    if (nev < 0)
     {
-      if (!c->conns[i].active)
+      if (errno != EINTR)
+      {
+        perror("epoll_wait");
+        pthread_exit((void *) (intptr_t) -1);
+      }
+      continue;
+    }
+
+    /* Process all events returned by epoll */
+    for (int i = 0; i < nev; i++)
+    {
+      int fd = events[i].data.fd;
+      uint32_t ev = events[i].events;
+
+      /* Accept on listen socket */
+      if (fd == c->listen_fd)
+      {
+        if (ev & EPOLLIN)
+        {
+          while (1)
+          {
+            if (core_accept_conn(c) != 0)
+              break;
+          }
+        }
+        if (ev & (EPOLLERR | EPOLLHUP))
+        {
+          fprintf(stderr, "core %d: listen socket error\n", c->id);
+          fflush(stderr);
+        }
         continue;
-      core_rx_conn(c, &c->conns[i]);
-      if (!c->conns[i].active)
+      }
+
+      /* Find connection by fd */
+      struct conn *cn = NULL;
+      for (int j = 0; j < mconns; j++)
+      {
+        if (c->conns[j].active && c->conns[j].fd == fd)
+        {
+          cn = &c->conns[j];
+          break;
+        }
+      }
+
+      if (cn == NULL)
         continue;
-      core_tx_conn(c, &c->conns[i]);
+
+      /* Handle errors first */
+      if (ev & (EPOLLERR | EPOLLHUP))
+      {
+        core_close_conn(c, cn, "epoll error", 0);
+        continue;
+      }
+
+      /* Drain all available data (for ET mode) */
+      if (ev & EPOLLIN)
+      {
+        while (1)
+        {
+          core_rx_conn(c, cn);
+          if (!cn->active)
+            break;
+          /* For ET mode, try to read again to ensure we got everything */
+          int nrx = recv(cn->fd, cn->buf + cn->nrx, bsize - cn->nrx, MSG_PEEK);
+          if (nrx <= 0)
+            break;
+        }
+      }
+
+      if (ev & EPOLLOUT)
+      {
+        while (cn->active)
+        {
+          core_tx_conn(c, cn);
+          /* For ET mode, check if there's still data to send */
+          if (cn->nrx <= cn->ntx || !cn->active)
+            break;
+        }
+      }
+    }
+
+    /* Try to accept if we have room and got no events */
+    if (nev == 0)
+    {
+      core_accept_conn(c);
     }
   }
 
