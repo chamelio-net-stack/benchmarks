@@ -368,7 +368,6 @@ static inline void conn_accept(struct core *c)
     abort();
   }
   
-  fprintf(stderr, "ACCEPTED CONN\n");
   con->id = c->nconns;
   con->nrx = 0;
   con->ntx = 0;  
