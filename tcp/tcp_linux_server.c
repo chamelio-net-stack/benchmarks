@@ -1,8 +1,8 @@
 /* Usage:
- *   ./udp_linux_server <bind_ip> <port> [--msize N] [--ncores N] [--buf-size N]
+ *   ./tcp_linux_server <bind_ip> <port> [--msize N] [--ncores N] [--buf-size N]
  *
  * Example:
- *   ./udp_linux_server 0.0.0.0 9000 --msize 64 --ncores 2 --buf-size 4096
+ *   ./tcp_linux_server 0.0.0.0 9000 --msize 64 --ncores 2 --buf-size 4096
  * 
  *   --msize Size of expected message
  *   --ncores Number of cores to use
@@ -573,7 +573,7 @@ int main(int argc, char **argv)
   fflush(stdout);
   pthread_barrier_wait(&start_barrier);
 
-  printf("UDP echo server listening on %s:%d (msize=%zu) (bsize=%zu) (ncores=%d)\n", 
+  printf("TCP echo server listening on %s:%d (msize=%zu) (bsize=%zu) (ncores=%d)\n", 
       server_ip, port, msize, bsize, ncores);
   fflush(stdout);
   

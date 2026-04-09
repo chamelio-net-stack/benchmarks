@@ -1,0 +1,1164 @@
+/* Reports per-second throughput (Mbits/s and packets/s) and cumulative
+ * latency percentiles (p50, p99, p99.9) in microseconds.
+ *
+ * Usage:
+ *   ./tcp_linux_client <src_ip> <src_port> <rem_ip> <rem_port>
+ *     [--msize N] [--duration S] [--rate R] [--ncores N]
+ *     [--nconns N] [--mpending N] [--cwait S]
+ *
+ *   --msize Total TCP payload bytes.
+ *   --duration Duration in seconds to run benchmark
+ *   --rate Per-connection send rate in megabits per second
+ *   --ncores Number of cores to use
+ *   --nconns Number of TCP connections per core
+ *   --mpending Max number of pending connects per core
+ *   --cwait Time in seconds to wait before starting traffic
+ */
+
+#define _GNU_SOURCE
+#include <errno.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <arpa/inet.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/epoll.h>
+#include <stdio.h>
+#include <time.h>
+#include <stdbool.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <fcntl.h>
+#include <linux/types.h>
+#include "../utils/clock.h"
+#include "../utils/hist.h"
+
+struct payload_hdr {
+  __u64 tsc;
+}__attribute__((packed));
+
+struct conn {
+  int fd;
+  bool active;
+  bool connected;
+  __u8 *txbuf;
+  __u8 *rxbuf;
+  size_t tx_off;
+  size_t rx_off;
+  double tokens;
+  __u64 token_tsc;
+  __u64 next_tx_tsc;
+  __u64 total_tx_pkts;
+  __u64 total_rx_pkts;
+  int next_free;
+  int heap_idx;
+};
+
+struct core {
+  int id;
+  int epoll_fd;
+  int free_head;
+  int heap_len;
+  struct conn *conns;
+  struct conn **tx_heap;
+  struct sockaddr_in dst_addr;
+  socklen_t dst_len;
+  __u64 txb_load_interval;
+  __u64 txp_load_interval;
+  __u64 txb_tp_interval;
+  __u64 txp_tp_interval;
+  int established_conns;
+  int pending_conns;
+};
+
+size_t msize = 64;
+int duration = 30;
+double rate = 10.0;
+int ncores = 1;
+int nconns = 1;
+int mpending = 0;
+double cwait = 0.0;
+const char *rem_ip;
+int rem_port;
+const char *src_ip;
+int src_port;
+struct sockaddr_in src_addr;
+
+__u64 t_start_ns, t_end_ns;
+__u64 t_last_report_ns, t_next_report_ns;
+__u64 txb_load_interval_total, txp_load_interval_total;
+__u64 txb_tp_interval_total, txp_tp_interval_total;
+
+#define MAX_RTT_US 1000000u
+
+static pthread_barrier_t start_barrier;
+static pthread_t *threads = NULL;
+static struct core *cores = NULL;
+static struct hist_state rtt_hist = { 0 };
+
+static inline int src_ip_is_auto(void)
+{
+  return strcmp(src_ip, "-1") == 0;
+}
+
+static inline int should_bind_source(void)
+{
+  return nconns == 1 && src_port > 0 && !src_ip_is_auto();
+}
+
+static inline int core_src_port(int core_id)
+{
+  return src_port + core_id;
+}
+
+static inline int parse_args(int argc, char **argv)
+{
+  if (argc < 5)
+  {
+    fprintf(stderr,
+        "Usage: %s <src_ip> <src_port> <rem_ip> <rem_port> [--msize N]"
+        " [--duration S] [--rate R] [--ncores N] [--nconns N]"
+        " [--mpending N] [--cwait S]\n",
+        argv[0]);
+    return -1;
+  }
+
+  src_ip = argv[1];
+  src_port = atoi(argv[2]);
+  if (src_port < -1 || src_port > 65535)
+  {
+    fprintf(stderr, "Invalid src_port\n");
+    return -1;
+  }
+
+  rem_ip = argv[3];
+  rem_port = atoi(argv[4]);
+  if (rem_port <= 0 || rem_port > 65535)
+  {
+    fprintf(stderr, "Invalid rem_port\n");
+    return -1;
+  }
+
+  for (int i = 5; i < argc; i++)
+  {
+    if ((strcmp(argv[i], "--msize") == 0 ||
+        strcmp(argv[i], "--size") == 0) &&
+        i + 1 < argc)
+    {
+      msize = (size_t) strtoul(argv[++i], NULL, 10);
+    }
+    else if (strcmp(argv[i], "--duration") == 0 && i + 1 < argc)
+    {
+      duration = atoi(argv[++i]);
+    }
+    else if (strcmp(argv[i], "--rate") == 0 && i + 1 < argc)
+    {
+      rate = strtod(argv[++i], NULL);
+    }
+    else if (strcmp(argv[i], "--ncores") == 0 && i + 1 < argc)
+    {
+      ncores = atoi(argv[++i]);
+    }
+    else if (strcmp(argv[i], "--nconns") == 0 && i + 1 < argc)
+    {
+      nconns = atoi(argv[++i]);
+    }
+    else if (strcmp(argv[i], "--mpending") == 0 && i + 1 < argc)
+    {
+      mpending = atoi(argv[++i]);
+    }
+    else if (strcmp(argv[i], "--cwait") == 0 && i + 1 < argc)
+    {
+      cwait = strtod(argv[++i], NULL);
+    }
+    else
+    {
+      fprintf(stderr, "Unknown arg: %s\n", argv[i]);
+      return -1;
+    }
+  }
+
+  if (duration <= 0)
+  {
+    fprintf(stderr, "duration must be > 0\n");
+    return -1;
+  }
+
+  if (rate <= 0.0)
+  {
+    fprintf(stderr, "rate must be > 0\n");
+    return -1;
+  }
+
+  if (cwait < 0.0)
+  {
+    fprintf(stderr, "cwait must be >= 0\n");
+    return -1;
+  }
+
+  if (msize < sizeof(struct payload_hdr))
+  {
+    fprintf(stderr, "msize must be at least %zu bytes (header size)\n",
+        sizeof(struct payload_hdr));
+    return -1;
+  }
+
+  if (ncores <= 0)
+    ncores = 1;
+  if (nconns <= 0)
+    nconns = 1;
+
+  if (mpending == 0)
+    mpending = nconns;
+  if (mpending <= 0 || mpending > nconns)
+  {
+    fprintf(stderr, "mpending must be in [1, nconns]\n");
+    return -1;
+  }
+
+  if (should_bind_source() && (src_port + ncores - 1 > 65535))
+  {
+    fprintf(stderr, "src_port + ncores - 1 exceeds 65535\n");
+    return -1;
+  }
+
+  return 0;
+}
+
+static inline void print_stats(__u64 now)
+{
+  double interval_s, rps_load, mbps_load, rps_tp, mbps_tp;
+  __u64 p50 = 0, p99 = 0, p999 = 0;
+  __u64 bytes_load = 0, pkts_load = 0, bytes_tp = 0, pkts_tp = 0;
+
+  interval_s = (double) (t_next_report_ns - t_last_report_ns) / 1e9;
+  if (interval_s <= 0.0)
+    interval_s = 1.0;
+
+  for (int i = 0; i < ncores; i++)
+  {
+    bytes_load += __sync_fetch_and_add(&cores[i].txb_load_interval, 0);
+    pkts_load += __sync_fetch_and_add(&cores[i].txp_load_interval, 0);
+    bytes_tp += __sync_fetch_and_add(&cores[i].txb_tp_interval, 0);
+    pkts_tp += __sync_fetch_and_add(&cores[i].txp_tp_interval, 0);
+
+    __sync_fetch_and_and(&cores[i].txb_load_interval, 0);
+    __sync_fetch_and_and(&cores[i].txp_load_interval, 0);
+    __sync_fetch_and_and(&cores[i].txb_tp_interval, 0);
+    __sync_fetch_and_and(&cores[i].txp_tp_interval, 0);
+  }
+
+  txb_load_interval_total = bytes_load;
+  txp_load_interval_total = pkts_load;
+  txb_tp_interval_total = bytes_tp;
+  txp_tp_interval_total = pkts_tp;
+
+  rps_load = (double) txp_load_interval_total / interval_s;
+  mbps_load = ((double) txb_load_interval_total * 8.0 / 1e6) / interval_s;
+  rps_tp = (double) txp_tp_interval_total / interval_s;
+  mbps_tp = ((double) txb_tp_interval_total * 8.0 / 1e6) / interval_s;
+
+  hist_percentiles(&rtt_hist, &p50, &p99, &p999);
+
+  printf("[ %3lus ] load=%lld rps | load=%.2f Mb/s | tp=%lld rps | tp=%.2f Mb/s | ",
+      (unsigned long) ((t_next_report_ns - t_start_ns) / 1000000000ULL),
+      (unsigned long long) rps_load, mbps_load,
+      (unsigned long long) rps_tp, mbps_tp);
+  printf("p50=%llu us  p99=%llu us  p99.9=%llu us\n",
+      (unsigned long long) p50,
+      (unsigned long long) p99,
+      (unsigned long long) p999);
+  fflush(stdout);
+
+  t_last_report_ns = t_next_report_ns;
+  t_next_report_ns += 1000000000ULL;
+
+  if (now > t_next_report_ns + 5000000000ULL)
+  {
+    t_next_report_ns = now + 1000000000ULL;
+    t_last_report_ns = now;
+  }
+}
+
+static void set_nonblock(int fd)
+{
+  int fl = fcntl(fd, F_GETFL, 0);
+  if (fl < 0)
+  {
+    perror("fcntl(F_GETFL)");
+    exit(EXIT_FAILURE);
+  }
+
+  if (fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0)
+  {
+    perror("fcntl(F_SETFL O_NONBLOCK)");
+    exit(EXIT_FAILURE);
+  }
+}
+
+static inline void conn_reset(struct conn *cn)
+{
+  cn->fd = -1;
+  cn->active = false;
+  cn->connected = false;
+  cn->tx_off = 0;
+  cn->rx_off = 0;
+  cn->tokens = 0.0;
+  cn->token_tsc = 0;
+  cn->next_tx_tsc = 0;
+  cn->next_free = -1;
+  cn->heap_idx = -1;
+}
+
+static inline void core_push_free_conn(struct core *c, struct conn *cn)
+{
+  cn->next_free = c->free_head;
+  c->free_head = (int) (cn - c->conns);
+}
+
+static inline struct conn *core_pop_free_conn(struct core *c)
+{
+  int idx;
+  struct conn *cn;
+
+  if (c->free_head < 0)
+    return NULL;
+
+  idx = c->free_head;
+  cn = &c->conns[idx];
+  c->free_head = cn->next_free;
+  cn->next_free = -1;
+  return cn;
+}
+
+static inline void core_heap_swap(struct core *c, int a, int b)
+{
+  struct conn *tmp = c->tx_heap[a];
+
+  c->tx_heap[a] = c->tx_heap[b];
+  c->tx_heap[b] = tmp;
+  c->tx_heap[a]->heap_idx = a;
+  c->tx_heap[b]->heap_idx = b;
+}
+
+static inline void core_heap_sift_up(struct core *c, int idx)
+{
+  while (idx > 0)
+  {
+    int parent = (idx - 1) / 2;
+
+    if (c->tx_heap[parent]->next_tx_tsc <= c->tx_heap[idx]->next_tx_tsc)
+      break;
+
+    core_heap_swap(c, parent, idx);
+    idx = parent;
+  }
+}
+
+static inline void core_heap_sift_down(struct core *c, int idx)
+{
+  while (1)
+  {
+    int left = idx * 2 + 1;
+    int right = left + 1;
+    int smallest = idx;
+
+    if (left < c->heap_len &&
+        c->tx_heap[left]->next_tx_tsc < c->tx_heap[smallest]->next_tx_tsc)
+    {
+      smallest = left;
+    }
+
+    if (right < c->heap_len &&
+        c->tx_heap[right]->next_tx_tsc < c->tx_heap[smallest]->next_tx_tsc)
+    {
+      smallest = right;
+    }
+
+    if (smallest == idx)
+      return;
+
+    core_heap_swap(c, idx, smallest);
+    idx = smallest;
+  }
+}
+
+static inline void core_heap_insert(struct core *c, struct conn *cn)
+{
+  if (cn->heap_idx >= 0)
+  {
+    core_heap_sift_up(c, cn->heap_idx);
+    core_heap_sift_down(c, cn->heap_idx);
+    return;
+  }
+
+  c->tx_heap[c->heap_len] = cn;
+  cn->heap_idx = c->heap_len;
+  c->heap_len++;
+  core_heap_sift_up(c, cn->heap_idx);
+}
+
+static inline void core_heap_remove(struct core *c, struct conn *cn)
+{
+  int idx;
+  int last;
+
+  if (cn->heap_idx < 0)
+    return;
+
+  idx = cn->heap_idx;
+  last = c->heap_len - 1;
+  c->heap_len--;
+  cn->heap_idx = -1;
+
+  if (idx == last)
+    return;
+
+  c->tx_heap[idx] = c->tx_heap[last];
+  c->tx_heap[idx]->heap_idx = idx;
+  core_heap_sift_up(c, idx);
+  core_heap_sift_down(c, idx);
+}
+
+static inline struct conn *core_heap_peek(struct core *c)
+{
+  if (c->heap_len == 0)
+    return NULL;
+
+  return c->tx_heap[0];
+}
+
+static inline void conn_refresh_tokens(struct conn *cn, __u64 now_tsc,
+    double bytes_per_us, double max_tokens)
+{
+  double delta_us;
+
+  if (!cn->active || !cn->connected)
+    return;
+
+  if (cn->token_tsc == 0)
+  {
+    cn->token_tsc = now_tsc;
+    return;
+  }
+
+  if (now_tsc <= cn->token_tsc)
+    return;
+
+  delta_us = (double) (now_tsc - cn->token_tsc) / clock_tsc_per_us();
+  if (delta_us <= 0.0)
+    return;
+
+  cn->tokens += delta_us * bytes_per_us;
+  if (cn->tokens > max_tokens)
+    cn->tokens = max_tokens;
+  cn->token_tsc = now_tsc;
+}
+
+static inline __u64 conn_compute_next_tsc(struct conn *cn, __u64 now_tsc,
+    double bytes_per_us)
+{
+  double missing_bytes;
+  double wait_us;
+  double wait_cycles;
+
+  if (cn->tokens >= (double) msize || bytes_per_us <= 0.0)
+    return now_tsc;
+
+  missing_bytes = (double) msize - cn->tokens;
+  wait_us = missing_bytes / bytes_per_us;
+  wait_cycles = wait_us * clock_tsc_per_us();
+  if (wait_cycles < 1.0)
+    wait_cycles = 1.0;
+
+  return now_tsc + (__u64) wait_cycles;
+}
+
+static inline __u64 conn_retry_next_tsc(__u64 now_tsc)
+{
+  double retry_cycles = 50.0 * clock_tsc_per_us();
+
+  if (retry_cycles < 1.0)
+    retry_cycles = 1.0;
+
+  return now_tsc + (__u64) retry_cycles;
+}
+
+static inline int core_update_conn_events(struct core *c, struct conn *cn)
+{
+  struct epoll_event ev;
+  uint32_t events = EPOLLERR | EPOLLHUP | EPOLLRDHUP;
+
+  if (!cn->active || cn->fd < 0)
+    return 0;
+
+  if (cn->connected)
+    events |= EPOLLIN;
+  else
+    events |= EPOLLOUT;
+
+  ev.events = events;
+  ev.data.ptr = cn;
+  return epoll_ctl(c->epoll_fd, EPOLL_CTL_MOD, cn->fd, &ev);
+}
+
+static inline void core_drop_conn(struct core *c, struct conn *cn,
+    const char *op, int err)
+{
+  core_heap_remove(c, cn);
+
+  if (cn->fd >= 0)
+  {
+    epoll_ctl(c->epoll_fd, EPOLL_CTL_DEL, cn->fd, NULL);
+    close(cn->fd);
+  }
+
+  if (cn->active)
+  {
+    if (cn->connected)
+    {
+      if (c->established_conns > 0)
+        c->established_conns--;
+    }
+    else if (c->pending_conns > 0)
+    {
+      c->pending_conns--;
+    }
+  }
+
+  fprintf(stderr, "core %d fd=%d: %s: %s\n",
+      c->id, cn->fd, op,
+      err == 0 ? "connection closed" : strerror(err));
+  fflush(stderr);
+
+  conn_reset(cn);
+  core_push_free_conn(c, cn);
+}
+
+static inline int core_start_conn(struct core *c, struct conn *cn)
+{
+  int fd, ret, err;
+  struct epoll_event ev;
+
+  fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0)
+  {
+    perror("socket");
+    return -1;
+  }
+  set_nonblock(fd);
+
+  if (should_bind_source())
+  {
+    struct sockaddr_in bind_addr = src_addr;
+
+    bind_addr.sin_port = htons((__u16) core_src_port(c->id));
+    ret = bind(fd, (struct sockaddr *) &bind_addr, sizeof(bind_addr));
+    if (ret < 0)
+    {
+      err = errno;
+      close(fd);
+      errno = err;
+      return -1;
+    }
+  }
+
+  cn->fd = fd;
+  cn->active = true;
+  cn->connected = false;
+  cn->tx_off = 0;
+  cn->rx_off = 0;
+  cn->tokens = 0.0;
+  cn->token_tsc = 0;
+  cn->next_tx_tsc = 0;
+
+  ev.data.ptr = cn;
+  ret = connect(fd, (struct sockaddr *) &c->dst_addr, c->dst_len);
+  if (ret == 0)
+  {
+    cn->connected = true;
+    c->established_conns++;
+    ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
+    if (epoll_ctl(c->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
+    {
+      err = errno;
+      close(fd);
+      conn_reset(cn);
+      errno = err;
+      return -1;
+    }
+    return 0;
+  }
+
+  if (errno == EINPROGRESS)
+  {
+    c->pending_conns++;
+    ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
+    if (epoll_ctl(c->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
+    {
+      err = errno;
+      close(fd);
+      conn_reset(cn);
+      errno = err;
+      return -1;
+    }
+    return 0;
+  }
+
+  err = errno;
+  close(fd);
+  conn_reset(cn);
+  errno = err;
+  return -1;
+}
+
+static inline void core_fill_connects(struct core *c)
+{
+  while (c->established_conns + c->pending_conns < nconns &&
+      c->pending_conns < mpending)
+  {
+    struct conn *cn = core_pop_free_conn(c);
+
+    if (cn == NULL)
+      return;
+
+    if (core_start_conn(c, cn) != 0)
+    {
+      fprintf(stderr, "core %d: connect setup failed: %s\n",
+          c->id, strerror(errno));
+      fflush(stderr);
+      conn_reset(cn);
+      core_push_free_conn(c, cn);
+      return;
+    }
+  }
+}
+
+static inline void core_connect_all(struct core *c)
+{
+  struct epoll_event events[nconns];
+  int nev;
+
+  core_fill_connects(c);
+
+  while (c->established_conns < nconns)
+  {
+    nev = epoll_wait(c->epoll_fd, events, nconns, 1);
+    if (nev < 0)
+    {
+      if (errno == EINTR)
+        continue;
+      perror("epoll_wait");
+      pthread_exit((void *) (intptr_t) -1);
+    }
+
+    for (int i = 0; i < nev; i++)
+    {
+      uint32_t ev = events[i].events;
+      struct conn *cn = (struct conn *) events[i].data.ptr;
+      int err = 0;
+      socklen_t len = sizeof(err);
+
+      if (cn == NULL || !cn->active || cn->connected)
+        continue;
+
+      if (ev & (EPOLLERR | EPOLLHUP))
+      {
+        getsockopt(cn->fd, SOL_SOCKET, SO_ERROR, &err, &len);
+        core_drop_conn(c, cn, "connect failed", err);
+        core_fill_connects(c);
+        continue;
+      }
+
+      if (!(ev & EPOLLOUT))
+        continue;
+
+      if (getsockopt(cn->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0)
+        err = errno;
+
+      if (err == 0)
+      {
+        cn->connected = true;
+        if (c->pending_conns > 0)
+          c->pending_conns--;
+        c->established_conns++;
+        if (core_update_conn_events(c, cn) < 0)
+          core_drop_conn(c, cn, "epoll_ctl mod failed", errno);
+      }
+      else
+      {
+        core_drop_conn(c, cn, "connect failed", err);
+      }
+
+      core_fill_connects(c);
+    }
+  }
+}
+
+static inline void core_init(struct core *c)
+{
+  c->conns = (struct conn *) calloc((size_t) nconns, sizeof(struct conn));
+  if (c->conns == NULL)
+  {
+    perror("calloc core state");
+    pthread_exit((void *) (intptr_t) -1);
+  }
+
+  for (int i = 0; i < nconns; i++)
+  {
+    conn_reset(&c->conns[i]);
+    c->conns[i].txbuf = (__u8 *) malloc(msize);
+    c->conns[i].rxbuf = (__u8 *) malloc(msize);
+    if (c->conns[i].txbuf == NULL || c->conns[i].rxbuf == NULL)
+    {
+      perror("malloc buffers");
+      pthread_exit((void *) (intptr_t) -1);
+    }
+    memset(c->conns[i].txbuf, 0, msize);
+    memset(c->conns[i].rxbuf, 0, msize);
+  }
+
+  c->free_head = -1;
+  for (int i = nconns - 1; i >= 0; i--)
+    core_push_free_conn(c, &c->conns[i]);
+
+  c->tx_heap = (struct conn **) calloc((size_t) nconns, sizeof(struct conn *));
+  if (c->tx_heap == NULL)
+  {
+    perror("calloc tx heap");
+    pthread_exit((void *) (intptr_t) -1);
+  }
+
+  c->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+  if (c->epoll_fd < 0)
+  {
+    perror("epoll_create1");
+    pthread_exit((void *) (intptr_t) -1);
+  }
+
+  c->heap_len = 0;
+  c->txb_load_interval = 0;
+  c->txp_load_interval = 0;
+  c->txb_tp_interval = 0;
+  c->txp_tp_interval = 0;
+  c->established_conns = 0;
+  c->pending_conns = 0;
+}
+
+static inline void core_schedule_conn(struct core *c, struct conn *cn,
+    __u64 now_tsc, double bytes_per_us, double max_tokens, int blocked)
+{
+  if (!cn->active || !cn->connected)
+    return;
+
+  conn_refresh_tokens(cn, now_tsc, bytes_per_us, max_tokens);
+  core_heap_remove(c, cn);
+
+  if (blocked || cn->tx_off > 0)
+  {
+    cn->next_tx_tsc = conn_retry_next_tsc(now_tsc);
+  }
+  else if (cn->tokens >= (double) msize)
+  {
+    cn->next_tx_tsc = now_tsc;
+  }
+  else
+  {
+    cn->next_tx_tsc = conn_compute_next_tsc(cn, now_tsc, bytes_per_us);
+  }
+
+  core_heap_insert(c, cn);
+  if (core_update_conn_events(c, cn) < 0)
+    core_drop_conn(c, cn, "epoll_ctl mod failed", errno);
+}
+
+static inline void core_tx_conn(struct core *c, struct conn *cn, __u64 now_tsc,
+    double bytes_per_us, double max_tokens)
+{
+  int ntx;
+  int blocked = 0;
+
+  if (!cn->active || !cn->connected)
+    return;
+
+  conn_refresh_tokens(cn, now_tsc, bytes_per_us, max_tokens);
+
+  while (cn->tx_off > 0 || cn->tokens >= (double) msize)
+  {
+    struct payload_hdr *ph;
+
+    if (!cn->active || !cn->connected)
+      return;
+
+    if (cn->tx_off == 0)
+    {
+      ph = (struct payload_hdr *) cn->txbuf;
+      ph->tsc = util_rdtsc();
+    }
+
+    ntx = send(cn->fd, cn->txbuf + cn->tx_off, msize - cn->tx_off, 0);
+    if (ntx < 0)
+    {
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+      {
+        blocked = 1;
+        break;
+      }
+
+      core_drop_conn(c, cn, "send failed", errno);
+      return;
+    }
+
+    if (ntx == 0)
+    {
+      core_drop_conn(c, cn, "send failed", 0);
+      return;
+    }
+
+    cn->tx_off += (size_t) ntx;
+    if (cn->tx_off < msize)
+      break;
+
+    cn->tx_off = 0;
+    cn->tokens -= (double) msize;
+    cn->total_tx_pkts++;
+    __sync_fetch_and_add(&c->txb_load_interval, msize);
+    __sync_fetch_and_add(&c->txp_load_interval, 1);
+  }
+
+  if (!cn->active || !cn->connected)
+    return;
+
+  core_schedule_conn(c, cn, util_rdtsc(), bytes_per_us, max_tokens, blocked);
+}
+
+static inline void core_rx_conn(struct core *c, struct conn *cn)
+{
+  int nrx;
+
+  if (!cn->active || !cn->connected)
+    return;
+
+  while (1)
+  {
+    struct payload_hdr *ph;
+    __u64 rtt_us;
+
+    nrx = recv(cn->fd, cn->rxbuf + cn->rx_off, msize - cn->rx_off, 0);
+    if (nrx < 0)
+    {
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+        break;
+
+      core_drop_conn(c, cn, "recv failed", errno);
+      break;
+    }
+
+    if (nrx == 0)
+    {
+      core_drop_conn(c, cn, "recv failed", 0);
+      break;
+    }
+
+    cn->rx_off += (size_t) nrx;
+    if (cn->rx_off < msize)
+      continue;
+
+    ph = (struct payload_hdr *) cn->rxbuf;
+    rtt_us = us_since_tsc(ph->tsc);
+    cn->rx_off = 0;
+    cn->total_rx_pkts++;
+    __sync_fetch_and_add(&c->txb_tp_interval, msize);
+    __sync_fetch_and_add(&c->txp_tp_interval, 1);
+    hist_add(&rtt_hist, rtt_us);
+  }
+}
+
+static inline void core_run_due(struct core *c, __u64 now_tsc,
+    double bytes_per_us, double max_tokens)
+{
+  while (1)
+  {
+    struct conn *cn = core_heap_peek(c);
+
+    if (cn == NULL || cn->next_tx_tsc > now_tsc)
+      return;
+
+    core_heap_remove(c, cn);
+    core_tx_conn(c, cn, now_tsc, bytes_per_us, max_tokens);
+  }
+}
+
+static inline int core_next_timeout_ms(struct core *c, __u64 now_tsc)
+{
+  struct conn *cn = core_heap_peek(c);
+  double delta_us;
+
+  if (cn == NULL)
+    return 1000;
+
+  if (cn->next_tx_tsc <= now_tsc)
+    return 0;
+
+  delta_us = (double) (cn->next_tx_tsc - now_tsc) / clock_tsc_per_us();
+  if (delta_us < 1000.0)
+    return 0;
+
+  return (int) ((delta_us + 999.0) / 1000.0);
+}
+
+static inline void wait_for_start(void)
+{
+  while (now_ns() < t_start_ns)
+  {
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };
+    nanosleep(&ts, NULL);
+  }
+}
+
+static inline void * core_thread(void *arg)
+{
+  struct core *c;
+  __u64 start_tsc, elapsed;
+  double bytes_per_us, max_tokens;
+  struct epoll_event events[nconns];
+  int nev;
+
+  c = (struct core *) arg;
+  core_init(c);
+  core_connect_all(c);
+
+  pthread_barrier_wait(&start_barrier);
+  wait_for_start();
+
+  start_tsc = util_rdtsc();
+  bytes_per_us = rate / 8.0;
+  max_tokens = bytes_per_us * 1000.0;
+
+  for (int i = 0; i < nconns; i++)
+  {
+    struct conn *cn = &c->conns[i];
+
+    if (!cn->active || !cn->connected)
+      continue;
+
+    cn->tokens = 0.0;
+    cn->token_tsc = start_tsc;
+    core_schedule_conn(c, cn, start_tsc, bytes_per_us, max_tokens, 0);
+  }
+
+  while (1)
+  {
+    __u64 now_tsc = util_rdtsc();
+    int timeout_ms;
+
+    elapsed = us_since_tsc(start_tsc);
+    if (elapsed >= (__u64) duration * 1000000ULL)
+      break;
+
+    core_run_due(c, now_tsc, bytes_per_us, max_tokens);
+
+    timeout_ms = core_next_timeout_ms(c, util_rdtsc());
+    nev = epoll_wait(c->epoll_fd, events, nconns, timeout_ms);
+    if (nev < 0)
+    {
+      if (errno != EINTR)
+        perror("epoll_wait");
+      continue;
+    }
+
+    for (int i = 0; i < nev; i++)
+    {
+      uint32_t ev = events[i].events;
+      struct conn *cn = (struct conn *) events[i].data.ptr;
+      int err = 0;
+      socklen_t len = sizeof(err);
+
+      if (cn == NULL || !cn->active)
+        continue;
+
+      if (ev & (EPOLLERR | EPOLLHUP))
+      {
+        if (getsockopt(cn->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0)
+          err = errno;
+        core_drop_conn(c, cn, "epoll error", err);
+        continue;
+      }
+
+      if (ev & EPOLLIN)
+        core_rx_conn(c, cn);
+    }
+  }
+
+  pthread_exit((void *) (intptr_t) 0);
+}
+
+static inline void prepare_cores(void)
+{
+  for (int i = 0; i < ncores; i++)
+  {
+    memset(&cores[i], 0, sizeof(struct core));
+    cores[i].id = i;
+    cores[i].epoll_fd = -1;
+    memset(&cores[i].dst_addr, 0, sizeof(cores[i].dst_addr));
+    cores[i].dst_addr.sin_family = AF_INET;
+    cores[i].dst_addr.sin_port = htons((__u16) rem_port);
+    if (inet_pton(AF_INET, rem_ip, &cores[i].dst_addr.sin_addr) != 1)
+    {
+      fprintf(stderr, "Invalid rem_ip\n");
+      abort();
+    }
+    cores[i].dst_len = sizeof(cores[i].dst_addr);
+  }
+}
+
+static inline void start_cores(void)
+{
+  for (int i = 0; i < ncores; i++)
+  {
+    int rc = pthread_create(&threads[i], NULL, core_thread, &cores[i]);
+    if (rc != 0)
+    {
+      errno = rc;
+      perror("pthread_create");
+      exit(EXIT_FAILURE);
+    }
+  }
+}
+
+static inline void init_client(void)
+{
+  memset(&src_addr, 0, sizeof(src_addr));
+  src_addr.sin_family = AF_INET;
+  src_addr.sin_port = htons((__u16) src_port);
+  if (should_bind_source())
+  {
+    if (inet_pton(AF_INET, src_ip, &src_addr.sin_addr) != 1)
+    {
+      fprintf(stderr, "invalid source bind_ip\n");
+      abort();
+    }
+  }
+
+  calibrate_tsc();
+
+  cores = (struct core *) calloc((size_t) ncores, sizeof(struct core));
+  threads = (pthread_t *) calloc((size_t) ncores, sizeof(pthread_t));
+  if (!cores || !threads)
+  {
+    perror("calloc cores/threads");
+    exit(EXIT_FAILURE);
+  }
+
+  if (pthread_barrier_init(&start_barrier, NULL,
+      (unsigned) ncores + 1) != 0)
+  {
+    perror("pthread_barrier_init");
+    exit(EXIT_FAILURE);
+  }
+}
+
+int main(int argc, char **argv)
+{
+  __u64 now;
+  __u64 p50 = 0, p99 = 0, p999 = 0;
+  __u64 totalp_tx = 0, totalp_rx = 0;
+
+  if (parse_args(argc, argv) != 0)
+  {
+    fprintf(stderr, "failed to parse args\n");
+    return EXIT_FAILURE;
+  }
+
+  if (init_hist(&rtt_hist, MAX_RTT_US) != 0)
+  {
+    fprintf(stderr, "failed to init hist\n");
+    return EXIT_FAILURE;
+  }
+
+  init_client();
+  prepare_cores();
+  start_cores();
+
+  printf("Initialized %d core(s), %d connection(s)/core. Waiting for barrier\n",
+      ncores, nconns);
+  fflush(stdout);
+
+  t_start_ns = now_ns() + (__u64) (cwait * 1000000000.0);
+  t_last_report_ns = t_start_ns;
+  t_next_report_ns = t_start_ns + 1000000000ULL;
+  t_end_ns = t_start_ns + (__u64) duration * 1000000000ULL;
+
+  pthread_barrier_wait(&start_barrier);
+  wait_for_start();
+
+  while (1)
+  {
+    now = now_ns();
+    if (now >= t_end_ns)
+      break;
+
+    if (now >= t_next_report_ns)
+      print_stats(now);
+
+    {
+      struct timespec ts = { .tv_sec = 0, .tv_nsec = 2000000 };
+      nanosleep(&ts, NULL);
+    }
+  }
+
+  for (int i = 0; i < ncores; i++)
+    pthread_join(threads[i], NULL);
+
+  print_stats(now_ns());
+  hist_percentiles(&rtt_hist, &p50, &p99, &p999);
+
+  for (int i = 0; i < ncores; i++)
+  {
+    for (int j = 0; j < nconns; j++)
+    {
+      totalp_tx += cores[i].conns[j].total_tx_pkts;
+      totalp_rx += cores[i].conns[j].total_rx_pkts;
+    }
+  }
+
+  printf("Cores               : %d\n", ncores);
+  printf("Connections/core    : %d\n", nconns);
+  printf("Pending/core        : %d\n", mpending);
+  printf("Wait before start   : %.3f s\n", cwait);
+  printf("TX packets          : %llu\n", (unsigned long long) totalp_tx);
+  printf("RX packets          : %llu\n", (unsigned long long) totalp_rx);
+  printf("Avg Load            : %lld rps %.2f Mb/s\n",
+      (unsigned long long) (totalp_tx / (__u64) duration),
+      ((double) totalp_tx * msize * 8.0 / 1000000.0) / duration);
+  printf("Avg Throughput      : %lld rps %.2f Mb/s\n",
+      (unsigned long long) (totalp_rx / (__u64) duration),
+      ((double) totalp_rx * msize * 8.0 / 1000000.0) / duration);
+  printf("RTT percentiles (us): p50=%llu  p99=%llu  p99.9=%llu\n",
+      (unsigned long long) p50,
+      (unsigned long long) p99,
+      (unsigned long long) p999);
+
+  for (int i = 0; i < ncores; i++)
+  {
+    if (cores[i].conns != NULL)
+    {
+      for (int j = 0; j < nconns; j++)
+      {
+        if (cores[i].conns[j].fd >= 0)
+          close(cores[i].conns[j].fd);
+        free(cores[i].conns[j].txbuf);
+        free(cores[i].conns[j].rxbuf);
+      }
+    }
+    if (cores[i].epoll_fd >= 0)
+      close(cores[i].epoll_fd);
+    free(cores[i].tx_heap);
+    free(cores[i].conns);
+  }
+
+  free(cores);
+  free(threads);
+  hist_cleanup(&rtt_hist);
+  return 0;
+}

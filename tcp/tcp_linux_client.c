@@ -2,10 +2,10 @@
  * latency percentiles (p50, p99, p99.9) in microseconds.
  *
  * Usage:
- *   ./udp_linux_client <src_ip> <src_port> <rem_ip> <rem_port>
+ *   ./tcp_linux_client <src_ip> <src_port> <rem_ip> <rem_port>
  *     [--msize N] [--duration S] [--rate R] [--ncores N]
  *
- *   --msize Total UDP payload bytes.
+ *   --msize Total TCP payload bytes.
  *   --duration Duration in seconds to run benchmark
  *   --rate Per-core send rate in megabits per second
  *   --ncores Number of cores to use
@@ -37,6 +37,7 @@ struct payload_hdr {
 struct conn {
   int id;
   int fd;
+  int ready;
   __u8 connected;
   int tx_remain;
   __u8 *txbuf;
@@ -44,6 +45,7 @@ struct conn {
   __u8 *rxbuf;
   double tokens;
   __u64 last_tsc;
+  int next;
 };
 
 /* Per-core context */
@@ -61,6 +63,10 @@ struct core {
   __u64 total_tx_pkts;
   __u64 total_rx_pkts;
   struct conn *conns;
+  int nready;
+  int ready_head;
+  int ready_tail;
+  int *ready_conns;
   int nconnected;
   int npending;
 };
@@ -249,6 +255,29 @@ static void set_nonblock(int fd)
   }
 }
 
+static void conn_rearm(struct core *c, struct conn *con)
+{
+  struct conn *tail_con;
+  
+  /* Connection is already in ready */
+  if (con->ready)
+    return;
+  
+  con->next = -1;
+  if (c->nready == 0)
+  {
+    c->ready_head = con->id;
+  }
+  else
+  {
+    tail_con = &c->conns[c->ready_tail];
+    tail_con->next = con->id;
+  }
+  con->ready = 1;
+  c->ready_tail = con->id;
+  c->nready++;
+}
+
 static inline void core_init(struct core *c)
 {
   int fd, i, nevs;
@@ -262,6 +291,16 @@ static inline void core_init(struct core *c)
     abort();
   }
   c->conns = conns;
+  
+  c->ready_conns = malloc(sizeof(int) * nconns);
+  if (c->ready_conns == NULL)
+  {
+    fprintf(stderr, "error allocating ready conns array");
+    abort();
+  }
+  c->nready = 0;
+  c->ready_head = -1;
+  c->ready_tail = -1;
   
   nevs = nconns * 4;
   evs = calloc(nevs, sizeof(struct epoll_event));
@@ -296,11 +335,14 @@ static inline void core_init(struct core *c)
     memset(con->rxbuf, 0, msize);
     
     con->fd = fd;
+    con->ready = 0;
     con->tokens  = 0.0;
     con->connected = 0;
     con->tx_remain = msize;
     con->rx_remain = msize;
+    con->next = -1;
     con->last_tsc = util_rdtsc();
+    conn_rearm(c, con);
   }
   
   if ((c->ep = epoll_create(2 * nconns)) < 0)
@@ -337,23 +379,28 @@ static inline void conn_refill(struct conn *con, __u64 tsc_now)
     con->last_tsc = tsc_now;
 }
 
-static inline void conn_tx(struct core *c, struct conn *con)
+static inline int conn_tx(struct core *c, struct conn *con)
 {
   int ntx, pos;
   struct payload_hdr *ph;
   
-  while (con->tokens >= (double) msize)
+  while (con->tokens >= con->tx_remain)
   {
     assert(con->tx_remain != 0);
-    ph = (struct payload_hdr *) con->txbuf;
-    ph->tsc = util_rdtsc();
+    
+    if (con->tx_remain == msize) 
+    {
+      ph = (struct payload_hdr *) con->txbuf;
+      ph->tsc = util_rdtsc();
+    }
+    
     pos = msize - con->tx_remain;
     ntx = sendto(con->fd, con->txbuf + pos, con->tx_remain, 0,
       (struct sockaddr *) &c->dst_addr, c->dst_len);
     assert(ntx <= 0 || (ntx <= con->tx_remain && ntx <= msize));
-                  
+    
     if (ntx <= 0)
-      break;
+      return -1;
       
     con->tx_remain -= ntx;
     con->tokens -= ntx;
@@ -365,20 +412,52 @@ static inline void conn_tx(struct core *c, struct conn *con)
       __sync_fetch_and_add(&c->txp_load_interval, 1);
     }
   }
+  
+  return 0;
 }
 
 static inline void core_tx(struct core *c)
 {
-  int i;
+  int i, cid, nready, ret, next;
   __u64 tsc_now;
   struct conn *con;
+  struct epoll_event ev;
   
-  tsc_now = util_rdtsc();
-  for (i = 0; i < nconns; i++)
+  nready = c->nready;
+  for (i = 0; i < nready && c->ready_head != -1; i++)
   {
-    con = &c->conns[i];
+    cid = c->ready_head;
+    con = &c->conns[cid];
+    next = con->next;
+  
+    /* Remove connection from ready */
+    con->next = -1;
+    con->ready = 0;
+    c->nready--;
+    c->ready_head = next;
+    if (next == -1)
+      c->ready_tail = -1;
+      
+    tsc_now = util_rdtsc();
     conn_refill(con, tsc_now);
-    conn_tx(c, con);
+    ret = conn_tx(c, con);
+    
+    if (ret == 0)
+    {
+      conn_rearm(c, con);
+    }
+    else if (ret < 0)
+    {
+      /* Add to epoll */
+      ev.data.ptr = con;
+      ev.events = EPOLLOUT | EPOLLIN | EPOLLERR | EPOLLHUP;
+      ret = epoll_ctl(c->ep, EPOLL_CTL_MOD, con->fd, &ev);
+      if (ret < 0)
+      {
+        perror("failed to modify conn event to trigger EPOLLOUT");
+        abort();
+      }
+    }
   }
 }
 
@@ -415,6 +494,7 @@ static inline void conn_rx(struct core *c, struct conn *con)
 static inline void core_rx(struct core *c)
 {
   int i, ret;
+  __u32 events;
   struct conn *con;
   struct epoll_event *ev;
 
@@ -428,20 +508,34 @@ static inline void core_rx(struct core *c)
   for (i = 0; i < ret; i++)
   {
     ev = &c->rx_evs[i];
+    events = ev->events;
     con = ev->data.ptr;
-    if ((ev->events & EPOLLERR) != 0)
+    if (events & EPOLLERR)
     {
       fprintf(stderr, "connection event triggered error\n");
       abort();
     }
-    else if ((ev->events & EPOLLIN) == EPOLLIN)
+    else 
     {
-      conn_rx(c, con);
-    }
-    else
-    {
-      fprintf(stderr, "unknown event bye\n");
-      abort();
+      /* Add connection to ready queue */
+      if (events & EPOLLOUT)
+      {
+        conn_rearm(c, con);
+        
+        /* Disable EPOLLOUT events */
+        ev->data.ptr = con;
+        ev->events = EPOLLIN | EPOLLERR | EPOLLHUP;
+        ret = epoll_ctl(c->ep, EPOLL_CTL_MOD, con->fd, ev);
+        if (ret < 0)
+        {
+          perror("failed to disable EPOLLOUT");
+          abort();
+        }
+      }
+     
+      /* Process received bytes */
+      if (events & EPOLLIN)
+        conn_rx(c, con);
     }
   }
 }
