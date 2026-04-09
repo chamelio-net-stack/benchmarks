@@ -1,14 +1,12 @@
 /* Usage:
- *   ./tcp_linux_server <bind_ip> <port>
- *     [--msize N] [--ncores N] [--mconns N] [--buf-size N]
+ *   ./udp_linux_server <bind_ip> <port> [--msize N] [--ncores N] [--buf-size N]
  *
  * Example:
- *   ./tcp_linux_server 0.0.0.0 9000 --msize 64 --ncores 2 --mconns 32 --buf-size 4096
- *
+ *   ./udp_linux_server 0.0.0.0 9000 --msize 64 --ncores 2 --buf-size 4096
+ * 
  *   --msize Size of expected message
  *   --ncores Number of cores to use
- *   --mconns Max number of accepted connections per core
- *   --buf-size Per-connection buffer size
+ *   --buf-size Size of transmit buffer
  */
 
 #define _GNU_SOURCE
@@ -18,6 +16,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
+#include <netinet/tcp.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -26,44 +25,36 @@
 #include <linux/types.h>
 #include "../utils/clock.h"
 
-enum epoll_item_type {
-  EPOLL_ITEM_LISTEN,
-  EPOLL_ITEM_CONN,
-};
-
-struct epoll_item {
-  enum epoll_item_type type;
-  void *ptr;
-};
-
 struct conn {
+  int id;
   int fd;
-  int active;
-  size_t nrx;
-  size_t ntx;
-  __u64 next_tx_tsc;
-  int heap_idx;
+  int tx_remain;
+  int rx_remain;
+  int nrx;
+  int ntx;
   __u8 *buf;
-  int next_free;
-  struct epoll_item ev_item;
 };
 
 struct core {
   int id;
   int listen_fd;
-  int epoll_fd;
+  int ep_fd;
+  struct epoll_event *evs;
   int nconns;
-  int free_head;
-  int tx_heap_len;
   struct conn *conns;
-  struct conn **tx_heap;
   __u64 rxb_interval;
   __u64 rxp_interval;
   __u64 txb_interval;
   __u64 txp_interval;
-  struct epoll_item listen_item;
+  struct sockaddr_in dst_addr;
+  socklen_t dst_len;
 };
 
+/* Constants */
+__u32 listen_backlog = 512;
+__u32 max_events = 128;
+
+/* Default arg values */
 size_t msize = 64;
 size_t bsize = 4096;
 int ncores = 1;
@@ -81,18 +72,14 @@ static pthread_t *threads = NULL;
 static struct core *cores = NULL;
 struct sockaddr_in src_addr;
 
-static inline void core_rx_conn(struct core *c, struct conn *cn);
-static inline void core_tx_conn(struct core *c, struct conn *cn);
-static inline void core_update_events(struct core *c, struct conn *cn);
-static inline void core_push_free_conn(struct core *c, struct conn *cn);
-static inline struct conn *core_pop_free_conn(struct core *c);
-
 static inline int parse_args(int argc, char **argv)
 {
+  int i;
+
   if (argc < 3)
   {
-    fprintf(stderr, "Usage: %s <bind_ip> <port>"
-        " [--msize N] [--ncores N] [--mconns N] [--buf-size N]\n", argv[0]);
+    fprintf(stderr, "Usage: %s <bind_ip> <port>" 
+        " [--msize N] [--ncores N] [--buf-size]\n", argv[0]);
     return -1;
   }
 
@@ -104,15 +91,15 @@ static inline int parse_args(int argc, char **argv)
     return -1;
   }
 
-  for (int i = 3; i < argc; i++)
+  for (i = 3; i < argc; i++)
   {
     if (strcmp(argv[i], "--msize") == 0 && i + 1 < argc)
     {
-      msize = (size_t) strtoul(argv[++i], NULL, 10);
+      msize = (size_t)strtoul(argv[++i], NULL, 10);
     }
     else if (strcmp(argv[i], "--ncores") == 0 && i + 1 < argc)
     {
-      ncores = atoi(argv[++i]);
+      ncores = (size_t)strtoul(argv[++i], NULL, 10);
     }
     else if (strcmp(argv[i], "--mconns") == 0 && i + 1 < argc)
     {
@@ -120,23 +107,13 @@ static inline int parse_args(int argc, char **argv)
     }
     else if (strcmp(argv[i], "--buf-size") == 0 && i + 1 < argc)
     {
-      bsize = (size_t) strtoul(argv[++i], NULL, 10);
+      bsize = (size_t)strtoul(argv[++i], NULL, 10);
     }
     else
     {
       fprintf(stderr, "Unknown arg: %s\n", argv[i]);
       return -1;
     }
-  }
-
-  if (ncores <= 0)
-    ncores = 1;
-  if (mconns <= 0)
-    mconns = 1;
-  if (bsize < msize)
-  {
-    fprintf(stderr, "buf-size must be >= msize\n");
-    return -1;
   }
 
   return 0;
@@ -148,38 +125,38 @@ static inline void print_stats(__u64 now)
   __u64 bytes_rx = 0, pkts_rx = 0, bytes_tx = 0, pkts_tx = 0;
 
   interval_s = (double) (t_next_report_ns - t_last_report_ns) / 1e9;
-  if (interval_s <= 0.0)
-    interval_s = 1.0;
+  if (interval_s <= 0.0) interval_s = 1.0;
 
+  /* Aggregate per-core and reset per-core intervals */
   for (int i = 0; i < ncores; i++)
   {
     bytes_rx += __sync_fetch_and_add(&cores[i].rxb_interval, 0);
-    pkts_rx += __sync_fetch_and_add(&cores[i].rxp_interval, 0);
+    pkts_rx  += __sync_fetch_and_add(&cores[i].rxp_interval, 0);
     bytes_tx += __sync_fetch_and_add(&cores[i].txb_interval, 0);
-    pkts_tx += __sync_fetch_and_add(&cores[i].txp_interval, 0);
+    pkts_tx  += __sync_fetch_and_add(&cores[i].txp_interval, 0);
+    fprintf(stderr, "core=%d bytes_rx=%.2f Mb/s bytes_tx=%.2f Mb/s\n", i, (double) cores[i].rxb_interval * 8.0 / 1e6, (double) cores[i].txb_interval * 8.0 / 1e6);
     __sync_fetch_and_and(&cores[i].rxb_interval, 0);
     __sync_fetch_and_and(&cores[i].rxp_interval, 0);
     __sync_fetch_and_and(&cores[i].txb_interval, 0);
     __sync_fetch_and_and(&cores[i].txp_interval, 0);
   }
-
+  
   rxb_interval_total = bytes_rx;
-  rxp_interval_total = pkts_rx;
+  rxp_interval_total  = pkts_rx;
   txb_interval_total = bytes_tx;
-  txp_interval_total = pkts_tx;
+  txp_interval_total  = pkts_tx;
 
-  rps_rx = (double) rxp_interval_total / interval_s;
+  rps_rx  = (double) rxp_interval_total / interval_s;
   mbps_rx = ((double) rxb_interval_total * 8.0 / 1e6) / interval_s;
-  rps_tx = (double) txp_interval_total / interval_s;
+  rps_tx  = (double) txp_interval_total / interval_s;
   mbps_tx = ((double) txb_interval_total * 8.0 / 1e6) / interval_s;
 
   printf("[ %3lus ] rx=%lld rps | rx=%.2f Mb/s | tx=%lld rps | tx=%.2f Mb/s \n",
-      (unsigned long) ((t_next_report_ns - t_start_ns) / 1000000000ULL),
-      (unsigned long long) rps_rx, mbps_rx,
-      (unsigned long long) rps_tx, mbps_tx);
+          (unsigned long)((t_next_report_ns - t_start_ns) / 1000000000ULL),
+          (__u64) rps_rx, mbps_rx, (__u64) rps_tx, mbps_tx);
   fflush(stdout);
 
-  t_last_report_ns = t_next_report_ns;
+  t_last_report_ns  = t_next_report_ns;
   t_next_report_ns += 1000000000ULL;
 
   if (now > t_next_report_ns + 5000000000ULL)
@@ -197,582 +174,323 @@ static void set_nonblock(int fd)
     perror("fcntl(F_GETFL)");
     exit(EXIT_FAILURE);
   }
-
-  if (fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0)
+  
+  if (fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) 
   {
     perror("fcntl(F_SETFL O_NONBLOCK)");
     exit(EXIT_FAILURE);
   }
 }
 
-static inline void conn_reset(struct conn *cn)
+static void set_nonagle(int fd)
 {
-  cn->fd = -1;
-  cn->active = 0;
-  cn->nrx = 0;
-  cn->ntx = 0;
-  cn->next_tx_tsc = 0;
-  cn->heap_idx = -1;
-  cn->next_free = -1;
-}
-
-static inline void core_push_free_conn(struct core *c, struct conn *cn)
-{
-  cn->next_free = c->free_head;
-  c->free_head = (int) (cn - c->conns);
-}
-
-static inline struct conn *core_pop_free_conn(struct core *c)
-{
-  int idx;
-  struct conn *cn;
-
-  if (c->free_head < 0)
-    return NULL;
-
-  idx = c->free_head;
-  cn = &c->conns[idx];
-  c->free_head = cn->next_free;
-  cn->next_free = -1;
-  return cn;
-}
-
-static inline void core_heap_swap(struct core *c, int a, int b)
-{
-  struct conn *tmp = c->tx_heap[a];
-
-  c->tx_heap[a] = c->tx_heap[b];
-  c->tx_heap[b] = tmp;
-  c->tx_heap[a]->heap_idx = a;
-  c->tx_heap[b]->heap_idx = b;
-}
-
-static inline void core_heap_sift_up(struct core *c, int idx)
-{
-  while (idx > 0)
+  int ret;
+  int flag = 1;
+  ret = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+  if (ret < 0)
   {
-    int parent = (idx - 1) / 2;
-
-    if (c->tx_heap[parent]->next_tx_tsc <= c->tx_heap[idx]->next_tx_tsc)
-      break;
-
-    core_heap_swap(c, parent, idx);
-    idx = parent;
+    perror("failed to set no nagle\n");
+    abort();
   }
-}
-
-static inline void core_heap_sift_down(struct core *c, int idx)
-{
-  while (1)
-  {
-    int left = idx * 2 + 1;
-    int right = left + 1;
-    int smallest = idx;
-
-    if (left < c->tx_heap_len &&
-        c->tx_heap[left]->next_tx_tsc < c->tx_heap[smallest]->next_tx_tsc)
-    {
-      smallest = left;
-    }
-
-    if (right < c->tx_heap_len &&
-        c->tx_heap[right]->next_tx_tsc < c->tx_heap[smallest]->next_tx_tsc)
-    {
-      smallest = right;
-    }
-
-    if (smallest == idx)
-      return;
-
-    core_heap_swap(c, idx, smallest);
-    idx = smallest;
-  }
-}
-
-static inline void core_heap_insert(struct core *c, struct conn *cn)
-{
-  if (cn->heap_idx >= 0)
-  {
-    core_heap_sift_up(c, cn->heap_idx);
-    core_heap_sift_down(c, cn->heap_idx);
-    return;
-  }
-
-  c->tx_heap[c->tx_heap_len] = cn;
-  cn->heap_idx = c->tx_heap_len;
-  c->tx_heap_len++;
-  core_heap_sift_up(c, cn->heap_idx);
-}
-
-static inline void core_heap_remove(struct core *c, struct conn *cn)
-{
-  int idx;
-  int last;
-
-  if (cn->heap_idx < 0)
-    return;
-
-  idx = cn->heap_idx;
-  last = c->tx_heap_len - 1;
-  c->tx_heap_len--;
-  cn->heap_idx = -1;
-
-  if (idx == last)
-    return;
-
-  c->tx_heap[idx] = c->tx_heap[last];
-  c->tx_heap[idx]->heap_idx = idx;
-  core_heap_sift_up(c, idx);
-  core_heap_sift_down(c, idx);
-}
-
-static inline struct conn *core_heap_peek(struct core *c)
-{
-  if (c->tx_heap_len == 0)
-    return NULL;
-
-  return c->tx_heap[0];
-}
-
-static inline __u64 conn_retry_next_tsc(__u64 now_tsc)
-{
-  double retry_cycles = 50.0 * clock_tsc_per_us();
-
-  if (retry_cycles < 1.0)
-    retry_cycles = 1.0;
-
-  return now_tsc + (__u64) retry_cycles;
-}
-
-static inline void core_schedule_tx_retry(struct core *c, struct conn *cn,
-    __u64 now_tsc, int blocked)
-{
-  size_t ready;
-
-  if (!cn->active || cn->fd < 0)
-    return;
-
-  ready = cn->nrx - (cn->nrx % msize);
-  if (ready <= cn->ntx)
-  {
-    core_heap_remove(c, cn);
-    return;
-  }
-
-  if (blocked)
-    cn->next_tx_tsc = conn_retry_next_tsc(now_tsc);
-  else
-    cn->next_tx_tsc = now_tsc;
-
-  core_heap_insert(c, cn);
-}
-
-static inline void core_run_due_tx(struct core *c, __u64 now_tsc)
-{
-  while (1)
-  {
-    struct conn *cn = core_heap_peek(c);
-
-    if (cn == NULL || cn->next_tx_tsc > now_tsc)
-      return;
-
-    core_heap_remove(c, cn);
-    core_tx_conn(c, cn);
-  }
-}
-
-static inline int core_next_timeout_ms(struct core *c, __u64 now_tsc)
-{
-  struct conn *cn = core_heap_peek(c);
-  double delta_us;
-
-  if (cn == NULL)
-    return 1000;
-
-  if (cn->next_tx_tsc <= now_tsc)
-    return 0;
-
-  delta_us = (double) (cn->next_tx_tsc - now_tsc) / clock_tsc_per_us();
-  if (delta_us < 1000.0)
-    return 0;
-
-  return (int) ((delta_us + 999.0) / 1000.0);
-}
-
-static inline void core_close_conn(struct core *c, struct conn *cn,
-    const char *op, int err)
-{
-  fprintf(stderr, "core %d fd=%d: %s: %s\n",
-      c->id, cn->fd, op,
-      err == 0 ? "connection closed" : strerror(err));
-  fflush(stderr);
-
-  if (cn->fd >= 0)
-  {
-    epoll_ctl(c->epoll_fd, EPOLL_CTL_DEL, cn->fd, NULL);
-    close(cn->fd);
-  }
-  if (c->nconns > 0)
-    c->nconns--;
-  core_heap_remove(c, cn);
-  conn_reset(cn);
-  core_push_free_conn(c, cn);
-}
-
-static inline int core_accept_conn(struct core *c)
-{
-  int fd;
-  int opt = 1;
-  struct conn *slot;
-
-  if (c->nconns >= mconns)
-    return 0;
-
-  while (c->nconns < mconns)
-  {
-    struct epoll_event ev;
-
-    slot = core_pop_free_conn(c);
-    if (slot == NULL)
-      return 0;
-
-    fd = accept4(c->listen_fd, NULL, NULL, SOCK_NONBLOCK);
-    if (fd < 0)
-    {
-      core_push_free_conn(c, slot);
-      if (errno == EAGAIN || errno == EWOULDBLOCK)
-        return 0;
-
-      fprintf(stderr, "core %d: accept failed: %s\n",
-          c->id, strerror(errno));
-      fflush(stderr);
-      return -1;
-    }
-
-    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
-    slot->fd = fd;
-    slot->active = 1;
-    slot->nrx = 0;
-    slot->ntx = 0;
-    c->nconns++;
-
-    ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
-    ev.data.ptr = &slot->ev_item;
-    if (epoll_ctl(c->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
-    {
-      fprintf(stderr, "core %d: epoll_ctl add failed: %s\n",
-          c->id, strerror(errno));
-      fflush(stderr);
-      close(fd);
-      if (c->nconns > 0)
-        c->nconns--;
-      conn_reset(slot);
-      core_push_free_conn(c, slot);
-      return -1;
-    }
-
-    core_rx_conn(c, slot);
-    if (slot->active)
-      core_tx_conn(c, slot);
-  }
-
-  return 0;
-}
-
-static inline void core_rx_conn(struct core *c, struct conn *cn)
-{
-  while (cn->nrx < bsize)
-  {
-    int nrx;
-    size_t before_msgs, after_msgs, delta_msgs;
-
-    nrx = recv(cn->fd, cn->buf + cn->nrx, bsize - cn->nrx, 0);
-    if (nrx < 0)
-    {
-      if (errno == EAGAIN || errno == EWOULDBLOCK)
-        return;
-
-      core_close_conn(c, cn, "recv failed", errno);
-      return;
-    }
-
-    if (nrx == 0)
-    {
-      core_close_conn(c, cn, "recv failed", 0);
-      return;
-    }
-
-    before_msgs = cn->nrx / msize;
-    cn->nrx += (size_t) nrx;
-    after_msgs = cn->nrx / msize;
-    delta_msgs = after_msgs - before_msgs;
-    if (delta_msgs > 0)
-    {
-      __sync_fetch_and_add(&c->rxp_interval, delta_msgs);
-      __sync_fetch_and_add(&c->rxb_interval, delta_msgs * msize);
-    }
-  }
-}
-
-static inline void core_tx_conn(struct core *c, struct conn *cn)
-{
-  size_t ready = cn->nrx - (cn->nrx % msize);
-  int blocked = 0;
-
-  while (cn->ntx < ready)
-  {
-    int ntx;
-    size_t before_msgs, after_msgs, delta_msgs;
-
-    ntx = send(cn->fd, cn->buf + cn->ntx, ready - cn->ntx, 0);
-    if (ntx < 0)
-    {
-      if (errno == EAGAIN || errno == EWOULDBLOCK)
-      {
-        blocked = 1;
-        break;
-      }
-
-      core_close_conn(c, cn, "send failed", errno);
-      return;
-    }
-
-    if (ntx == 0)
-    {
-      core_close_conn(c, cn, "send failed", 0);
-      return;
-    }
-
-    before_msgs = cn->ntx / msize;
-    cn->ntx += (size_t) ntx;
-    after_msgs = cn->ntx / msize;
-    delta_msgs = after_msgs - before_msgs;
-    if (delta_msgs > 0)
-    {
-      __sync_fetch_and_add(&c->txp_interval, delta_msgs);
-      __sync_fetch_and_add(&c->txb_interval, delta_msgs * msize);
-    }
-  }
-
-  if (cn->ntx == ready && ready > 0)
-  {
-    size_t left = cn->nrx - ready;
-
-    if (left > 0)
-      memmove(cn->buf, cn->buf + ready, left);
-
-    cn->nrx = left;
-    cn->ntx = 0;
-  }
-
-  if (cn->active)
-    core_schedule_tx_retry(c, cn, util_rdtsc(), blocked);
-}
-
-static inline void core_update_events(struct core *c, struct conn *cn)
-{
-  struct epoll_event ev;
-
-  if (!cn->active || cn->fd < 0)
-    return;
-
-  ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
-  ev.data.ptr = &cn->ev_item;
-  if (epoll_ctl(c->epoll_fd, EPOLL_CTL_MOD, cn->fd, &ev) < 0)
-    core_close_conn(c, cn, "epoll_ctl mod failed", errno);
+  
 }
 
 static inline void core_init(struct core *c)
 {
-  int ret, opt, fd;
+  __u8 *buf;
+  int ret, i, opt = 1;
+  struct conn *con;
   struct epoll_event ev;
-
-  c->conns = (struct conn *) calloc((size_t) mconns, sizeof(struct conn));
-  if (c->conns == NULL)
-  {
-    fprintf(stderr, "failed to calloc conn array\n");
-    abort();
-  }
-
-  for (int i = 0; i < mconns; i++)
-  {
-    conn_reset(&c->conns[i]);
-    c->conns[i].buf = (__u8 *) malloc(bsize);
-    c->conns[i].ev_item.type = EPOLL_ITEM_CONN;
-    c->conns[i].ev_item.ptr = &c->conns[i];
-    if (c->conns[i].buf == NULL)
-    {
-      fprintf(stderr, "failed to malloc conn buf\n");
-      abort();
-    }
-    memset(c->conns[i].buf, 0, bsize);
-  }
-  c->free_head = -1;
-  for (int i = mconns - 1; i >= 0; i--)
-    core_push_free_conn(c, &c->conns[i]);
-
-  c->tx_heap = (struct conn **) calloc((size_t) mconns, sizeof(struct conn *));
-  if (c->tx_heap == NULL)
-  {
-    fprintf(stderr, "failed to calloc tx heap\n");
-    abort();
-  }
-
+  
+  /* Cores that are not core 0 wait here so that ARP can complete */
   if (c->id != 0)
     pthread_barrier_wait(&start_barrier);
 
-  fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0)
+  
+  /* Open listening socket */
+  c->listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (c->listen_fd < 0)
   {
-    perror("socket");
+    perror("failed to create listening socket\n");
     abort();
   }
-  set_nonblock(fd);
-
-  opt = 1;
-  ret = setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-  if (ret < 0)
-  {
-    perror("setsockopt SO_REUSEPORT");
-    abort();
-  }
-
-  ret = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-  if (ret < 0)
+  
+  ret = setsockopt(c->listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+  if (ret < 0) 
   {
     perror("setsockopt SO_REUSEADDR");
     abort();
   }
-
-  if (bind(fd, (struct sockaddr *) &src_addr, sizeof(src_addr)) < 0)
+  
+  ret = setsockopt(c->listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  if (ret < 0) 
+  {
+    perror("setsockopt SO_REUSEADDR");
+    abort();
+  }
+  
+  set_nonblock(c->listen_fd);
+  ret = bind(c->listen_fd, (struct sockaddr *)&src_addr, sizeof(src_addr)); 
+  if (ret < 0)
   {
     perror("bind");
     abort();
   }
 
-  if (listen(fd, mconns) < 0)
+  ret = listen(c->listen_fd, listen_backlog);
+  if (ret < 0)
   {
-    perror("listen");
+    perror("listen failed\n");
     abort();
   }
-
-  c->listen_fd = fd;
-  c->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-  if (c->epoll_fd < 0)
+  
+  /* Prepare epoll */
+  c->ep_fd = epoll_create(mconns);
+  if (c->ep_fd < 0)
   {
-    perror("epoll_create1");
+    perror("epoll create failed\n");
     abort();
   }
-
+  
+  /* Add listening socket to epoll */
   ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
-  c->listen_item.type = EPOLL_ITEM_LISTEN;
-  c->listen_item.ptr = c;
-  ev.data.ptr = &c->listen_item;
-  if (epoll_ctl(c->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
+  ev.data.ptr = NULL;
+  ret = epoll_ctl(c->ep_fd, EPOLL_CTL_ADD, c->listen_fd, &ev);
+  if (ret < 0)
   {
-    perror("epoll_ctl add listen");
+    perror("epoll_ctl failed to add listen fd\n");
     abort();
   }
+  
+    c->conns = calloc(mconns, sizeof(struct conn));
+  if (c->conns == NULL)
+  {
+    fprintf(stderr, "failed to allocate conns\n");
+    abort();
+  }
+  
+  /* Prepare connections */
+  for (i = 0; i < mconns; i++)
+  {
+    con = &c->conns[i];
+    
+    buf = (__u8 *) malloc(bsize);
+    if (buf == NULL)
+    {
+      fprintf(stderr, "failed to malloc tx buf");
+      abort();
+    }
+    con->buf = buf;
+    memset(con->buf, 0, bsize);
+    
+    con->fd = -1;
+    con->id = i;
+    con->nrx = 0;
+    con->ntx = 0;
+    con->tx_remain = msize;
+    con->rx_remain = msize;
+  }
 
-  c->nconns = 0;
-  c->tx_heap_len = 0;
+  c->dst_len = sizeof(c->dst_addr);
   c->rxb_interval = 0;
   c->rxp_interval = 0;
   c->txb_interval = 0;
   c->txp_interval = 0;
 }
 
+static inline void conn_rx(struct core *c, struct conn *con)
+{
+  int nrx;
+  
+  while (con->nrx < bsize)
+  {
+    assert(con->rx_remain != 0);
+    nrx = recvfrom(con->fd, con->buf + con->nrx, con->rx_remain, 
+        0, (struct sockaddr *) &c->dst_addr, &c->dst_len);
+    assert(nrx <= 0 || (nrx <= msize && nrx <= con->rx_remain));
+
+    if (nrx <= 0)
+      break;
+    
+    con->nrx += nrx;
+    con->rx_remain -= nrx;
+    __sync_fetch_and_add(&c->rxb_interval, nrx);
+    if (con->rx_remain == 0)
+    {
+      con->rx_remain = msize;
+      __sync_fetch_and_add(&c->rxp_interval, 1);
+    }
+  }
+}
+
+static inline void conn_tx(struct core *c, 
+    struct conn *con, struct epoll_event *ev)
+{
+  int ntx, ret;
+
+  while (con->ntx < con->nrx)
+  {
+    assert(con->tx_remain != 0);
+    ntx = sendto(con->fd, con->buf + con->ntx, con->tx_remain, 0,
+        (struct sockaddr *) &c->dst_addr, c->dst_len);
+    assert(ntx <= 0 || (ntx <= msize && ntx <= con->tx_remain));
+          
+    if (ntx <= 0)
+    {
+      /* Trigger event if we didn't echo everything */
+      ev->data.ptr = con;
+      ev->events = EPOLLOUT | EPOLLIN | EPOLLERR | EPOLLHUP;
+      ret = epoll_ctl(c->ep_fd, EPOLL_CTL_MOD, con->fd, ev);
+      if (ret < 0)
+      {
+        perror("failed to modify conn event to trigger EPOLLOUT");
+        abort();
+      }
+      return;
+    }
+      
+    con->ntx += ntx;
+    con->tx_remain -= ntx;
+    __sync_fetch_and_add(&c->txb_interval, ntx);
+    if (con->tx_remain == 0)
+    {
+      con->tx_remain = msize;
+      __sync_fetch_and_add(&c->txp_interval, 1);
+    }
+  }
+  
+  /* We sent all the data so do not trigger EPOLLOUT anymore */
+  ev->events = EPOLLIN | EPOLLERR | EPOLLHUP;
+  ret = epoll_ctl(c->ep_fd, EPOLL_CTL_MOD, con->fd, ev);
+  if (ret < 0)
+  {
+    perror("failed to modify conn event to stop triggering EPOLLOUT");
+    abort();
+  }
+  
+  con->ntx = 0;
+  con->nrx = 0;
+}
+
+static inline void conn_accept(struct core *c, struct epoll_event *ev)
+{
+  int ret;
+  struct conn *con;
+  
+  /* There was some error on the listening socket so abort */
+  if ((ev->events != EPOLLIN)) 
+  {
+      fprintf(stderr, "error on listening socket\n");
+      abort();
+  }
+  
+  if (c->nconns == mconns)
+  {
+    fprintf(stderr, "already accepted max connections\n");
+    abort();
+  }
+  
+  con = &c->conns[c->nconns];
+  con->fd = accept(c->listen_fd, NULL, NULL);
+  if (con->fd < 0)
+  {
+    fprintf(stderr, "accept failed\n");
+    abort();
+  }
+  
+  set_nonblock(con->fd);
+  set_nonagle(con->fd);
+  
+  /* Add conn to epoll */
+  ev->data.ptr = con;
+  ev->events = EPOLLIN | EPOLLERR | EPOLLHUP;
+  ret = epoll_ctl(c->ep_fd, EPOLL_CTL_ADD, con->fd, ev);
+  if (ret < 0)
+  {
+    perror("epoll ctl failed to add conn\n");
+    abort();
+  }
+  
+  con->id = c->nconns;
+  con->nrx = 0;
+  con->ntx = 0;  
+  c->nconns++;
+}
+
 static inline void * core_thread(void *arg)
 {
-  struct core *c = (struct core *) arg;
-  struct epoll_event events[mconns + 1];
-  int nev;
-
+  int ret, i;
+  struct core *c;
+  struct conn *con;
+  struct epoll_event *evs;
+  
+  c = (struct core *) arg;
   core_init(c);
+  
+  /* Allocate event structure */
+  evs = calloc(max_events, sizeof(struct epoll_event));
+  if (evs == NULL)
+  {
+    fprintf(stderr, "failed to allocate epoll_event struct\n");
+    abort();
+  }
+  c->evs = evs;
 
+  /* Core 0 waits here while others wait in init */
   if (c->id == 0)
     pthread_barrier_wait(&start_barrier);
+  
+  fprintf(stderr, "Initialized core=%d\n", c->id);
 
   while (1)
   {
-    core_run_due_tx(c, util_rdtsc());
-    nev = epoll_wait(c->epoll_fd, events, mconns + 1,
-        core_next_timeout_ms(c, util_rdtsc()));
-
-    if (nev < 0)
+    ret = epoll_wait(c->ep_fd, c->evs, max_events, -1);
+    if (ret < 0)
     {
-      if (errno != EINTR)
-      {
-        perror("epoll_wait");
-        pthread_exit((void *) (intptr_t) -1);
-      }
-      continue;
+      perror("epoll_wait failed\n");
+      abort();
     }
-
-    for (int i = 0; i < nev; i++)
+    
+    for (i = 0; i < ret; i++)
     {
-      uint32_t ev = events[i].events;
-      struct epoll_item *item = (struct epoll_item *) events[i].data.ptr;
-
-      if (item == NULL)
-        continue;
-
-      if (item->type == EPOLL_ITEM_LISTEN)
+      con = c->evs[i].data.ptr;
+      if (con == NULL)
       {
-        if (ev & EPOLLIN)
-        {
-          while (1)
-          {
-            if (core_accept_conn(c) != 0)
-              break;
-          }
-        }
-        if (ev & (EPOLLERR | EPOLLHUP))
-        {
-          fprintf(stderr, "core %d: listen socket error\n", c->id);
-          fflush(stderr);
-        }
-        continue;
+        conn_accept(c, &c->evs[i]);
       }
-
+      else if (c->evs[i].events & ~(EPOLLIN | EPOLLOUT))
       {
-        struct conn *cn = (struct conn *) item->ptr;
-
-        if (cn == NULL || !cn->active)
-          continue;
-
-        if (ev & (EPOLLERR | EPOLLHUP))
+        fprintf(stderr, "error on connection\n");
+        abort();
+      }
+      else 
+      {        
+        /* Drain send before receiving so we have more buffer space */
+        if (c->evs[i].events & EPOLLOUT)
+          conn_tx(c, con, &c->evs[i]);
+          
+        /* Receive data and echo back */
+        if (c->evs[i].events & EPOLLIN)
         {
-          core_close_conn(c, cn, "epoll error", 0);
-          continue;
+          conn_rx(c, con);
+          conn_tx(c, con, &c->evs[i]);
         }
-
-        if (ev & EPOLLIN)
-          core_rx_conn(c, cn);
-
-        if (cn->active)
-          core_tx_conn(c, cn);
-
-        if (cn->active)
-          core_update_events(c, cn);
       }
     }
-
-    if (nev == 0)
-      core_accept_conn(c);
   }
 
-  pthread_exit((void *) (intptr_t) 0);
+  pthread_exit((void *)(intptr_t)0);
 }
 
-static inline void prepare_cores(void)
+static inline void prepare_cores()
 {
-  for (int i = 0; i < ncores; i++)
+  int i;
+
+  for (i = 0; i < ncores; i++)
   {
     memset(&cores[i], 0, sizeof(struct core));
     cores[i].id = i;
-    cores[i].listen_fd = -1;
-    cores[i].epoll_fd = -1;
+    memset(&cores[i].dst_addr, 0, sizeof(cores[i].dst_addr));
 
     if (inet_pton(AF_INET, server_ip, &src_addr.sin_addr) != 1)
     {
@@ -782,11 +500,14 @@ static inline void prepare_cores(void)
   }
 }
 
-static inline void start_cores(void)
+static inline void start_cores()
 {
-  for (int i = 0; i < ncores; i++)
+  int i, rc;
+  
+  /* Spawn core threads */
+  for (i = 0; i < ncores; i++)
   {
-    int rc = pthread_create(&threads[i], NULL, core_thread, &cores[i]);
+    rc = pthread_create(&threads[i], NULL, core_thread, &cores[i]);
     if (rc != 0)
     {
       errno = rc;
@@ -796,18 +517,20 @@ static inline void start_cores(void)
   }
 }
 
-static inline void init_server(void)
+static inline void init_server()
 {
   memset(&src_addr, 0, sizeof(src_addr));
   src_addr.sin_family = AF_INET;
-  src_addr.sin_port = htons((__u16) port);
+  src_addr.sin_port   = htons((__u16)port);
   if (inet_pton(AF_INET, server_ip, &src_addr.sin_addr) != 1)
   {
     fprintf(stderr, "Invalid bind_ip\n");
     abort();
   }
 
-  cores = (struct core *) calloc((size_t) ncores, sizeof(struct core));
+  /* Allocate cores and thread handles */
+  cores = (struct core *) calloc((size_t) ncores, 
+      sizeof(struct core));
   threads = (pthread_t *) calloc((size_t) ncores, sizeof(pthread_t));
   if (!cores || !threads)
   {
@@ -815,13 +538,14 @@ static inline void init_server(void)
     abort();
   }
 
-  if (pthread_barrier_init(&start_barrier, NULL,
+  /* Barrier for all cores + main (to synchronize start of sending) */
+  if (pthread_barrier_init(&start_barrier, NULL, 
       (unsigned) ncores + 1) != 0)
   {
     perror("pthread_barrier_init");
     abort();
   }
-
+  
   rxb_interval_total = 0;
   rxp_interval_total = 0;
   txb_interval_total = 0;
@@ -830,39 +554,49 @@ static inline void init_server(void)
 
 int main(int argc, char **argv)
 {
+  int ret, i;
   __u64 now;
 
-  if (parse_args(argc, argv) != 0)
+  ret = parse_args(argc, argv);
+  if (ret != 0)
   {
     fprintf(stderr, "failed to parse args\n");
     abort();
   }
-
+    
   init_server();
   prepare_cores();
   start_cores();
 
+  /* Wait for work threads brefore continuing */
   printf("Initialized %d core(s). Waiting for barrier\n", ncores);
   fflush(stdout);
   pthread_barrier_wait(&start_barrier);
 
-  printf("TCP echo server listening on %s:%d (msize=%zu) (bsize=%zu) (ncores=%d) (mconns=%d)\n",
-      server_ip, port, msize, bsize, ncores, mconns);
+  printf("UDP echo server listening on %s:%d (msize=%zu) (bsize=%zu) (ncores=%d)\n", 
+      server_ip, port, msize, bsize, ncores);
   fflush(stdout);
-
+  
+  /* Establish timebase and reporting windows */
   t_start_ns = now_ns();
   t_last_report_ns = t_start_ns;
   t_next_report_ns = t_start_ns + 1000000000ULL;
-
+  
+  /* Per-second reporting loop in main thread */
   while (1)
   {
     now = now_ns();
     if (now >= t_next_report_ns)
       print_stats(now);
 
-    {
-      struct timespec ts = { .tv_sec = 0, .tv_nsec = 2000000 };
-      nanosleep(&ts, NULL);
-    }
+    /* Sleep a bit to avoid busy wait */
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 2000000 };
+    nanosleep(&ts, NULL);
   }
+  
+  /* Join all cores */
+  for (i = 0; i < ncores; i++)
+    pthread_join(threads[i], NULL);
+    
+  return 0;
 }
