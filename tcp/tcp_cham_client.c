@@ -114,7 +114,7 @@ static inline int parse_args(int argc, char **argv)
 
   src_ip = argv[1];
   src_port = atoi(argv[2]);
-  if (src_port < 0 || src_port > 65535)
+  if (src_port != -1 && (src_port < 0 || src_port > 65535))
   {
     fprintf(stderr, "Invalid src_port\n");
     return -1;
@@ -704,15 +704,7 @@ static inline void start_cores()
 }
 
 static inline void init_client()
-{
-  src_addr.sin_family = AF_INET;
-  src_addr.sin_port = htons((__u16) src_port);
-  if (inet_pton(AF_INET, src_ip, &src_addr.sin_addr) != 1)
-  {
-    fprintf(stderr, "invalid source bind_ip\n");
-    abort();
-  }
-  
+{ 
   /* Calibrate tsc */
   calibrate_tsc();
 
