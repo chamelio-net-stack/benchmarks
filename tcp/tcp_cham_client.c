@@ -240,22 +240,6 @@ static inline void print_stats(__u64 now)
   }
 }
 
-static void set_nonblock(int fd)
-{
-  int fl = fcntl(fd, F_GETFL, 0);
-  if (fl < 0)
-  {
-    perror("fcntl(F_GETFL)");
-    exit(EXIT_FAILURE);
-  }
-  
-  if (fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) 
-  {
-    perror("fcntl(F_SETFL O_NONBLOCK)");
-    exit(EXIT_FAILURE);
-  }
-}
-
 static void conn_rearm(struct core *c, struct conn *con)
 {
   struct conn *tail_con;
@@ -335,7 +319,6 @@ static inline void core_init(struct core *c)
       fprintf(stderr, "failed to create socket\n");
       abort();
     }
-    set_nonblock(fd);
   
     con = &conns[i];
     con->id = i;
@@ -551,7 +534,6 @@ static void open_conn(struct core *c, struct conn *con)
     /* Connected succesfully */
     con->connected = 1;
     c->nconnected++;
-    c->npending--;
     events = TCP_WAIT_IN | TCP_WAIT_OUT;
     ret = tcp_wait_add(c->wait, con->fd, events, (__u64) con);
     if (ret < 0)
@@ -572,7 +554,7 @@ static void open_conn(struct core *c, struct conn *con)
   {
     /* Connection is still pending */
     c->npending++;
-    events = TCP_WAIT_IN | TCP_WAIT_OUT;
+    events = TCP_WAIT_CONNECTED;
     ret = tcp_wait_add(c->wait, con->fd, events, (__u64) con);
     if (ret < 0)
     {
@@ -605,7 +587,7 @@ static void open_conns(struct core *c)
     
     /* Wait for new connections to be opened*/
     tcp_poll_slow(c->tcp_ctx);
-    ret = tcp_wait(c->wait, evs, mpending, TCP_WAIT_CONNECTED);
+    ret = tcp_wait(c->wait, evs, mpending, 0);
     if (ret < 0)
     {
       fprintf(stderr, "tcp_wait failed\n");
@@ -616,19 +598,23 @@ static void open_conns(struct core *c)
     for (i = 0; i < ret; i++)
     {
       con = (struct conn *) evs[i].data;
-      assert(!con->connected);
-      con->connected = 1;
-      c->nconnected++;
-      c->npending--;
-      
-      /* Add connection to tcp_wait for tx and rx */
-      ret = tcp_wait_mod(c->wait, con->fd, 
-          TCP_WAIT_IN | TCP_WAIT_OUT, (__u64) con);
-      if (ret < 0)
+      if (evs[i].events & TCP_WAIT_CONNECTED)
       {
-        fprintf(stderr, "tcp_wait_mod failed\n");
-        abort();
+        assert(!con->connected);
+        con->connected = 1;
+        c->nconnected++;
+        c->npending--;
+        
+        /* Add connection to tcp_wait for tx and rx */
+        ret = tcp_wait_mod(c->wait, con->fd, 
+            TCP_WAIT_IN | TCP_WAIT_OUT, (__u64) con);
+        if (ret < 0)
+        {
+          fprintf(stderr, "tcp_wait_mod failed\n");
+          abort();
+        }
       }
+      
     }
   }
 }
