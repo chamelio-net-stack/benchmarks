@@ -2,18 +2,13 @@
  * latency percentiles (p50, p99, p99.9) in microseconds.
  *
  * Usage:
- *   ./tcp_cham_client <src_ip> <src_port> <rem_ip> <rem_port>
+ *   ./tcp_linux_client <src_ip> <src_port> <rem_ip> <rem_port>
  *     [--msize N] [--duration S] [--rate R] [--ncores N]
- *     [--nconns N] [--mpending N] [--cwait S] [--cores LIST]
  *
  *   --msize Total TCP payload bytes.
  *   --duration Duration in seconds to run benchmark
- *   --rate Per-connection send rate in megabits per second
+ *   --rate Per-core send rate in megabits per second
  *   --ncores Number of cores to use
- *   --nconns Number of TCP connections per core
- *   --mpending Max number of pending connects per core
- *   --cwait Time in seconds to wait before starting traffic
- *   --cores Comma-separated core list (main, thread0, thread1, ...)
  */
 
 #define _GNU_SOURCE
@@ -27,31 +22,30 @@
 #include <stdio.h>
 #include <time.h>
 #include <stdbool.h>
-#include <stdint.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <sched.h>
+#include <fcntl.h>
+#include <linux/types.h>
 #include "../utils/clock.h"
 #include "../utils/hist.h"
-#include "../utils/core.h"
 
 struct payload_hdr {
   __u64 tsc;
 }__attribute__((packed));
 
+/* Connection */
 struct conn {
+  int id;
   int fd;
-  bool active;
-  bool connected;
+  int ready;
+  __u8 connected;
+  int tx_remain;
   __u8 *txbuf;
+  int rx_remain;
   __u8 *rxbuf;
-  size_t tx_off;
-  size_t rx_off;
-  __u32 wait_events;
-  bool tx_queued;
-  double next_tx_tsc;
-  __u64 total_tx_pkts;
-  __u64 total_rx_pkts;
+  double tokens;
+  __u64 last_tsc;
+  int next;
 };
 
 /* Per-core context */
@@ -59,23 +53,23 @@ struct core {
   int id;
   struct tcp_context_lib *tcp_ctx;
   struct tcp_wait *wait;
-  struct tcp_wait_event *events;
-  struct conn *conns;
-  struct conn **txq;
-  int txq_head;
-  int txq_tail;
-  int txq_len;
+  int nrx_evs;
+  struct tcp_wait_event *rx_evs;
   struct sockaddr_in dst_addr;
   socklen_t dst_len;
   __u64 txb_load_interval;
   __u64 txp_load_interval;
   __u64 txb_tp_interval;
   __u64 txp_tp_interval;
-  int established_conns;
-  int pending_conns;
-  double tx_interval_tsc;
-  double tx_catchup_tsc;
-  unsigned int tx_burst_pkts;
+  __u64 total_tx_pkts;
+  __u64 total_rx_pkts;
+  struct conn *conns;
+  int nready;
+  int ready_head;
+  int ready_tail;
+  int *ready_conns;
+  int nconnected;
+  int npending;
 };
 
 /* Default arg values */
@@ -85,10 +79,7 @@ double rate = 10.0;
 int ncores = 1;
 int nconns = 1;
 int mpending = 0;
-double cwait = 0.0;
-static char *cores_arg = NULL;
-static int *core_list = NULL;
-static int core_list_len = 0;
+int cwait = 0;
 const char *rem_ip;
 int rem_port;
 const char *src_ip;
@@ -109,119 +100,26 @@ static pthread_t *threads = NULL;
 static struct core *cores = NULL;
 static struct hist_state rtt_hist = { 0 };
 
-static inline int src_ip_is_auto(void)
-{
-  return strcmp(src_ip, "-1") == 0;
-}
-
-static inline int should_bind_source(void)
-{
-  return nconns == 1 && src_port > 0 && !src_ip_is_auto();
-}
-
-static inline int core_src_port(int core_id)
-{
-  return src_port + core_id;
-}
-
-static inline int parse_core_list(const char *arg, int expected_len)
-{
-  int count = 1;
-  const char *p = arg;
-  char *tmp, *tok, *end;
-  int idx = 0;
-
-  if (arg == NULL || *arg == '\0')
-    return -1;
-
-  while (*p)
-  {
-    if (*p == ',')
-      count++;
-    p++;
-  }
-
-  if (expected_len > 0 && count != expected_len)
-  {
-    fprintf(stderr, "cores list must have %d entries (main + %d threads)\n",
-        expected_len, expected_len - 1);
-    return -1;
-  }
-
-  core_list = (int *) calloc((size_t) count, sizeof(int));
-  if (!core_list)
-  {
-    perror("calloc core_list");
-    return -1;
-  }
-
-  tmp = strdup(arg);
-  if (!tmp)
-  {
-    perror("strdup cores");
-    free(core_list);
-    core_list = NULL;
-    return -1;
-  }
-
-  for (tok = strtok(tmp, ","); tok != NULL; tok = strtok(NULL, ","))
-  {
-    while (*tok == ' ' || *tok == '\t')
-      tok++;
-    if (*tok == '\0')
-    {
-      fprintf(stderr, "empty core id in list\n");
-      free(core_list);
-      core_list = NULL;
-      free(tmp);
-      return -1;
-    }
-    errno = 0;
-    core_list[idx] = (int) strtol(tok, &end, 10);
-    if (errno != 0 || end == tok || (*end != '\0' && *end != ' ' && *end != '\t'))
-    {
-      fprintf(stderr, "invalid core id: %s\n", tok);
-      free(core_list);
-      core_list = NULL;
-      free(tmp);
-      return -1;
-    }
-    if (core_list[idx] < 0 || core_list[idx] >= CPU_SETSIZE)
-    {
-      fprintf(stderr, "core id out of range: %d\n", core_list[idx]);
-      free(core_list);
-      core_list = NULL;
-      free(tmp);
-      return -1;
-    }
-    idx++;
-  }
-
-  free(tmp);
-  core_list_len = count;
-  return 0;
-}
-
 static inline int parse_args(int argc, char **argv)
 {
-  if (argc < 5)
+  if (argc < 3)
   {
     fprintf(stderr,
         "Usage: %s <src_ip> <src_port> <rem_ip> <rem_port> [--msize N]"
-        " [--duration S] [--rate R] [--ncores N] [--nconns N]"
-        " [--mpending N] [--cwait S] [--cores LIST]\n",
+        " [--duration S] [--rate R] [--ncores N]"
+        " [--nconns N] [--mpending N] [--cwait S]\n",
         argv[0]);
     return -1;
   }
 
   src_ip = argv[1];
   src_port = atoi(argv[2]);
-  if (src_port < -1 || src_port > 65535)
+  if (src_port < 0 || src_port > 65535)
   {
     fprintf(stderr, "Invalid src_port\n");
     return -1;
   }
-
+  
   rem_ip = argv[3];
   rem_port = atoi(argv[4]);
   if (rem_port <= 0 || rem_port > 65535)
@@ -236,7 +134,7 @@ static inline int parse_args(int argc, char **argv)
         strcmp(argv[i], "--size") == 0) &&
         i + 1 < argc)
     {
-      msize = (size_t) strtoul(argv[++i], NULL, 10);
+      msize = (size_t)strtoul(argv[++i], NULL, 10);
     }
     else if (strcmp(argv[i], "--duration") == 0 && i + 1 < argc)
     {
@@ -246,7 +144,7 @@ static inline int parse_args(int argc, char **argv)
     {
       rate = strtod(argv[++i], NULL);
     }
-    else if (strcmp(argv[i], "--ncores") == 0 && i + 1 < argc)
+    else if ((strcmp(argv[i], "--ncores") == 0) && i + 1 < argc)
     {
       ncores = atoi(argv[++i]);
     }
@@ -260,11 +158,7 @@ static inline int parse_args(int argc, char **argv)
     }
     else if (strcmp(argv[i], "--cwait") == 0 && i + 1 < argc)
     {
-      cwait = strtod(argv[++i], NULL);
-    }
-    else if (strcmp(argv[i], "--cores") == 0 && i + 1 < argc)
-    {
-      cores_arg = argv[++i];
+      cwait = atoi(argv[++i]);
     }
     else
     {
@@ -273,21 +167,9 @@ static inline int parse_args(int argc, char **argv)
     }
   }
 
-  if (duration <= 0)
-  {
-    fprintf(stderr, "duration must be > 0\n");
-    return -1;
-  }
-
   if (rate <= 0.0)
   {
     fprintf(stderr, "rate must be > 0\n");
-    return -1;
-  }
-
-  if (cwait < 0.0)
-  {
-    fprintf(stderr, "cwait must be >= 0\n");
     return -1;
   }
 
@@ -300,29 +182,6 @@ static inline int parse_args(int argc, char **argv)
 
   if (ncores <= 0)
     ncores = 1;
-  if (nconns <= 0)
-    nconns = 1;
-
-  if (mpending == 0)
-    mpending = nconns;
-  if (mpending <= 0 || mpending > nconns)
-  {
-    fprintf(stderr, "mpending must be in [1, nconns]\n");
-    return -1;
-  }
-
-  if (should_bind_source() &&
-      (src_port + ncores - 1 > 65535))
-  {
-    fprintf(stderr, "src_port + ncores - 1 exceeds 65535\n");
-    return -1;
-  }
-
-  if (cores_arg != NULL)
-  {
-    if (parse_core_list(cores_arg, ncores + 1) != 0)
-      return -1;
-  }
 
   return 0;
 }
@@ -334,45 +193,44 @@ static inline void print_stats(__u64 now)
   __u64 bytes_load = 0, pkts_load = 0, bytes_tp = 0, pkts_tp = 0;
 
   interval_s = (double) (t_next_report_ns - t_last_report_ns) / 1e9;
-  if (interval_s <= 0.0)
-    interval_s = 1.0;
+  if (interval_s <= 0.0) interval_s = 1.0;
 
+  /* Aggregate per-core and reset per-core intervals */
   for (int i = 0; i < ncores; i++)
   {
     bytes_load += __sync_fetch_and_add(&cores[i].txb_load_interval, 0);
-    pkts_load += __sync_fetch_and_add(&cores[i].txp_load_interval, 0);
+    pkts_load  += __sync_fetch_and_add(&cores[i].txp_load_interval, 0);
     bytes_tp += __sync_fetch_and_add(&cores[i].txb_tp_interval, 0);
-    pkts_tp += __sync_fetch_and_add(&cores[i].txp_tp_interval, 0);
-
+    pkts_tp  += __sync_fetch_and_add(&cores[i].txp_tp_interval, 0);
+    
+    /* Zero values safely */
     __sync_fetch_and_and(&cores[i].txb_load_interval, 0);
     __sync_fetch_and_and(&cores[i].txp_load_interval, 0);
     __sync_fetch_and_and(&cores[i].txb_tp_interval, 0);
     __sync_fetch_and_and(&cores[i].txp_tp_interval, 0);
   }
-
   txb_load_interval_total = bytes_load;
-  txp_load_interval_total = pkts_load;
+  txp_load_interval_total  = pkts_load;
   txb_tp_interval_total = bytes_tp;
-  txp_tp_interval_total = pkts_tp;
+  txp_tp_interval_total  = pkts_tp;
 
-  rps_load = (double) txp_load_interval_total / interval_s;
+  rps_load  = (double) txp_load_interval_total / interval_s;
   mbps_load = ((double) txb_load_interval_total * 8.0 / 1e6) / interval_s;
-  rps_tp = (double) txp_tp_interval_total / interval_s;
+  rps_tp  = (double) txp_tp_interval_total / interval_s;
   mbps_tp = ((double) txb_tp_interval_total * 8.0 / 1e6) / interval_s;
 
   hist_percentiles(&rtt_hist, &p50, &p99, &p999);
 
   printf("[ %3lus ] load=%lld rps | load=%.2f Mb/s | tp=%lld rps | tp=%.2f Mb/s | ",
-      (unsigned long) ((t_next_report_ns - t_start_ns) / 1000000000ULL),
-      (unsigned long long) rps_load, mbps_load,
-      (unsigned long long) rps_tp, mbps_tp);
+          (unsigned long)((t_next_report_ns - t_start_ns) / 1000000000ULL),
+          (__u64) rps_load, mbps_load, (__u64) rps_tp, mbps_tp);
   printf("p50=%llu us  p99=%llu us  p99.9=%llu us\n",
-      (unsigned long long) p50,
-      (unsigned long long) p99,
-      (unsigned long long) p999);
+          (unsigned long long) p50,
+          (unsigned long long) p99,
+          (unsigned long long) p999);
   fflush(stdout);
 
-  t_last_report_ns = t_next_report_ns;
+  t_last_report_ns  = t_next_report_ns;
   t_next_report_ns += 1000000000ULL;
 
   if (now > t_next_report_ns + 5000000000ULL)
@@ -382,601 +240,443 @@ static inline void print_stats(__u64 now)
   }
 }
 
-static inline void conn_reset(struct conn *cn)
+static void set_nonblock(int fd)
 {
-  cn->fd = -1;
-  cn->active = false;
-  cn->connected = false;
-  cn->tx_off = 0;
-  cn->rx_off = 0;
-  cn->wait_events = 0;
-  cn->tx_queued = false;
-  cn->next_tx_tsc = 0.0;
-}
-
-static inline __u32 conn_wait_events(struct conn *cn)
-{
-  __u32 events = TCP_WAIT_CLOSED;
-
-  if (!cn->active)
-    return 0;
-
-  if (!cn->connected)
-    return events | TCP_WAIT_CONNECTED | TCP_WAIT_OP;
-
-  events |= TCP_WAIT_IN;
-  if (cn->tx_off > 0)
-    events |= TCP_WAIT_OUT;
-
-  return events;
-}
-
-static inline void conn_wait_add(struct core *c, struct conn *cn)
-{
-  __u32 events = conn_wait_events(cn);
-
-  if (tcp_wait_add(c->wait, cn->fd, events,
-          (__u64) (uintptr_t) cn) != 0)
+  int fl = fcntl(fd, F_GETFL, 0);
+  if (fl < 0)
   {
-    fprintf(stderr, "core %d fd=%d: wait_add failed: %s\n",
-        c->id, cn->fd, strerror(errno));
-    abort();
+    perror("fcntl(F_GETFL)");
+    exit(EXIT_FAILURE);
   }
-
-  cn->wait_events = events;
+  
+  if (fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) 
+  {
+    perror("fcntl(F_SETFL O_NONBLOCK)");
+    exit(EXIT_FAILURE);
+  }
 }
 
-static inline void conn_wait_update(struct core *c, struct conn *cn)
+static void conn_rearm(struct core *c, struct conn *con)
 {
-  __u32 events;
-
-  if (!cn->active)
+  struct conn *tail_con;
+  
+  /* Connection is already in ready */
+  if (con->ready)
     return;
-  events = conn_wait_events(cn);
-  if (events == cn->wait_events)
-    return;
-
-  if (tcp_wait_mod(c->wait, cn->fd, events,
-          (__u64) (uintptr_t) cn) != 0)
+  
+  con->next = -1;
+  if (c->nready == 0)
   {
-    fprintf(stderr, "core %d fd=%d: wait_mod failed: %s\n",
-        c->id, cn->fd, strerror(errno));
-    abort();
+    c->ready_head = con->id;
   }
-
-  cn->wait_events = events;
-}
-
-static inline int txq_next_index(int idx)
-{
-  idx++;
-  if (idx == nconns)
-    idx = 0;
-  return idx;
-}
-
-static inline void txq_push(struct core *c, struct conn *cn)
-{
-  if (!cn->active || !cn->connected || cn->tx_queued)
-    return;
-
-  c->txq[c->txq_tail] = cn;
-  c->txq_tail = txq_next_index(c->txq_tail);
-  c->txq_len++;
-  cn->tx_queued = true;
-}
-
-static inline struct conn *txq_peek(struct core *c)
-{
-  while (c->txq_len > 0)
+  else
   {
-    struct conn *cn = c->txq[c->txq_head];
-
-    if (cn != NULL && cn->tx_queued)
-      return cn;
-
-    c->txq_head = txq_next_index(c->txq_head);
-    c->txq_len--;
+    tail_con = &c->conns[c->ready_tail];
+    tail_con->next = con->id;
   }
-
-  return NULL;
-}
-
-static inline struct conn *txq_pop(struct core *c)
-{
-  struct conn *cn = txq_peek(c);
-
-  if (cn == NULL)
-    return NULL;
-
-  c->txq_head = txq_next_index(c->txq_head);
-  c->txq_len--;
-  cn->tx_queued = false;
-  return cn;
-}
-
-static inline void core_drop_conn(struct core *c, struct conn *cn,
-    const char *op, int err)
-{
-  cn->tx_queued = false;
-
-  if (cn->fd >= 0)
-  {
-    tcp_wait_del(c->wait, cn->fd);
-    tcp_close(c->tcp_ctx, cn->fd);
-  }
-
-  if (cn->active)
-  {
-    if (cn->connected)
-    {
-      if (c->established_conns > 0)
-        c->established_conns--;
-    }
-    else if (c->pending_conns > 0)
-    {
-      c->pending_conns--;
-    }
-  }
-
-  fprintf(stderr, "core %d fd=%d: %s: %s\n",
-      c->id, cn->fd, op,
-      err == 0 ? "connection closed" : strerror(err));
-  fflush(stderr);
-
-  conn_reset(cn);
-}
-
-static inline int core_start_conn(struct core *c, struct conn *cn)
-{
-  int fd, ret;
-
-  fd = tcp_socket(c->tcp_ctx);
-  if (fd < 0)
-    return -1;
-
-  if (should_bind_source())
-  {
-    struct sockaddr_in bind_addr = src_addr;
-
-    bind_addr.sin_port = htons((__u16) core_src_port(c->id));
-    ret = tcp_bind(c->tcp_ctx, fd,
-        (struct sockaddr *) &bind_addr, sizeof(bind_addr));
-    if (ret < 0)
-    {
-      tcp_close(c->tcp_ctx, fd);
-      return -1;
-    }
-  }
-
-  cn->fd = fd;
-  cn->active = true;
-  cn->connected = false;
-  cn->tx_off = 0;
-  cn->rx_off = 0;
-  cn->wait_events = 0;
-  cn->tx_queued = false;
-  cn->next_tx_tsc = 0.0;
-
-  ret = tcp_connect(c->tcp_ctx, fd,
-      (struct sockaddr *) &c->dst_addr, c->dst_len, SOCK_NONBLOCK);
-  if (ret == 0)
-  {
-    cn->connected = true;
-    c->established_conns++;
-    conn_wait_add(c, cn);
-    return 0;
-  }
-
-  if (errno == EINPROGRESS)
-  {
-    c->pending_conns++;
-    conn_wait_add(c, cn);
-    return 0;
-  }
-
-  tcp_close(c->tcp_ctx, fd);
-  conn_reset(cn);
-  return -1;
-}
-
-static inline int core_open_pending(struct core *c)
-{
-  int started = 0;
-
-  while ((c->established_conns + c->pending_conns) < nconns &&
-      c->pending_conns < mpending)
-  {
-    bool found = false;
-
-    for (int i = 0; i < nconns; i++)
-    {
-      if (c->conns[i].active)
-        continue;
-
-      found = true;
-      if (core_start_conn(c, &c->conns[i]) != 0)
-      {
-        fprintf(stderr, "core %d: connect setup failed: %s\n",
-            c->id, strerror(errno));
-        fflush(stderr);
-      }
-      else
-      {
-        started++;
-      }
-      break;
-    }
-
-    if (!found)
-      break;
-  }
-
-  return started;
-}
-
-static inline int core_finish_pending(struct core *c, struct conn *cn)
-{
-  int ret;
-
-  if (!cn->active || cn->connected)
-    return 0;
-
-  ret = tcp_connect(c->tcp_ctx, cn->fd,
-      (struct sockaddr *) &c->dst_addr, c->dst_len, SOCK_NONBLOCK);
-  if (ret == 0)
-  {
-    cn->connected = true;
-    if (c->pending_conns > 0)
-      c->pending_conns--;
-    c->established_conns++;
-    conn_wait_update(c, cn);
-    return 1;
-  }
-
-  if (errno == EALREADY || errno == EINPROGRESS)
-    return 0;
-
-  core_drop_conn(c, cn, "connect failed", errno);
-  return 1;
-}
-
-static inline void core_connect_all(struct core *c)
-{
-  while (c->established_conns < nconns)
-  {
-    core_open_pending(c);
-    int nevents, progress = 0;
-
-    while (tcp_poll_slow(c->tcp_ctx) > 0)
-      progress = 1;
-    if (tcp_poll_fast(c->tcp_ctx) > 0)
-      progress = 1;
-
-    nevents = tcp_wait(c->wait, c->events, nconns, TCP_WAIT_NONBLOCK);
-    if (nevents < 0)
-    {
-      fprintf(stderr, "core %d: tcp_wait failed: %s\n", c->id, strerror(errno));
-      pthread_exit(-1);
-    }
-
-    for (int i = 0; i < nevents; i++)
-    {
-      struct conn *cn = (struct conn *) c->events[i].data;
-
-      if (cn == NULL || !cn->active || cn->connected || cn->fd != c->events[i].sockfd)
-        continue;
-
-      if ((c->events[i].events &
-              (TCP_WAIT_CONNECTED | TCP_WAIT_OP | TCP_WAIT_CLOSED)) == 0)
-      {
-        continue;
-      }
-
-      progress |= core_finish_pending(c, cn);
-    }
-  }
+  con->ready = 1;
+  c->ready_tail = con->id;
+  c->nready++;
 }
 
 static inline void core_init(struct core *c)
 {
+  int fd, i, nevs;
+  struct conn *conns, *con;
+  struct tcp_wait_event *evs;
+  
   c->tcp_ctx = tcp_ctx_new();
   if (c->tcp_ctx == NULL)
   {
     fprintf(stderr, "core %d: failed to create TCP context\n", c->id);
-    pthread_exit(-1);
+    abort();
   }
 
   c->wait = tcp_wait_new(c->tcp_ctx);
   if (c->wait == NULL)
   {
     fprintf(stderr, "core %d: failed to create TCP wait handle\n", c->id);
-    pthread_exit(-1);
+    abort();
   }
-
-  c->conns = (struct conn *) calloc((size_t) nconns, sizeof(struct conn));
-  c->events = calloc(nconns, sizeof(*c->events));
-  c->txq = calloc(nconns, sizeof(*c->txq));
-  if (c->conns == NULL || c->events == NULL || c->txq == NULL)
+  
+  conns = calloc(nconns, sizeof(struct conn));
+  if (conns == NULL)
   {
-    perror("calloc conn state");
-    pthread_exit(-1);
+    fprintf(stderr, "error allocating connections\n");
+    abort();
   }
-
-  for (int i = 0; i < nconns; i++)
+  c->conns = conns;
+  
+  c->ready_conns = malloc(sizeof(int) * nconns);
+  if (c->ready_conns == NULL)
   {
-    conn_reset(&c->conns[i]);
-    c->conns[i].txbuf = (__u8 *) malloc(msize);
-    c->conns[i].rxbuf = (__u8 *) malloc(msize);
-    if (c->conns[i].txbuf == NULL || c->conns[i].rxbuf == NULL)
+    fprintf(stderr, "error allocating ready conns array");
+    abort();
+  }
+  c->nready = 0;
+  c->ready_head = -1;
+  c->ready_tail = -1;
+  
+  nevs = nconns * 4;
+  evs = calloc(nevs, sizeof(struct tcp_wait_event));
+  if (evs == NULL)
+  {
+    fprintf(stderr, "error allocating rx tcp wait events\n");
+    abort();
+  }
+  c->rx_evs = evs;
+  c->nrx_evs = nevs;
+  
+  for (i = 0; i < nconns; i++)
+  {
+    fd = tcp_socket(c->tcp_ctx);
+    if (fd < 0)
+    {
+      fprintf(stderr, "failed to create socket\n");
+      abort();
+    }
+    set_nonblock(fd);
+  
+    con = &conns[i];
+    con->id = i;
+    con->txbuf = (__u8 *) malloc(msize);
+    con->rxbuf = (__u8 *) malloc(msize);
+    if (con->txbuf == NULL || con->rxbuf == NULL)
     {
       perror("malloc buffers");
-      pthread_exit(-1);
+      pthread_exit((void *) (intptr_t) -1);
     }
-    memset(c->conns[i].txbuf, 0, msize);
-    memset(c->conns[i].rxbuf, 0, msize);
+    memset(con->txbuf, 0, msize);
+    memset(con->rxbuf, 0, msize);
+    
+    con->fd = fd;
+    con->ready = 0;
+    con->tokens  = 0.0;
+    con->connected = 0;
+    con->tx_remain = msize;
+    con->rx_remain = msize;
+    con->next = -1;
+    con->last_tsc = util_rdtsc();
+    conn_rearm(c, con);
   }
-
+  
   c->txb_load_interval = 0;
   c->txp_load_interval = 0;
   c->txb_tp_interval = 0;
   c->txp_tp_interval = 0;
-  c->established_conns = 0;
-  c->pending_conns = 0;
-  c->txq_head = 0;
-  c->txq_tail = 0;
-  c->txq_len = 0;
-  c->tx_interval_tsc = 0.0;
-  c->tx_catchup_tsc = 0.0;
-  c->tx_burst_pkts = 1;
+  c->total_tx_pkts = 0;
+  c->total_rx_pkts = 0;
+  c->nconnected = 0;
+  c->npending = 0;
 }
 
-static inline void core_prepare_tx_schedule(struct core *c, double start_tsc)
+static inline void conn_refill(struct conn *con, __u64 tsc_now)
 {
-  double tsc_per_us = clock_tsc_per_us();
+    double bytes_per_us, delta_cycles, delta_us, max_tokens;
+    
+    delta_cycles = (double) (tsc_now - con->last_tsc);
+    delta_us = delta_cycles / clock_tsc_per_us();
+    assert(delta_us >= 0);
+    bytes_per_us = (rate / 8.0);
+    con->tokens += delta_us * bytes_per_us;
+    
+    /* Cap bucket to 1 ms worth of traffic to avoid unbounded bursts */
+    max_tokens = bytes_per_us * 1000;
+    if (con->tokens > max_tokens)
+      con->tokens = max_tokens;
 
-  c->txq_head = 0;
-  c->txq_tail = 0;
-  c->txq_len = 0;
-  c->tx_interval_tsc = ((double) msize * 8.0 * tsc_per_us) / rate;
-  c->tx_catchup_tsc = 1000.0 * tsc_per_us;
-  if (c->tx_interval_tsc > 0.0)
-  {
-    double burst = c->tx_catchup_tsc / c->tx_interval_tsc;
-
-    if (burst < 1.0)
-      burst = 1.0;
-    if (burst > 256.0)
-      burst = 256.0;
-    c->tx_burst_pkts = (unsigned int) burst;
-  }
-  else
-  {
-    c->tx_burst_pkts = 256;
-  }
-
-  for (int i = 0; i < nconns; i++)
-  {
-    struct conn *cn = &c->conns[i];
-
-    cn->next_tx_tsc = start_tsc;
-    cn->tx_queued = false;
-    if (cn->active && cn->connected)
-      txq_push(c, cn);
-  }
+    con->last_tsc = tsc_now;
 }
 
-static inline void core_tx_conn(struct core *c, struct conn *cn, double now_tsc)
+static inline int conn_tx(struct core *c, struct conn *con)
 {
-  unsigned int sent_pkts = 0;
-
-  if (!cn->active || !cn->connected)
-    return;
-
-  if (cn->tx_off == 0 && c->tx_interval_tsc > 0.0 &&
-      cn->next_tx_tsc < now_tsc - c->tx_catchup_tsc)
+  int ntx, pos;
+  struct payload_hdr *ph;
+  
+  while (con->tokens >= con->tx_remain)
   {
-    cn->next_tx_tsc = now_tsc - c->tx_catchup_tsc;
-  }
-
-  while (cn->active && cn->connected)
-  {
-    int ntx;
-    struct payload_hdr *ph;
-
-    if (cn->tx_off == 0)
+    assert(con->tx_remain != 0);
+    
+    if (con->tx_remain == msize) 
     {
-      if (sent_pkts >= c->tx_burst_pkts || cn->next_tx_tsc > now_tsc)
-        break;
-
-      ph = (struct payload_hdr *) cn->txbuf;
+      ph = (struct payload_hdr *) con->txbuf;
       ph->tsc = util_rdtsc();
     }
-
-    ntx = tcp_sendto(c->tcp_ctx, cn->fd, cn->txbuf + cn->tx_off,
-        msize - cn->tx_off, NULL, 0);
-    if (ntx < 0)
+    
+    pos = msize - con->tx_remain;
+    ntx = tcp_sendto(c->tcp_ctx, con->fd, con->txbuf + pos, 
+      con->tx_remain, NULL, 0);
+    assert(ntx <= 0 || (ntx <= con->tx_remain && ntx <= msize));
+    
+    if (ntx <= 0)
+      return -1;
+      
+    con->tx_remain -= ntx;
+    con->tokens -= ntx;
+    __sync_fetch_and_add(&c->txb_load_interval, ntx);
+    if (con->tx_remain == 0)
     {
-      if (errno == EAGAIN || errno == EWOULDBLOCK)
-        break;
-
-      core_drop_conn(c, cn, "send failed", errno);
-      break;
+      con->tx_remain = msize;
+      c->total_tx_pkts++;
+      __sync_fetch_and_add(&c->txp_load_interval, 1);
     }
-
-    if (ntx == 0)
-    {
-      core_drop_conn(c, cn, "send failed", 0);
-      break;
-    }
-
-    cn->tx_off += (size_t) ntx;
-    if (cn->tx_off < msize)
-      break;
-
-    cn->tx_off = 0;
-    cn->next_tx_tsc += c->tx_interval_tsc;
-    sent_pkts++;
-    cn->total_tx_pkts++;
-    __sync_fetch_and_add(&c->txb_load_interval, msize);
-    __sync_fetch_and_add(&c->txp_load_interval, 1);
   }
+  
+  return 0;
+}
 
-  if (cn->active)
+static inline void core_tx(struct core *c)
+{
+  int i, cid, nready, ret, next;
+  __u64 tsc_now;
+  struct conn *con;
+  
+  nready = c->nready;
+  for (i = 0; i < nready && c->ready_head != -1; i++)
   {
-    conn_wait_update(c, cn);
-    if (cn->tx_off == 0)
-      txq_push(c, cn);
+    cid = c->ready_head;
+    con = &c->conns[cid];
+    next = con->next;
+  
+    /* Remove connection from ready */
+    con->next = -1;
+    con->ready = 0;
+    c->nready--;
+    c->ready_head = next;
+    if (next == -1)
+      c->ready_tail = -1;
+      
+    tsc_now = util_rdtsc();
+    conn_refill(con, tsc_now);
+    ret = conn_tx(c, con);
+    
+    if (ret == 0)
+    {
+      conn_rearm(c, con);
+    }
+    else if (ret < 0)
+    {
+      /* Add to tcp wait */
+      ret = tcp_wait_mod(c->wait, con->fd, 
+          TCP_WAIT_OUT | TCP_WAIT_IN, (__u64) con);
+      if (ret < 0)
+      {
+        fprintf(stderr, "failed to modify conn event to trigger TCP_WAIT_OUT");
+        abort();
+      }
+    }
   }
 }
 
-static inline void core_run_tx(struct core *c, double now_tsc)
+static inline void conn_rx(struct core *c, struct conn *con)
 {
-  struct conn *cn;
-
-  while ((cn = txq_peek(c)) != NULL)
-  {
-    if (!cn->active || !cn->connected)
-    {
-      txq_pop(c);
-      continue;
-    }
-
-    if (cn->tx_off == 0 && cn->next_tx_tsc > now_tsc)
-      break;
-
-    cn = txq_pop(c);
-    core_tx_conn(c, cn, now_tsc);
-  }
-}
-
-static inline void core_rx_conn(struct core *c, struct conn *cn)
-{
+  int nrx, pos;
+  __u64 rtt_us;
+  struct payload_hdr *ph;
+  
   while (1)
   {
-    int nrx;
-    struct payload_hdr *ph;
-    __u64 rtt_us;
-
-    nrx = tcp_recvfrom(c->tcp_ctx, cn->fd, cn->rxbuf + cn->rx_off,
-        msize - cn->rx_off, NULL, 0);
-    if (nrx < 0)
-    {
-      if (errno == EAGAIN || errno == EWOULDBLOCK)
-        break;
-
-      core_drop_conn(c, cn, "recv failed", errno);
+    assert(con->rx_remain != 0);
+    pos = msize - con->rx_remain;
+    nrx = tcp_recvfrom(c->tcp_ctx, con->fd, con->rxbuf + pos, 
+        con->rx_remain, NULL, 0);
+    assert(nrx <= 0 || (nrx <= msize && nrx <= con->rx_remain));
+    
+    if (nrx <= 0)
       break;
-    }
-
-    if (nrx == 0)
+    
+    con->rx_remain -= nrx;
+    __sync_fetch_and_add(&c->txb_tp_interval, nrx);
+    if (con->rx_remain == 0)
     {
-      core_drop_conn(c, cn, "recv failed", 0);
-      break;
+      ph = (struct payload_hdr *) con->rxbuf;
+      rtt_us = us_since_tsc(ph->tsc);
+      c->total_rx_pkts++;
+      con->rx_remain = msize;
+      __sync_fetch_and_add(&c->txp_tp_interval, 1);
+      hist_add(&rtt_hist, rtt_us);
     }
-
-    cn->rx_off += (size_t) nrx;
-    if (cn->rx_off < msize)
-      continue;
-
-    ph = (struct payload_hdr *) cn->rxbuf;
-    rtt_us = us_since_tsc(ph->tsc);
-    cn->rx_off = 0;
-    cn->total_rx_pkts++;
-    __sync_fetch_and_add(&c->txb_tp_interval, msize);
-    __sync_fetch_and_add(&c->txp_tp_interval, 1);
-    hist_add(&rtt_hist, rtt_us);
   }
-
-  if (cn->active)
-    conn_wait_update(c, cn);
 }
 
-static inline int core_process_events(struct core *c, double now_tsc)
+static inline void core_rx(struct core *c)
 {
-  int nevents;
+  int i, ret;
+  __u32 events;
+  struct tcp_wait_event *ev;
+  struct conn *con;
 
-  nevents = tcp_wait_fast(c->wait, c->events, nconns, TCP_WAIT_NONBLOCK);
-  if (nevents < 0)
+  ret = tcp_wait(c->wait, c->rx_evs, c->nrx_evs, TCP_WAIT_NONBLOCK);
+  if (ret < 0)
   {
-    fprintf(stderr, "core %d: tcp_wait_fast failed: %s\n",
-        c->id, strerror(errno));
-    pthread_exit((void *) (intptr_t) -1);
+    fprintf(stderr, "tcp_wait failed\n");
+    abort();
   }
-
-  for (int i = 0; i < nevents; i++)
+  
+  for (i = 0; i < ret; i++)
   {
-    struct tcp_wait_event *ev = &c->events[i];
-    struct conn *cn = (struct conn *) ev->data;
+    ev = &c->rx_evs[i];
+    events = ev->events;
+    con = (struct conn *) ev->data;
 
-    if (cn == NULL || !cn->active || !cn->connected || cn->fd != ev->sockfd)
-      continue;
-
-    if ((ev->events & TCP_WAIT_OUT) != 0)
-      core_tx_conn(c, cn, now_tsc);
-    if ((ev->events & (TCP_WAIT_IN | TCP_WAIT_CLOSED)) != 0)
-      core_rx_conn(c, cn);
+    /* Add connection to ready queue */
+    if (events & TCP_WAIT_OUT)
+    {
+      conn_rearm(c, con);
+      
+      /* Disable TCP_WAIT_OUT events */
+      ret = tcp_wait_mod(c->wait, con->fd, TCP_WAIT_IN, (__u64) con);
+      if (ret < 0)
+      {
+        perror("failed to disable TCP_WAIT_OUT");
+        abort();
+      }
+    }
+     
+    /* Process received bytes */
+    if (events & TCP_WAIT_IN)
+      conn_rx(c, con);
   }
-
-  return nevents;
 }
 
-static inline void wait_for_start(void)
+static void open_conn(struct core *c, struct conn *con)
 {
-  while (now_ns() < t_start_ns)
-    ;
+  int ret;
+  __u32 events;
+  
+  ret = tcp_connect(c->tcp_ctx, con->fd, (struct sockaddr *) &c->dst_addr, 
+      c->dst_len, SOCK_NONBLOCK);
+  if (ret == 0)
+  {
+    /* Connected succesfully */
+    con->connected = 1;
+    c->nconnected++;
+    c->npending--;
+    events = TCP_WAIT_IN | TCP_WAIT_OUT;
+    ret = tcp_wait_add(c->wait, con->fd, events, (__u64) con);
+    if (ret < 0)
+    {
+      fprintf(stderr, "failed to wait for connection event");
+      abort();
+    }
+  }
+  else if (ret == -1 && errno != EINPROGRESS)
+  {
+    /* Failed to connect */
+    fprintf(stderr, "failed to open connection core=%d conn=%d\n", 
+        c->id, con->id);
+    perror("");
+    abort();
+  }
+  else if (ret == -1 && errno == EINPROGRESS)
+  {
+    /* Connection is still pending */
+    c->npending++;
+    events = TCP_WAIT_IN | TCP_WAIT_OUT;
+    ret = tcp_wait_add(c->wait, con->fd, events, (__u64) con);
+    if (ret < 0)
+    {
+      fprintf(stderr, "failed to wait for connection event");
+      abort();
+    }
+  }
+}
+
+static void open_conns(struct core *c)
+{
+  int ret, i;
+  struct conn *con;
+  struct tcp_wait_event evs[mpending];
+  
+  while (c->nconnected != nconns)
+  {
+    /* Open up to max pending conns */
+    while (c->npending < mpending && 
+        (c->npending + c->nconnected) < nconns)
+    {
+      /* Open more connections */
+      con = &c->conns[c->nconnected + c->npending];
+      open_conn(c, con);
+      
+      /* Opened all connections */
+      if (c->nconnected == nconns)
+        return;
+    }
+    
+    /* Wait for new connections to be opened*/
+    tcp_poll_slow(c->tcp_ctx);
+    ret = tcp_wait(c->wait, evs, mpending, TCP_WAIT_CONNECTED);
+    if (ret < 0)
+    {
+      fprintf(stderr, "tcp_wait failed\n");
+      abort();
+    }
+   
+    /* Process connection events */
+    for (i = 0; i < ret; i++)
+    {
+      con = (struct conn *) evs[i].data;
+      assert(!con->connected);
+      con->connected = 1;
+      c->nconnected++;
+      c->npending--;
+      
+      /* Add connection to tcp_wait for tx and rx */
+      ret = tcp_wait_mod(c->wait, con->fd, 
+          TCP_WAIT_IN | TCP_WAIT_OUT, (__u64) con);
+      if (ret < 0)
+      {
+        fprintf(stderr, "tcp_wait_mod failed\n");
+        abort();
+      }
+    }
+  }
 }
 
 static inline void * core_thread(void *arg)
 {
   struct core *c;
   __u64 start_tsc, elapsed;
-  double now_tsc;
 
   c = (struct core *) arg;
-  if (core_list_len > 0)
-  {
-    if (pin_thread_to_core(core_list[c->id + 1]) != 0)
-      pthread_exit(-1);
-  }
-
   core_init(c);
-  core_connect_all(c);
+  
+  /* Open all connections */
+  open_conns(c);
+  fprintf(stderr, "Opened all conns core=%d\n", c->id);
 
+  /* Synchronize start with all other cores and main */
   pthread_barrier_wait(&start_barrier);
-  wait_for_start();
-
   start_tsc = util_rdtsc();
-  core_prepare_tx_schedule(c, start_tsc);
-
-  while (1)
+  
+  while(1)
   {
     elapsed = us_since_tsc(start_tsc);
-    if (elapsed >= (__u64) duration * 1000000ULL)
+    if (duration > 0 && elapsed >= (duration * 1000000))
       break;
 
-    now_tsc = util_rdtsc();
-    core_run_tx(c, now_tsc);
+    /* Send as many packets as tokens allow */
     tcp_poll_fast(c->tcp_ctx);
-    core_process_events(c, util_rdtsc());
-    now_tsc = util_rdtsc();
-    core_run_tx(c, now_tsc);
+    core_tx(c);
+    /* Drain replies */
     tcp_poll_fast(c->tcp_ctx);
-    core_process_events(c, util_rdtsc());
+    core_rx(c);
   }
 
-  pthread_exit(0);
+  pthread_exit((void *) (intptr_t) 0);
 }
 
-static inline void prepare_cores(void)
+static inline void prepare_cores()
 {
-  for (int i = 0; i < ncores; i++)
+  int i;
+  
+  for (i = 0; i < ncores; i++)
   {
     memset(&cores[i], 0, sizeof(struct core));
     cores[i].id = i;
     memset(&cores[i].dst_addr, 0, sizeof(cores[i].dst_addr));
     cores[i].dst_addr.sin_family = AF_INET;
-    cores[i].dst_addr.sin_port = htons((__u16) rem_port);
+    cores[i].dst_addr.sin_port   = htons((__u16) rem_port);
     if (inet_pton(AF_INET, rem_ip, &cores[i].dst_addr.sin_addr) != 1)
     {
       fprintf(stderr, "Invalid rem_ip\n");
@@ -986,11 +686,14 @@ static inline void prepare_cores(void)
   }
 }
 
-static inline void start_cores(void)
+static inline void start_cores()
 {
-  for (int i = 0; i < ncores; i++)
+  int i, rc;
+  
+  /* Spawn core threads */
+  for (i = 0; i < ncores; i++)
   {
-    int rc = pthread_create(&threads[i], NULL, core_thread, &cores[i]);
+    rc = pthread_create(&threads[i], NULL, core_thread, &cores[i]);
     if (rc != 0)
     {
       errno = rc;
@@ -1000,31 +703,31 @@ static inline void start_cores(void)
   }
 }
 
-static inline void init_client(void)
+static inline void init_client()
 {
-  memset(&src_addr, 0, sizeof(src_addr));
   src_addr.sin_family = AF_INET;
   src_addr.sin_port = htons((__u16) src_port);
-  if (should_bind_source())
+  if (inet_pton(AF_INET, src_ip, &src_addr.sin_addr) != 1)
   {
-    if (inet_pton(AF_INET, src_ip, &src_addr.sin_addr) != 1)
-    {
-      fprintf(stderr, "invalid source bind_ip\n");
-      abort();
-    }
+    fprintf(stderr, "invalid source bind_ip\n");
+    abort();
   }
-
+  
+  /* Calibrate tsc */
   calibrate_tsc();
 
-  cores = (struct core *) calloc((size_t) ncores, sizeof(struct core));
+  /* Allocate cores and thread handles */
+  cores = (struct core *) calloc((size_t) ncores, 
+      sizeof(struct core));
   threads = (pthread_t *) calloc((size_t) ncores, sizeof(pthread_t));
   if (!cores || !threads)
   {
     perror("calloc cores/threads");
     exit(EXIT_FAILURE);
   }
-
-  if (pthread_barrier_init(&start_barrier, NULL,
+  
+  /* Barrier for all cores + main (to synchronize start of sending) */
+  if (pthread_barrier_init(&start_barrier, NULL, 
       (unsigned) ncores + 1) != 0)
   {
     perror("pthread_barrier_init");
@@ -1034,116 +737,97 @@ static inline void init_client(void)
 
 int main(int argc, char **argv)
 {
+  int ret;
   __u64 now;
-  __u64 p50 = 0, p99 = 0, p999 = 0;
-  __u64 totalp_tx = 0, totalp_rx = 0;
 
-  if (parse_args(argc, argv) != 0)
+  ret = parse_args(argc, argv);
+  if (ret != 0)
   {
     fprintf(stderr, "failed to parse args\n");
     return EXIT_FAILURE;
   }
 
-  if (init_hist(&rtt_hist, MAX_RTT_US) != 0)
+  ret = init_hist(&rtt_hist, MAX_RTT_US);
+  if (ret != 0)
   {
     fprintf(stderr, "failed to init hist\n");
     return EXIT_FAILURE;
   }
-
+  
   if (tcp_connect_slow() != 0)
   {
     fprintf(stderr, "failed to connect to Chamelio\n");
     return EXIT_FAILURE;
   }
-
+  
   init_client();
   prepare_cores();
-
-  if (core_list_len > 0)
-  {
-    if (pin_thread_to_core(core_list[0]) != 0)
-      return EXIT_FAILURE;
-  }
-
   start_cores();
-
-  printf("Initialized %d core(s), %d connection(s)/core. Waiting for barrier\n",
-      ncores, nconns);
+  
+  /* Wait for work threads before continuing */
+  printf("Initialized %d core(s). Waiting for barrier\n", ncores);
   fflush(stdout);
-
-  t_start_ns = now_ns() + (__u64) (cwait * 1000000000.0);
+  pthread_barrier_wait(&start_barrier);
+  
+  /* Establish timebase and reporting windows */
+  t_start_ns = now_ns();
   t_last_report_ns = t_start_ns;
   t_next_report_ns = t_start_ns + 1000000000ULL;
   t_end_ns = t_start_ns + (__u64) duration * 1000000000ULL;
-
-  pthread_barrier_wait(&start_barrier);
-  wait_for_start();
-
+  
+  /* Per-second reporting loop in main thread */
   while (1)
   {
     now = now_ns();
-    if (now >= t_end_ns)
+    if (duration > 0 && now >= t_end_ns)
       break;
 
     if (now >= t_next_report_ns)
       print_stats(now);
 
-    {
-      struct timespec ts = { .tv_sec = 0, .tv_nsec = 2000000 };
-      nanosleep(&ts, NULL);
-    }
+    /* Sleep a bit to avoid busy wait */
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 2000000 };
+    nanosleep(&ts, NULL);
   }
 
+  /* Join all cores */
   for (int i = 0; i < ncores; i++)
     pthread_join(threads[i], NULL);
 
+  /* One last print if we overshot the tick */
   print_stats(now_ns());
+
+  /* Final summary */
+  __u64 p50 = 0, p99 = 0, p999 = 0;
   hist_percentiles(&rtt_hist, &p50, &p99, &p999);
 
+  /* Sum total sent packets across cores */
+  __u64 totalp_tx = 0, totalp_rx = 0;
   for (int i = 0; i < ncores; i++)
   {
-    for (int j = 0; j < nconns; j++)
-    {
-      totalp_tx += cores[i].conns[j].total_tx_pkts;
-      totalp_rx += cores[i].conns[j].total_rx_pkts;
-    }
+    totalp_tx += cores[i].total_tx_pkts;
+    totalp_rx += cores[i].total_rx_pkts;
   }
 
   printf("Cores               : %d\n", ncores);
-  printf("Connections/core    : %d\n", nconns);
-  printf("Pending/core        : %d\n", mpending);
-  printf("Wait before start   : %.3f s\n", cwait);
   printf("TX packets          : %llu\n", (unsigned long long) totalp_tx);
   printf("RX packets          : %llu\n", (unsigned long long) totalp_rx);
-  printf("Avg Load            : %lld rps %.2f Mb/s\n",
-      (unsigned long long) (totalp_tx / (__u64) duration),
-      ((double) totalp_tx * msize * 8.0 / 1000000.0) / duration);
-  printf("Avg Throughput      : %lld rps %.2f Mb/s\n",
-      (unsigned long long) (totalp_rx / (__u64) duration),
-      ((double) totalp_rx * msize * 8.0 / 1000000.0) / duration);
+  printf("Avg Load            : %lld rps %.2f Mb/s\n", 
+      totalp_tx / duration, 
+      ((double) totalp_tx * msize * 8 / 1000000) / duration);
+  printf("Avg Throughput      : %lld rps %.2f Mb/s\n", 
+      totalp_rx / duration, 
+      ((double) totalp_rx * msize * 8 / 1000000) / duration);
   printf("RTT percentiles (us): p50=%llu  p99=%llu  p99.9=%llu\n",
       (unsigned long long) p50,
       (unsigned long long) p99,
       (unsigned long long) p999);
 
-  for (int i = 0; i < ncores; i++)
-  {
-    if (cores[i].conns != NULL)
-    {
-      for (int j = 0; j < nconns; j++)
-      {
-        if (cores[i].conns[j].fd >= 0)
-          tcp_close(cores[i].tcp_ctx, cores[i].conns[j].fd);
-        free(cores[i].conns[j].txbuf);
-        free(cores[i].conns[j].rxbuf);
-      }
-    }
-    free(cores[i].conns);
-  }
-
-  free(core_list);
+  /* Cleanup */
   free(cores);
   free(threads);
   hist_cleanup(&rtt_hist);
+  pthread_barrier_destroy(&start_barrier);
+
   return 0;
 }
