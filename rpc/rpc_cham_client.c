@@ -419,18 +419,18 @@ static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
     //  fprintf(stderr, "core %d: attempting rpc_call\n", c->id);
     ntx = rpc_call(c->client, ntohl(c->dst_addr.sin_addr.s_addr),
                    ntohs(c->dst_addr.sin_port), 1, c->txbuf, msize);
-    if (c->total_tx_pkts < 10)
-    {
-      fprintf(stderr, "rpc_call ret=%d tokens=%.2f\n", ntx, c->tokens);
-    }
-    if (c->total_tx_pkts < 10)
-    {
-      fprintf(stderr, "rpc_call ret=%d tx_avail=%u tx_len=%u tokens=%.2f\n",
-              ntx,
-              c->client->tx_avail,
-              c->client->tx_len,
-              c->tokens);
-    }
+    // if (c->total_tx_pkts < 10)
+    // {
+    //   fprintf(stderr, "rpc_call ret=%d tokens=%.2f\n", ntx, c->tokens);
+    // }
+    // if (c->total_tx_pkts < 10)
+    // {
+    //   fprintf(stderr, "rpc_call ret=%d tx_avail=%u tx_len=%u tokens=%.2f\n",
+    //           ntx,
+    //           c->client->tx_avail,
+    //           c->client->tx_len,
+    //           c->tokens);
+    // }
     // assert(ntx == msize || ntx <= 0);
     // assert(c->tokens >= msize);
     // fprintf(stderr, "core %d: rpc_call returned %d\n", c->id, ntx);
