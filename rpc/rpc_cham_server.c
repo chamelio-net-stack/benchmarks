@@ -451,10 +451,6 @@ static inline void *core_thread(void *arg)
   }
   rpc_ctx = core_init(c);
 
-  /* Core 0 waits here while others wait in init */
-  if (c->id == 0)
-    pthread_barrier_wait(&start_barrier);
-
   while (1)
   {
     rpc_poll_calls(rpc_ctx);
