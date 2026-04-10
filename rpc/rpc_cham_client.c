@@ -468,8 +468,9 @@ static inline void core_rx(struct rpc_context_lib *rpc_ctx, struct core *c)
 
 static inline struct rpc_context_lib *core_init(struct core *c)
 {
-  // int ret;
+  int ret;
   struct rpc_context_lib *rpc_ctx;
+  struct payload_hdr *ph;
 
   /* Each core has its own RPC context and socket */
   rpc_ctx = rpc_ctx_new();
@@ -516,6 +517,35 @@ static inline struct rpc_context_lib *core_init(struct core *c)
   c->total_tx_pkts = 0;
   c->total_rx_pkts = 0;
   c->tokens = 0.0;
+
+  /* Resolve ARP before the timed run */
+  if (c->id == 0)
+  {
+    ph = (struct payload_hdr *)c->txbuf;
+    ph->tsc = util_rdtsc();
+    ret = rpc_call(c->client, ntohl(c->dst_addr.sin_addr.s_addr),
+                   ntohs(c->dst_addr.sin_port), 1, c->txbuf, msize);
+    if (ret < 0)
+    {
+      fprintf(stderr, "failed to send first RPC ARP warm-up packet\n");
+      pthread_exit((void *)(intptr_t)-1);
+    }
+
+    sleep(1);
+
+    ph->tsc = util_rdtsc();
+    ret = rpc_call(c->client, ntohl(c->dst_addr.sin_addr.s_addr),
+                   ntohs(c->dst_addr.sin_port), 1, c->txbuf, msize);
+    if (ret < 0)
+    {
+      fprintf(stderr, "failed to send second RPC ARP warm-up packet\n");
+      pthread_exit((void *)(intptr_t)-1);
+    }
+
+    sleep(1);
+    fprintf(stderr, "Resolved ARP for RPC benchmark\n");
+  }
+
   return rpc_ctx;
 }
 
