@@ -62,7 +62,7 @@ __u64 t_last_report_ns, t_next_report_ns;
 
 int src_port;
 const char *src_ip;
-static int nworkers;
+static int nworkers = 1;
 static int nservices;
 static __u8 *service_id;
 
@@ -72,6 +72,7 @@ static struct core *cores = NULL;
 struct sockaddr_in src_addr;
 
 struct rpc_context_lib *rpc_ctx;
+static struct rpc_server_lib *rpc_server;
 
 static inline int parse_core_list(const char *arg, int expected_len)
 {
@@ -308,12 +309,15 @@ static inline void print_stats(__u64 now)
 static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
 {
   int ntx;
+  struct rpc_worker_lib *worker;
+
+  worker = &c->rpc_server->workers[0];
 
   while (c->ntx < c->nrx)
   {
     assert(msize <= c->nrx - c->ntx);
-    // ntx = rpc_return();
-    // assert(ntx == msize || ntx < 0);
+    ntx = rpc_return(c->rpc_server, worker->rx_ip, worker->rx_port,
+                     0, c->buf + c->ntx, msize);
 
     if (ntx <= 0)
       break;
@@ -329,18 +333,20 @@ static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
 static inline void core_rx(struct rpc_context_lib *rpc_ctx, struct core *c)
 {
   int nrx;
+  struct rpc_worker_lib *worker;
+
+  worker = &c->rpc_server->workers[0];
 
   while (c->nrx < bsize)
   {
     assert(msize <= bsize - c->nrx);
-    nrx = rpc_handle_call(&c->rpc_server->workers[0], c->buf + c->nrx, msize);
-    // assert(nrx == msize || nrx < 0);
+    nrx = rpc_handle_call(worker, c->buf + c->nrx, msize);
     if (nrx < 0)
       break;
 
-    c->nrx += msize;
+    c->nrx += nrx;
     __sync_fetch_and_add(&c->rxp_interval, 1);
-    __sync_fetch_and_add(&c->rxb_interval, msize);
+    __sync_fetch_and_add(&c->rxb_interval, nrx);
   }
 }
 
@@ -348,10 +354,7 @@ static inline struct rpc_context_lib *core_init(struct core *c)
 {
   __u8 *buf;
   int ret, i;
-  struct rpc_server_lib *rpc_server;
   struct rpc_worker_lib *rpc_workers;
-
-  rpc_server = NULL;
 
   buf = (__u8 *)malloc(bsize);
   if (buf == NULL)
@@ -377,13 +380,25 @@ static inline struct rpc_context_lib *core_init(struct core *c)
     }
 
     fprintf(stderr, "thread %d creating server %s:%d\n", c->id, src_ip, src_port);
-    rpc_server = rpc_new_server(rpc_ctx, ntohl(inet_addr(src_ip)), (__u16)src_port);
+    rpc_server = rpc_new_server(rpc_ctx, ntohl(inet_addr(src_ip)), (__u16)src_port); // sets global
     fflush(stderr);
 
     if (!rpc_server)
     {
       fprintf(stderr, "Failed to create RPC server\n");
       abort();
+    }
+
+    if (nservices == 0)
+    {
+      nservices = 1;
+      service_id = (__u8 *)malloc(sizeof(*service_id));
+      if (!service_id)
+      {
+        perror("malloc service_id");
+        abort();
+      }
+      service_id[0] = 1;
     }
 
     for (i = 0; i < nservices; i++)
@@ -397,7 +412,7 @@ static inline struct rpc_context_lib *core_init(struct core *c)
     }
     fprintf(stdout, "RPC server created & service %u registered.\n", service_id[0]);
 
-    for (i = 1; i < nworkers; i++)
+    for (i = 0; i < nworkers; i++)
     {
       fprintf(stderr, "  Creating RPC worker %d...\n", i);
       rpc_workers = rpc_new_worker(rpc_server);
@@ -444,8 +459,8 @@ static inline void *core_thread(void *arg)
   {
     rpc_poll_calls(rpc_ctx);
     core_rx(rpc_ctx, c);
-    // rpc_poll_calls(rpc_ctx);
-    // core_tx(rpc_ctx, c);
+    rpc_poll_calls(rpc_ctx);
+    core_tx(rpc_ctx, c);
   }
 
   pthread_exit((void *)(intptr_t)0);

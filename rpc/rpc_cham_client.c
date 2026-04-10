@@ -453,17 +453,15 @@ static inline void core_rx(struct rpc_context_lib *rpc_ctx, struct core *c)
 
   while (1)
   {
-    // assert(msize <= msize - c->total_rx_pkts);
-    // nrx = rpc_recv(c->client, c->rxbuf, msize);
-    // assert(nrx == msize || nrx < 0);
+    nrx = rpc_response(c->client, c->rxbuf, msize);
     if (nrx < 0)
       break;
 
     ph = (struct payload_hdr *)c->rxbuf;
     rtt_us = us_since_tsc(ph->tsc);
     c->total_rx_pkts += 1;
-    __sync_fetch_and_add(&c->txp_load_interval, 1);
-    __sync_fetch_and_add(&c->txb_load_interval, msize);
+    __sync_fetch_and_add(&c->txp_tp_interval, 1);
+    __sync_fetch_and_add(&c->txb_tp_interval, nrx);
     hist_add(rtt_us);
   }
 }
@@ -571,8 +569,8 @@ static inline void *core_thread(void *arg)
     /* Send as many packets as tokens allow */
     core_tx(rpc_ctx, c);
     /* Drain replies */
-    // rpc_poll_calls(rpc_ctx);
-    // core_rx(rpc_ctx, c);
+    rpc_poll_calls(rpc_ctx);
+    core_rx(rpc_ctx, c);
   }
 
   pthread_exit((void *)(intptr_t)0);
