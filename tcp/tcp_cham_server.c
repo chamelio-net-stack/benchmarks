@@ -402,8 +402,10 @@ static inline void * core_thread(void *arg)
   while (1)
   {
     tcp_poll_fast(c->tcp_ctx);
+    tcp_poll_slow(c->tcp_ctx);
     ret = tcp_wait(c->wait, c->evs, max_events, 0);
     tcp_poll_fast(c->tcp_ctx);
+    tcp_poll_slow(c->tcp_ctx);
     if (ret < 0)
     {
       perror("tcp_wait failed\n");
