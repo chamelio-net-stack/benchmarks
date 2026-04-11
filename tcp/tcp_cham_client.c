@@ -489,7 +489,11 @@ static inline void core_rx(struct core *c)
   struct tcp_wait_event *ev;
   struct conn *con;
 
+  tcp_poll_fast(c->tcp_ctx);
+  tcp_poll_slow(c->tcp_ctx);
   ret = tcp_wait(c->wait, c->rx_evs, c->nrx_evs, TCP_WAIT_NONBLOCK);
+  tcp_poll_fast(c->tcp_ctx);
+  tcp_poll_slow(c->tcp_ctx);
   if (ret < 0)
   {
     fprintf(stderr, "tcp_wait failed\n");
@@ -642,10 +646,8 @@ static inline void * core_thread(void *arg)
       break;
 
     /* Send as many packets as tokens allow */
-    tcp_poll_fast(c->tcp_ctx);
     core_tx(c);
     /* Drain replies */
-    tcp_poll_fast(c->tcp_ctx);
     core_rx(c);
   }
 
