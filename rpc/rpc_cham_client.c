@@ -416,24 +416,11 @@ static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
     ph->tsc = util_rdtsc();
 
     // TODO: remove the hardcoded service_id
-    //  fprintf(stderr, "core %d: attempting rpc_call\n", c->id);
     ntx = rpc_call(c->client, ntohl(c->dst_addr.sin_addr.s_addr),
                    ntohs(c->dst_addr.sin_port), 1, c->txbuf, msize);
-    // if (c->total_tx_pkts < 10)
-    // {
-    //   fprintf(stderr, "rpc_call ret=%d tokens=%.2f\n", ntx, c->tokens);
-    // }
-    // if (c->total_tx_pkts < 10)
-    // {
-    //   fprintf(stderr, "rpc_call ret=%d tx_avail=%u tx_len=%u tokens=%.2f\n",
-    //           ntx,
-    //           c->client->tx_avail,
-    //           c->client->tx_len,
-    //           c->tokens);
-    // }
+  
     // assert(ntx == msize || ntx <= 0);
     // assert(c->tokens >= msize);
-    // fprintf(stderr, "core %d: rpc_call returned %d\n", c->id, ntx);
 
     if (ntx < 0)
       break;
@@ -569,9 +556,6 @@ static inline void *core_thread(void *arg)
 
   while (1)
   {
-      // fprintf(stderr, "loop: rpc_ctx=%p fast_app_qs=%p fast_app_qs[0]=%p\n",
-      //     rpc_ctx, rpc_ctx->fast_app_qs, rpc_ctx->fast_app_qs[0]);
-
     elapsed = us_since_tsc(start_tsc);
     if (duration > 0 && elapsed >= (duration * 1000000))
       break;
@@ -583,9 +567,6 @@ static inline void *core_thread(void *arg)
     assert(delta_us >= 0);
     bytes_per_us = (c->rate / 8.0);
     c->tokens += delta_us * bytes_per_us;
-
-    // fprintf(stderr, "tokens=%.2f msize=%zu delta_us=%.2f\n",
-    // c->tokens, msize, delta_us);
 
     /* Cap bucket to 1 ms worth of traffic to avoid unbounded bursts */
     max_tokens = bytes_per_us * 1000;
@@ -726,84 +707,5 @@ int main(int argc, char **argv)
   free(rtt_hist);
   pthread_barrier_destroy(&start_barrier);
 
-  //   memset(&src_addr, 0, sizeof(src_addr));
-  //   src_addr.sin_family = AF_INET;
-  //   src_addr.sin_port   = htons((__u16) src_port);
-
-  //   if (inet_pton(AF_INET, src_ip, &src_addr.sin_addr) != 1) {
-  //       fprintf(stderr, "Invalid bind_ip\n");
-  //       abort();
-  //   }
-
-  //   ret = rpc_connect_slow();
-  //   if (ret != 0)
-  //       abort();
-
-  //   rpc_ctx = rpc_ctx_new();
-  //   if (rpc_ctx == NULL) {
-  //       fprintf(stderr, "Failed to create RPC context\n");
-  //       abort();
-  //   }
-  //   rpc_client = rpc_new_client(rpc_ctx,
-  //       ntohl(src_addr.sin_addr.s_addr), src_port);
-  //   if (rpc_client == NULL) {
-  //       fprintf(stderr, "Failed to create RPC client\n");
-  //       abort();
-  //   }
-  //   printf("Client created successfully.\n");
-  //   printf("  core        : %u\n", rpc_client->core);
-  //   printf("  rx_ip       : %u\n", rpc_client->rx_ip);
-  //   printf("  rx_port     : %u\n", rpc_client->rx_port);
-  //   printf("  tx_ip       : %u\n", rpc_client->tx_ip);
-
-  //   __u64 pkts = 0;
-  //   __u64 bytes = 0;
-  //   __u64 last = now_ns();
-  //   __u64 next = last + 1000000000ULL;
-  //   const char *SERVER_IP_STR = "192.168.11.11";
-  //   struct in_addr ina;
-  //   if (inet_pton(AF_INET, SERVER_IP_STR, &ina) != 1) {
-  //       fprintf(stderr, "Invalid server IP\n");
-  //       abort();
-  //   }
-
-  //   __u8 *buf = (__u8 *)malloc(msize);
-  //   if (!buf) {
-  //       perror("malloc buf");
-  //       return 1;
-  //   }
-  //   while (1)
-  //   {
-  //   int ret = rpc_call(rpc_client,ina.s_addr, 1002,
-  //                      (__u16)1, buf, msize);
-
-  //   if (ret < 0) {
-  //     /* If your rpc_call returns -1 on backpressure, you can just continue.
-  //      * For debugging, print occasionally:
-  //      */
-  //     // fprintf(stderr, "rpc_call returned -1\n");
-  //     continue;
-  //   }
-
-  //   pkts++;
-  //   bytes += msize;
-
-  //   __u64 now = now_ns();
-  //   if (now >= next) {
-  //     double sec = (double)(now - last) / 1e9;
-  //     if (sec <= 0.0) sec = 1.0;
-
-  //     double pps = (double)pkts / sec;
-  //     double mbps = ((double)bytes * 8.0 / 1e6) / sec;
-
-  //     printf("tx=%.0f pps | tx=%.2f Mb/s\n", pps, mbps);
-  //     fflush(stdout);
-
-  //     pkts = 0;
-  //     bytes = 0;
-  //     last = now;
-  //     next = now + 1000000000ULL;
-  //   }
-  // }
   return 0;
 }
