@@ -455,7 +455,8 @@ static inline void core_rx(struct rpc_context_lib *rpc_ctx, struct core *c)
 
 static inline struct rpc_context_lib *core_init(struct core *c)
 {
-  int ret;
+  int ret, nrx, attempt;
+  __u64 start_ns;
   struct rpc_context_lib *rpc_ctx;
   struct payload_hdr *ph;
 
@@ -497,6 +498,51 @@ static inline struct rpc_context_lib *core_init(struct core *c)
           c->client->rx_port,
           c->client->tx_ip);
 
+  /* Resolve ARP before the timed run */
+  if (c->id == 0)
+  {
+    for (attempt = 0; attempt < 2; attempt++)
+    {
+      ph = (struct payload_hdr *)c->txbuf;
+      ph->tsc = util_rdtsc();
+      ret = rpc_call(c->client, ntohl(c->dst_addr.sin_addr.s_addr),
+                     ntohs(c->dst_addr.sin_port), 1, c->txbuf, msize);
+      if (ret < 0)
+      {
+        fprintf(stderr, "failed to send RPC ARP warm-up packet\n");
+        pthread_exit((void *)(intptr_t)-1);
+      }
+
+      sleep(1);
+
+      start_ns = now_ns();
+      while (now_ns() - start_ns < 1000000000ULL)
+      {
+        rpc_poll_calls(rpc_ctx);
+        nrx = rpc_response(c->client, c->rxbuf, msize);
+        if (nrx >= 0)
+          break;
+        if (errno != EAGAIN)
+        {
+          fprintf(stderr, "failed to receive RPC ARP warm-up reply\n");
+          pthread_exit((void *)(intptr_t)-1);
+        }
+        usleep(1000);
+      }
+
+      if (nrx >= 0)
+        break;
+    }
+
+    if (nrx < 0)
+    {
+      fprintf(stderr, "failed to complete RPC ARP warm-up\n");
+      pthread_exit((void *)(intptr_t)-1);
+    }
+
+    fprintf(stderr, "Resolved ARP for RPC benchmark\n");
+  }
+
   c->txb_load_interval = 0;
   c->txp_load_interval = 0;
   c->txb_tp_interval = 0;
@@ -504,34 +550,6 @@ static inline struct rpc_context_lib *core_init(struct core *c)
   c->total_tx_pkts = 0;
   c->total_rx_pkts = 0;
   c->tokens = 0.0;
-
-  /* Resolve ARP before the timed run */
-  if (c->id == 0)
-  {
-    ph = (struct payload_hdr *)c->txbuf;
-    ph->tsc = util_rdtsc();
-    ret = rpc_call(c->client, ntohl(c->dst_addr.sin_addr.s_addr),
-                   ntohs(c->dst_addr.sin_port), 1, c->txbuf, msize);
-    if (ret < 0)
-    {
-      fprintf(stderr, "failed to send first RPC ARP warm-up packet\n");
-      pthread_exit((void *)(intptr_t)-1);
-    }
-
-    sleep(1);
-
-    ph->tsc = util_rdtsc();
-    ret = rpc_call(c->client, ntohl(c->dst_addr.sin_addr.s_addr),
-                   ntohs(c->dst_addr.sin_port), 1, c->txbuf, msize);
-    if (ret < 0)
-    {
-      fprintf(stderr, "failed to send second RPC ARP warm-up packet\n");
-      pthread_exit((void *)(intptr_t)-1);
-    }
-
-    sleep(1);
-    fprintf(stderr, "Resolved ARP for RPC benchmark\n");
-  }
 
   return rpc_ctx;
 }
