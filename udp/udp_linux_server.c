@@ -15,6 +15,7 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/epoll.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -26,6 +27,9 @@
 struct core {
   int id;
   int fd;
+  int ep_fd;
+  __u32 ep_events;
+  struct epoll_event event;
   int nrx;
   int ntx;
   __u8 *buf;
@@ -160,10 +164,42 @@ static void set_nonblock(int fd)
   }
 }
 
+static inline __u32 core_epoll_events(struct core *c)
+{
+  __u32 events = EPOLLERR | EPOLLHUP;
+
+  if (c->nrx + (int) msize <= (int) bsize)
+    events |= EPOLLIN;
+  if (c->ntx < c->nrx)
+    events |= EPOLLOUT;
+
+  return events;
+}
+
+static inline void core_epoll_update(struct core *c)
+{
+  struct epoll_event ev;
+  __u32 events = core_epoll_events(c);
+
+  if (c->ep_events == events)
+    return;
+
+  ev.data.ptr = c;
+  ev.events = events;
+  if (epoll_ctl(c->ep_fd, EPOLL_CTL_MOD, c->fd, &ev) < 0)
+  {
+    perror("epoll_ctl");
+    abort();
+  }
+
+  c->ep_events = events;
+}
+
 static inline void core_init(struct core *c)
 {
   __u8 *buf;
   int ret, fd, opt;
+  struct epoll_event ev;
 
   buf = (__u8 *) malloc(bsize);
   if (buf == NULL)
@@ -215,15 +251,31 @@ static inline void core_init(struct core *c)
   c->rxp_interval = 0;
   c->txb_interval = 0;
   c->txp_interval = 0;
+
+  c->ep_fd = epoll_create(1);
+  if (c->ep_fd < 0)
+  {
+    perror("epoll_create");
+    abort();
+  }
+
+  c->ep_events = core_epoll_events(c);
+  ev.data.ptr = c;
+  ev.events = c->ep_events;
+  if (epoll_ctl(c->ep_fd, EPOLL_CTL_ADD, c->fd, &ev) < 0)
+  {
+    perror("epoll_ctl");
+    abort();
+  }
 }
 
 static inline void core_rx(struct core *c)
 {
   int nrx;
   
-  while (c->nrx < bsize)
+  while (c->nrx + (int) msize <= (int) bsize)
   {
-    assert(msize <= bsize - c->nrx);
+    assert(msize <= (size_t) ((int) bsize - c->nrx));
     nrx = recvfrom(c->fd, c->buf + c->nrx, msize, 0,
         (struct sockaddr *) &c->dst_addr, &c->dst_len);
     assert(nrx == msize || nrx < 0);
@@ -235,6 +287,8 @@ static inline void core_rx(struct core *c)
     __sync_fetch_and_add(&c->rxp_interval, 1);
     __sync_fetch_and_add(&c->rxb_interval, msize);
   }
+
+  core_epoll_update(c);
 }
 
 static inline void core_tx(struct core *c)
@@ -256,13 +310,19 @@ static inline void core_tx(struct core *c)
     __sync_fetch_and_add(&c->txb_interval, msize);
   }
   
-  c->ntx = 0;
-  c->nrx = 0;
+  if (c->ntx == c->nrx)
+  {
+    c->ntx = 0;
+    c->nrx = 0;
+  }
+
+  core_epoll_update(c);
 }
 
 static inline void * core_thread(void *arg)
 {
   struct core *c;
+  int ret;
   
   c = (struct core *) arg;
   core_init(c);
@@ -273,8 +333,26 @@ static inline void * core_thread(void *arg)
 
   while (1)
   {
-    core_rx(c);
-    core_tx(c);
+    ret = epoll_wait(c->ep_fd, &c->event, 1, -1);
+    if (ret < 0)
+    {
+      perror("epoll_wait");
+      abort();
+    }
+
+    if ((c->event.events & (EPOLLERR | EPOLLHUP)) != 0)
+    {
+      fprintf(stderr, "udp server socket error\n");
+      abort();
+    }
+
+    if ((c->event.events & EPOLLOUT) != 0)
+      core_tx(c);
+    if ((c->event.events & EPOLLIN) != 0)
+    {
+      core_rx(c);
+      core_tx(c);
+    }
   }
   
 

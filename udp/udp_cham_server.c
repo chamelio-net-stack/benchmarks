@@ -30,6 +30,7 @@ struct core {
   int fd;
   struct udp_wait *wait;
   struct udp_wait_event event;
+  __u32 wait_events;
   int nrx;
   int ntx;
   __u8 *buf;
@@ -62,8 +63,10 @@ struct sockaddr_in src_addr;
 
 static inline __u32 core_wait_events(struct core *c)
 {
-  __u32 events = UDP_WAIT_IN;
+  __u32 events = 0;
 
+  if (c->nrx + (int) msize <= (int) bsize)
+    events |= UDP_WAIT_IN;
   if (c->ntx < c->nrx)
     events |= UDP_WAIT_OUT;
 
@@ -72,8 +75,14 @@ static inline __u32 core_wait_events(struct core *c)
 
 static inline void core_wait_update(struct core *c)
 {
-  if (udp_wait_mod(c->wait, c->fd, core_wait_events(c), 0) != 0)
+  __u32 events = core_wait_events(c);
+
+  if (c->wait_events == events)
+    return;
+
+  if (udp_wait_mod(c->wait, c->fd, events, 0) != 0)
     abort();
+  c->wait_events = events;
 }
 
 static inline int parse_core_list(const char *arg, int expected_len)
@@ -317,7 +326,8 @@ static inline struct udp_context_lib * core_init(struct core *c)
   c->wait = udp_wait_new(udp_ctx);
   if (c->wait == NULL)
     abort();
-  if (udp_wait_add(c->wait, c->fd, core_wait_events(c), 0) != 0)
+  c->wait_events = core_wait_events(c);
+  if (udp_wait_add(c->wait, c->fd, c->wait_events, 0) != 0)
     abort();
   return udp_ctx;
 }
@@ -326,9 +336,9 @@ static inline void core_rx(struct udp_context_lib *udp_ctx, struct core *c)
 {
   int nrx;
   
-  while (c->nrx < bsize)
+  while (c->nrx + (int) msize <= (int) bsize)
   {
-    assert(msize <= bsize - c->nrx);
+    assert(msize <= (size_t) ((int) bsize - c->nrx));
     nrx = udp_recvfrom(udp_ctx, c->fd, c->buf + c->nrx, msize, 
         (struct sockaddr *) &c->dst_addr, sizeof(c->dst_addr));
     assert(nrx == msize || nrx <= 0);
@@ -363,8 +373,11 @@ static inline void core_tx(struct udp_context_lib *udp_ctx, struct core *c)
     __sync_fetch_and_add(&c->txb_interval, msize);
   }
   
-  c->ntx = 0;
-  c->nrx = 0;
+  if (c->ntx == c->nrx)
+  {
+    c->ntx = 0;
+    c->nrx = 0;
+  }
   core_wait_update(c);
 }
 
@@ -396,12 +409,13 @@ static inline void * core_thread(void *arg)
     if (nevents == 0)
       continue;
 
-    if ((c->event.events & UDP_WAIT_IN) != 0)
-      core_rx(udp_ctx, c);
-    if (c->ntx < c->nrx &&
-        (((c->event.events & UDP_WAIT_OUT) != 0) ||
-         ((c->event.events & UDP_WAIT_IN) != 0)))
+    if ((c->event.events & UDP_WAIT_OUT) != 0)
       core_tx(udp_ctx, c);
+    if ((c->event.events & UDP_WAIT_IN) != 0)
+    {
+      core_rx(udp_ctx, c);
+      core_tx(udp_ctx, c);
+    }
   }
   
 

@@ -18,6 +18,7 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/epoll.h>
 #include <stdio.h>
 #include <time.h>
 #include <stdbool.h>
@@ -36,6 +37,9 @@ struct payload_hdr {
 struct core {
   int id;
   int fd;
+  int ep;
+  __u32 ep_events;
+  struct epoll_event event;
   __u8 *txbuf;
   __u8 *rxbuf;
   struct sockaddr_in dst_addr;
@@ -49,6 +53,7 @@ struct core {
   double rate;
   double tokens;
   __u64 last_tsc;
+  __u8 tx_blocked;
 };
 
 /* Default arg values */
@@ -219,9 +224,39 @@ static void set_nonblock(int fd)
   }
 }
 
+static inline __u32 core_epoll_events(struct core *c)
+{
+  __u32 events = EPOLLIN | EPOLLERR | EPOLLHUP;
+
+  if (c->tx_blocked)
+    events |= EPOLLOUT;
+
+  return events;
+}
+
+static inline void core_epoll_update(struct core *c)
+{
+  struct epoll_event ev;
+  __u32 events = core_epoll_events(c);
+
+  if (c->ep_events == events)
+    return;
+
+  ev.data.ptr = c;
+  ev.events = events;
+  if (epoll_ctl(c->ep, EPOLL_CTL_MOD, c->fd, &ev) < 0)
+  {
+    perror("epoll_ctl");
+    abort();
+  }
+
+  c->ep_events = events;
+}
+
 static inline void core_init(struct core *c)
 {
   int ret, fd;
+  struct epoll_event ev;
   
   fd = socket(AF_INET, SOCK_DGRAM, 0);
   if (fd < 0)
@@ -259,12 +294,32 @@ static inline void core_init(struct core *c)
   c->total_tx_pkts = 0;
   c->total_rx_pkts = 0;
   c->tokens  = 0.0;
+  c->tx_blocked = 0;
+
+  c->ep = epoll_create(1);
+  if (c->ep < 0)
+  {
+    perror("epoll_create");
+    abort();
+  }
+
+  c->ep_events = core_epoll_events(c);
+  ev.data.ptr = c;
+  ev.events = c->ep_events;
+  if (epoll_ctl(c->ep, EPOLL_CTL_ADD, c->fd, &ev) < 0)
+  {
+    perror("epoll_ctl");
+    abort();
+  }
 }
 
 static inline void core_tx(struct core *c)
 {
   int ntx;
   struct payload_hdr *ph;
+
+  if (c->tx_blocked)
+    return;
   
   while (c->tokens >= (double) msize)
   {
@@ -277,7 +332,11 @@ static inline void core_tx(struct core *c)
     assert(c->tokens >= msize);
     
     if (ntx < 0)
-      break;
+    {
+      c->tx_blocked = 1;
+      core_epoll_update(c);
+      return;
+    }
       
     c->tokens -= msize;
     c->total_tx_pkts++;
@@ -288,9 +347,34 @@ static inline void core_tx(struct core *c)
 
 static inline void core_rx(struct core *c)
 {
+  int ret;
   int nrx;
   __u64 rtt_us;
   struct payload_hdr *ph;
+
+  ret = epoll_wait(c->ep, &c->event, 1, 0);
+  if (ret < 0)
+  {
+    perror("epoll_wait");
+    abort();
+  }
+  if (ret == 0)
+    return;
+
+  if ((c->event.events & (EPOLLERR | EPOLLHUP)) != 0)
+  {
+    fprintf(stderr, "udp client socket error\n");
+    abort();
+  }
+
+  if ((c->event.events & EPOLLOUT) != 0 && c->tx_blocked)
+  {
+    c->tx_blocked = 0;
+    core_epoll_update(c);
+  }
+
+  if ((c->event.events & EPOLLIN) == 0)
+    return;
 
   while (1)
   {

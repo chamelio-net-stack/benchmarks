@@ -40,6 +40,7 @@ struct core {
   int fd;
   struct udp_wait *wait;
   struct udp_wait_event event;
+  __u32 wait_events;
   __u8 *txbuf;
   __u8 *rxbuf;
   struct sockaddr_in dst_addr;
@@ -53,6 +54,7 @@ struct core {
   double rate;
   double tokens;
   __u64 last_tsc;
+  __u8 tx_blocked;
 };
 
 /* Default arg values */
@@ -85,18 +87,19 @@ static struct hist_state rtt_hist = { 0 };
 
 static inline __u32 core_wait_events(struct core *c)
 {
-  __u32 events = UDP_WAIT_IN;
-
-  if (c->tokens >= (double) msize)
-    events |= UDP_WAIT_OUT;
-
-  return events;
+  return UDP_WAIT_IN | (c->tx_blocked ? UDP_WAIT_OUT : 0);
 }
 
 static inline void core_wait_update(struct core *c)
 {
-  if (udp_wait_mod(c->wait, c->fd, core_wait_events(c), 0) != 0)
+  __u32 events = core_wait_events(c);
+
+  if (c->wait_events == events)
+    return;
+
+  if (udp_wait_mod(c->wait, c->fd, events, 0) != 0)
     abort();
+  c->wait_events = events;
 }
 
 static inline int parse_core_list(const char *arg, int expected_len)
@@ -375,10 +378,12 @@ static inline struct udp_context_lib * core_init(struct core *c)
   c->total_tx_pkts = 0;
   c->total_rx_pkts = 0;
   c->tokens  = 0.0;
+  c->tx_blocked = 0;
   c->wait = udp_wait_new(udp_ctx);
   if (c->wait == NULL)
     abort();
-  if (udp_wait_add(c->wait, c->fd, core_wait_events(c), 0) != 0)
+  c->wait_events = core_wait_events(c);
+  if (udp_wait_add(c->wait, c->fd, c->wait_events, 0) != 0)
     abort();
   return udp_ctx;
 }
@@ -387,6 +392,9 @@ static inline void core_tx(struct udp_context_lib *udp_ctx, struct core *c)
 {
   int ntx;
   struct payload_hdr *ph;
+
+  if (c->tx_blocked)
+    return;
   
   while (c->tokens >= (double) msize)
   {
@@ -399,22 +407,41 @@ static inline void core_tx(struct udp_context_lib *udp_ctx, struct core *c)
     assert(c->tokens >= msize);
     
     if (ntx < 0)
-      break;
+    {
+      c->tx_blocked = 1;
+      core_wait_update(c);
+      return;
+    }
       
     c->tokens -= msize;
     c->total_tx_pkts++;
     __sync_fetch_and_add(&c->txb_load_interval, ntx);
     __sync_fetch_and_add(&c->txp_load_interval, 1);
   }
-
-  core_wait_update(c);
 }
 
 static inline void core_rx(struct udp_context_lib *udp_ctx, struct core *c)
 {
+  int nevents;
   int nrx;
   __u64 rtt_us;
   struct payload_hdr *ph;
+
+  udp_poll_fast(udp_ctx);
+  nevents = udp_wait_fast(c->wait, &c->event, 1, UDP_WAIT_NONBLOCK);
+  if (nevents < 0)
+    abort();
+  if (nevents == 0)
+    return;
+
+  if ((c->event.events & UDP_WAIT_OUT) != 0 && c->tx_blocked)
+  {
+    c->tx_blocked = 0;
+    core_wait_update(c);
+  }
+
+  if ((c->event.events & UDP_WAIT_IN) == 0)
+    return;
 
   while (1)
   {
@@ -431,8 +458,6 @@ static inline void core_rx(struct udp_context_lib *udp_ctx, struct core *c)
     __sync_fetch_and_add(&c->txp_tp_interval, 1);
     hist_add(&rtt_hist, rtt_us);
   }
-
-  core_wait_update(c);
 }
 
 static inline void * core_thread(void *arg)
@@ -457,8 +482,6 @@ static inline void * core_thread(void *arg)
   
   while(1)
   {
-    int nevents;
-
     elapsed = us_since_tsc(start_tsc);
     if (duration > 0 && elapsed >= (duration * 1000000))
       break;
@@ -478,18 +501,8 @@ static inline void * core_thread(void *arg)
 
     c->last_tsc = tsc_now;
 
-    core_wait_update(c);
-    udp_poll_fast(udp_ctx);
-    nevents = udp_wait_fast(c->wait, &c->event, 1, UDP_WAIT_NONBLOCK);
-    if (nevents < 0)
-      abort();
-    if (nevents == 0)
-      continue;
-
-    if ((c->event.events & UDP_WAIT_OUT) != 0)
-      core_tx(udp_ctx, c);
-    if ((c->event.events & UDP_WAIT_IN) != 0)
-      core_rx(udp_ctx, c);
+    core_tx(udp_ctx, c);
+    core_rx(udp_ctx, c);
   }
 
   pthread_exit((void *) (intptr_t) 0);
