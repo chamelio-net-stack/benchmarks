@@ -326,14 +326,18 @@ static inline void conn_rx(struct core *c, struct conn *con)
 static inline void conn_tx(struct core *c, 
     struct conn *con, struct epoll_event *ev)
 {
-  int ntx, ret;
+  int ntx, ret, tx_len;
 
   while (con->ntx < con->nrx)
   {
     assert(con->tx_remain != 0);
-    ntx = sendto(con->fd, con->buf + con->ntx, con->tx_remain, 0,
+    tx_len = con->nrx - con->ntx;
+    if (tx_len > con->tx_remain)
+      tx_len = con->tx_remain;
+
+    ntx = sendto(con->fd, con->buf + con->ntx, tx_len, 0,
         (struct sockaddr *) &c->dst_addr, c->dst_len);
-    assert(ntx <= 0 || (ntx <= msize && ntx <= con->tx_remain));
+    assert(ntx <= 0 || (ntx <= msize && ntx <= tx_len));
           
     if (ntx <= 0)
     {
