@@ -28,6 +28,19 @@
 #include "services.h"
 #include <stdint.h>
 
+/* Sentinel value meaning "this sent_rids slot is empty".
+ * UINT32_MAX is safe because next_rid wraps at 2^32 and the library
+ * uses __sync_fetch_and_add so it will never naturally produce UINT32_MAX
+ * as the first value seen during a short benchmark run. */
+#define RID_SLOT_EMPTY UINT32_MAX
+
+/* next_rid is global across all cores, so RIDs assigned to a single core
+ * are not consecutive — they can be any value in the global sequence.
+ * RID_TABLE_SIZE must be large enough that two in-flight RIDs from the
+ * same core never collide under % RID_TABLE_SIZE.
+ * 65536 entries = 256 KB, far beyond any realistic in-flight window. */
+#define RID_TABLE_SIZE 65536
+
 struct payload_hdr
 {
   __u64 tsc;
@@ -53,12 +66,12 @@ struct core
   __u64 last_tsc;
   __u64 prng_state; /* xorshift64 state for operand generation */
 
-  /* Circular buffer of sent RIDs — indexed by (rid % MAX_PENDING_RPC).
+  /* Circular buffer of sent RIDs — indexed by (rid % RID_TABLE_SIZE).
    * Filled in core_tx immediately after rpc_call; checked in core_rx. */
-  /* sent RIDs indexed by (rid % MAX_PENDING_RPC).
+  /* sent RIDs indexed by (rid % RID_TABLE_SIZE).
    * Filled in core_tx after rpc_call; checked and cleared in core_rx.
    * Empty slots hold RID_SLOT_EMPTY to distinguish from valid RID 0. */
-  __u32 sent_rids[MAX_PENDING_RPC];
+  __u32 sent_rids[RID_TABLE_SIZE];
 };
 
 /* Default arg values */
@@ -89,12 +102,6 @@ static __u64 *rtt_hist = NULL;
 
 /* Clamp histogram at 1 second */
 #define MAX_RTT_US 1000000u
-
-/* Sentinel value meaning "this sent_rids slot is empty".
- * UINT32_MAX is safe because next_rid wraps at 2^32 and the library
- * uses __sync_fetch_and_add so it will never naturally produce UINT32_MAX
- * as the first value seen during a short benchmark run. */
-#define RID_SLOT_EMPTY UINT32_MAX
 
 static pthread_barrier_t start_barrier;
 static pthread_t *threads = NULL;
@@ -478,7 +485,7 @@ static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
       break;
 
     /* record sent RID indexed by RID value, not position */
-    c->sent_rids[c->client->last_sent_rid % MAX_PENDING_RPC] = c->client->last_sent_rid;
+    c->sent_rids[c->client->last_sent_rid % RID_TABLE_SIZE] = c->client->last_sent_rid;
 
     c->tokens -= msize;
     c->total_tx_pkts++;
@@ -501,10 +508,10 @@ static inline void core_rx(struct rpc_context_lib *rpc_ctx, struct core *c)
 
     /* verify RID by looking up the slot the sent RID was stored in */
     __u32 recv_rid = c->client->last_recv_rid;
-    if (c->sent_rids[recv_rid % MAX_PENDING_RPC] != recv_rid)
+    if (c->sent_rids[recv_rid % RID_TABLE_SIZE] != recv_rid)
       c->rid_mismatches++;
     else
-      c->sent_rids[recv_rid % MAX_PENDING_RPC] = RID_SLOT_EMPTY; /* clear matched slot */
+      c->sent_rids[recv_rid % RID_TABLE_SIZE] = RID_SLOT_EMPTY; /* clear matched slot */
 
     /* tsc is at offset 0 in every service payload */
     ph = (struct payload_hdr *)c->rxbuf;
@@ -622,7 +629,7 @@ static inline struct rpc_context_lib *core_init(struct core *c)
   c->prng_state = 0xdeadbeef12345678ULL ^ ((__u64)c->id + 1);
 
   /* mark all slots empty — distinguishes "unsent" from valid RID 0 */
-  for (int i = 0; i < MAX_PENDING_RPC; i++)
+  for (int i = 0; i < RID_TABLE_SIZE; i++)
     c->sent_rids[i] = RID_SLOT_EMPTY;
 
   return rpc_ctx;
