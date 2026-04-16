@@ -54,9 +54,9 @@ struct core
 
   /* Circular buffer of sent RIDs — indexed by (rid % MAX_PENDING_RPC).
    * Filled in core_tx immediately after rpc_call; checked in core_rx. */
+  /* sent RIDs indexed by (rid % MAX_PENDING_RPC).
+   * Filled in core_tx after rpc_call; checked and cleared in core_rx. */
   __u32 sent_rids[MAX_PENDING_RPC];
-  __u32 next_sent_idx; 
-  __u32 next_recv_idx; 
 };
 
 /* Default arg values */
@@ -469,9 +469,8 @@ static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
     if (ntx < 0)
       break;
 
-    /* record sent RID in the circular buffer for later verification */
-    c->sent_rids[c->next_sent_idx % MAX_PENDING_RPC] = c->client->last_sent_rid;
-    c->next_sent_idx++;
+    /* record sent RID indexed by RID value, not position */
+    c->sent_rids[c->client->last_sent_rid % MAX_PENDING_RPC] = c->client->last_sent_rid;
 
     c->tokens -= msize;
     c->total_tx_pkts++;
@@ -492,11 +491,12 @@ static inline void core_rx(struct rpc_context_lib *rpc_ctx, struct core *c)
     if (nrx < 0)
       break;
 
-    /* verify RID matches what we sent for this slot */
-    if (c->client->last_recv_rid !=
-        c->sent_rids[c->next_recv_idx % MAX_PENDING_RPC])
+    /* verify RID by looking up the slot the sent RID was stored in */
+    __u32 recv_rid = c->client->last_recv_rid;
+    if (c->sent_rids[recv_rid % MAX_PENDING_RPC] != recv_rid)
       c->rid_mismatches++;
-    c->next_recv_idx++;
+    else
+      c->sent_rids[recv_rid % MAX_PENDING_RPC] = 0; /* clear matched slot */
 
     /* tsc is at offset 0 in every service payload */
     ph = (struct payload_hdr *)c->rxbuf;
