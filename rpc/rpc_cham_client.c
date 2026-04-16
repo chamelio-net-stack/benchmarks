@@ -26,6 +26,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include "services.h"
+#include <stdint.h>
 
 struct payload_hdr
 {
@@ -55,7 +56,8 @@ struct core
   /* Circular buffer of sent RIDs — indexed by (rid % MAX_PENDING_RPC).
    * Filled in core_tx immediately after rpc_call; checked in core_rx. */
   /* sent RIDs indexed by (rid % MAX_PENDING_RPC).
-   * Filled in core_tx after rpc_call; checked and cleared in core_rx. */
+   * Filled in core_tx after rpc_call; checked and cleared in core_rx.
+   * Empty slots hold RID_SLOT_EMPTY to distinguish from valid RID 0. */
   __u32 sent_rids[MAX_PENDING_RPC];
 };
 
@@ -87,6 +89,12 @@ static __u64 *rtt_hist = NULL;
 
 /* Clamp histogram at 1 second */
 #define MAX_RTT_US 1000000u
+
+/* Sentinel value meaning "this sent_rids slot is empty".
+ * UINT32_MAX is safe because next_rid wraps at 2^32 and the library
+ * uses __sync_fetch_and_add so it will never naturally produce UINT32_MAX
+ * as the first value seen during a short benchmark run. */
+#define RID_SLOT_EMPTY UINT32_MAX
 
 static pthread_barrier_t start_barrier;
 static pthread_t *threads = NULL;
@@ -496,7 +504,7 @@ static inline void core_rx(struct rpc_context_lib *rpc_ctx, struct core *c)
     if (c->sent_rids[recv_rid % MAX_PENDING_RPC] != recv_rid)
       c->rid_mismatches++;
     else
-      c->sent_rids[recv_rid % MAX_PENDING_RPC] = 0; /* clear matched slot */
+      c->sent_rids[recv_rid % MAX_PENDING_RPC] = RID_SLOT_EMPTY; /* clear matched slot */
 
     /* tsc is at offset 0 in every service payload */
     ph = (struct payload_hdr *)c->rxbuf;
@@ -607,6 +615,10 @@ static inline struct rpc_context_lib *core_init(struct core *c)
   c->tokens = 0.0;
   /* Seed per-core pseudo random generator with core id so each core has an independent sequence */
   c->prng_state = 0xdeadbeef12345678ULL ^ ((__u64)c->id + 1);
+
+  /* mark all slots empty — distinguishes "unsent" from valid RID 0 */
+  for (int i = 0; i < MAX_PENDING_RPC; i++)
+    c->sent_rids[i] = RID_SLOT_EMPTY;
 
   return rpc_ctx;
 }
