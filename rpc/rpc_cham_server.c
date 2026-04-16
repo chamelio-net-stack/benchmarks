@@ -28,9 +28,9 @@
 #include <sched.h>
 #include "../utils/clock.h"
 #include "../utils/core.h"
+#include "services.h"
 
 #define MAX_WORKERS 16
-
 
 struct core
 {
@@ -41,7 +41,8 @@ struct core
   int nrx;
   int ntx;
 
-  __u8 *buf;
+  __u8  *buf;
+  __u32 *rids;  /* per-slot RID captured from worker->last_rid after each rpc_handle_call */
   __u64 rxb_interval;
   __u64 rxp_interval;
   __u64 txb_interval;
@@ -314,7 +315,7 @@ static inline void print_stats(__u64 now)
   }
 }
 
-// TODO: do this with rpc_return when we have implemented it
+
 static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
 {
   int ntx;
@@ -325,7 +326,7 @@ static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
   {
     assert(msize <= c->nrx - c->ntx);
     ntx = rpc_return(c->rpc_server, c->worker, c->worker->rx_ip, c->worker->rx_port,
-                     0, c->buf + c->ntx, msize);
+                     c->rids[c->ntx / msize], c->buf + c->ntx, msize);
 
     if (ntx <= 0)
       break;
@@ -352,6 +353,8 @@ static inline void core_rx(struct rpc_context_lib *rpc_ctx, struct core *c)
     if (nrx < 0)
       break;
 
+    /* capture RID immediately before the next call overwrites last_rid */
+    c->rids[c->nrx / msize] = c->worker->last_rid;
     c->nrx += nrx;
     __sync_fetch_and_add(&c->rxp_interval, 1);
     __sync_fetch_and_add(&c->rxb_interval, nrx);
@@ -367,6 +370,53 @@ static inline struct rpc_context_lib *core_init(struct core *c)
   c->txb_interval = 0;
   c->txp_interval = 0;
   return c->rpc_ctx;
+}
+
+/*
+ * dispatch_buf — process every msize-byte slot received since the last tx.
+ * For SERVICE_ECHO the bytes are returned as-is (no transformation needed).
+ * For SERVICE_COMPUTE the request is evaluated and the result is written back
+ * into the same slot so core_tx can send it without any extra copy.
+ */
+static inline void dispatch_buf(struct core *c)
+{
+  int offset;
+  struct compute_req *req;
+  struct compute_resp resp;
+
+  offset = 0;
+  while (offset + (int)msize <= c->nrx)
+  {
+    __u8 *slot = c->buf + offset;
+
+    /* service_id is embedded at offset 8 in all non-echo payloads */
+    if (slot[8] == SERVICE_COMPUTE)
+    {
+      req = (struct compute_req *)slot;
+      resp.tsc        = req->tsc;
+      resp.service_id = SERVICE_COMPUTE;
+      resp._pad[0]    = 0; resp._pad[1] = 0; resp._pad[2] = 0;
+      resp._pad[3]    = 0; resp._pad[4] = 0; resp._pad[5] = 0;
+      resp.status     = 0;
+
+      switch (req->op)
+      {
+        case COMPUTE_OP_ADD: resp.result = req->a + req->b; break;
+        case COMPUTE_OP_MUL: resp.result = req->a * req->b; break;
+        case COMPUTE_OP_MAX: resp.result = req->a > req->b ? req->a : req->b; break;
+        default:
+          resp.result = 0;
+          resp.status = 1;
+          break;
+      }
+
+      memcpy(slot, &resp, sizeof(resp));
+      /* remaining bytes in the slot are padding — left untouched */
+    }
+    /* SERVICE_ECHO: no transformation; tsc at offset 0 is preserved */
+
+    offset += (int)msize;
+  }
 }
 
 static inline void *core_thread(void *arg)
@@ -387,6 +437,7 @@ static inline void *core_thread(void *arg)
   {
     rpc_poll_calls(rpc_ctx);
     core_rx(rpc_ctx, c);
+    dispatch_buf(c);
     rpc_poll_calls(rpc_ctx);
     core_tx(rpc_ctx, c);
   }
@@ -425,6 +476,14 @@ static inline void create_rpc_serv()
     }
     memset(cores[i].buf, 0, bsize);
 
+    cores[i].rids = (__u32 *)malloc((bsize / msize) * sizeof(__u32));
+    if (cores[i].rids == NULL)
+    {
+      perror("malloc core rids");
+      abort();
+    }
+    memset(cores[i].rids, 0, (bsize / msize) * sizeof(__u32));
+
     cores[i].rpc_ctx = rpc_ctx_new();
     if (cores[i].rpc_ctx == NULL)
     {
@@ -445,14 +504,16 @@ static inline void create_rpc_serv()
 
   if (nservices == 0)
   {
-    nservices = 1;
-    service_id = (__u8 *)malloc(sizeof(*service_id));
+    /* Register both echo (1) and compute (2) by default */
+    nservices = 2;
+    service_id = (__u8 *)malloc(nservices * sizeof(*service_id));
     if (!service_id)
     {
       perror("malloc service_id");
       abort();
     }
-    service_id[0] = 1;
+    service_id[0] = SERVICE_ECHO;
+    service_id[1] = SERVICE_COMPUTE;
   }
 
   for (i = 0; i < nservices; i++)

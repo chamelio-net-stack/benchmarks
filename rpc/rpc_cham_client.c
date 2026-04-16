@@ -25,6 +25,7 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <pthread.h>
+#include "services.h"
 
 struct payload_hdr
 {
@@ -35,22 +36,27 @@ struct payload_hdr
 struct core
 {
   int id;
-  // int fd;
   __u8 *txbuf;
   __u8 *rxbuf;
   struct rpc_client_lib *client;
   struct sockaddr_in dst_addr;
-  // socklen_t dst_len;
   __u64 txb_load_interval;
   __u64 txp_load_interval;
   __u64 txb_tp_interval;
   __u64 txp_tp_interval;
   __u64 total_tx_pkts;
   __u64 total_rx_pkts;
+  __u64 rid_mismatches; /* responses whose RID did not match the expected sent RID */
   double rate;
   double tokens;
   __u64 last_tsc;
-  // struct rpc_client_lib *client;
+  __u64 prng_state; /* xorshift64 state for operand generation */
+
+  /* Circular buffer of sent RIDs — indexed by (rid % MAX_PENDING_RPC).
+   * Filled in core_tx immediately after rpc_call; checked in core_rx. */
+  __u32 sent_rids[MAX_PENDING_RPC];
+  __u32 next_sent_idx; 
+  __u32 next_recv_idx; 
 };
 
 /* Default arg values */
@@ -64,6 +70,7 @@ double rate = 10.0;
 int ncores = 1;
 const char *rem_ip;
 int rem_port;
+int service = SERVICE_ECHO; 
 
 /* Global time and stats variables */
 __u64 t_start_ns, t_end_ns;
@@ -275,8 +282,9 @@ static inline int parse_args(int argc, char **argv)
 {
   if (argc < 3)
   {
-    fprintf(stderr, "Usage: %s <src_ip> <src_port>  <rem_ip> <rem_port> [--msize N]"
-                    " [--duration S] [--rate R] [--ncores N]\n",
+    fprintf(stderr, "Usage: %s <src_ip> <src_port> <rem_ip> <rem_port> [--msize N]"
+                    " [--duration S] [--rate R] [--ncores N]"
+                    " [--service N (1=echo 2=compute)]\n",
             argv[0]);
     return -1;
   }
@@ -314,6 +322,16 @@ static inline int parse_args(int argc, char **argv)
     {
       ncores = atoi(argv[++i]);
     }
+    else if ((strcmp(argv[i], "--service") == 0) && i + 1 < argc)
+    {
+      service = atoi(argv[++i]);
+      if (service != SERVICE_ECHO && service != SERVICE_COMPUTE)
+      {
+        fprintf(stderr, "Unknown service %d (valid: %d=echo  %d=compute)\n",
+                service, SERVICE_ECHO, SERVICE_COMPUTE);
+        return -1;
+      }
+    }
     else
     {
       fprintf(stderr, "Unknown arg: %s\n", argv[i]);
@@ -326,10 +344,13 @@ static inline int parse_args(int argc, char **argv)
     return -1;
   }
 
-  if (msize < sizeof(struct payload_hdr))
+  size_t min_msize = (service == SERVICE_COMPUTE)
+                     ? COMPUTE_REQ_MIN_MSIZE
+                     : sizeof(struct payload_hdr);
+  if (msize < min_msize)
   {
-    fprintf(stderr, "msize must be at least %zu bytes (header size)\n",
-            sizeof(struct payload_hdr));
+    fprintf(stderr, "msize must be at least %zu bytes for service %d\n",
+            min_msize, service);
     return -1;
   }
 
@@ -405,25 +426,52 @@ static inline void prepare_cores()
   }
 }
 
+//random number generator for compute operands
+static inline __u64 xorshift64(__u64 *state)
+{
+  __u64 x = *state;
+  x ^= x << 13;
+  x ^= x >> 7;
+  x ^= x << 17;
+  *state = x;
+  return x;
+}
+
 static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
 {
   int ntx;
   struct payload_hdr *ph;
+  struct compute_req *creq;
 
   while (c->tokens >= (double)msize)
   {
-    ph = (struct payload_hdr *)c->txbuf;
-    ph->tsc = util_rdtsc();
+    if (service == SERVICE_COMPUTE)
+    {
+      creq             = (struct compute_req *)c->txbuf;
+      creq->tsc        = util_rdtsc();
+      creq->service_id = SERVICE_COMPUTE;
+      creq->op         = (__u8)(xorshift64(&c->prng_state) % 3);
+      creq->a          = xorshift64(&c->prng_state);
+      creq->b          = xorshift64(&c->prng_state);
+    }
+    else
+    {
+      ph      = (struct payload_hdr *)c->txbuf;
+      ph->tsc = util_rdtsc();
+    }
 
-    // TODO: remove the hardcoded service_id
     ntx = rpc_call(c->client, ntohl(c->dst_addr.sin_addr.s_addr),
-                   ntohs(c->dst_addr.sin_port), 1, c->txbuf, msize);
+                   ntohs(c->dst_addr.sin_port), service, c->txbuf, msize);
   
     // assert(ntx == msize || ntx <= 0);
     // assert(c->tokens >= msize);
 
     if (ntx < 0)
       break;
+
+    /* record sent RID in the circular buffer for later verification */
+    c->sent_rids[c->next_sent_idx % MAX_PENDING_RPC] = c->client->last_sent_rid;
+    c->next_sent_idx++;
 
     c->tokens -= msize;
     c->total_tx_pkts++;
@@ -444,6 +492,13 @@ static inline void core_rx(struct rpc_context_lib *rpc_ctx, struct core *c)
     if (nrx < 0)
       break;
 
+    /* verify RID matches what we sent for this slot */
+    if (c->client->last_recv_rid !=
+        c->sent_rids[c->next_recv_idx % MAX_PENDING_RPC])
+      c->rid_mismatches++;
+    c->next_recv_idx++;
+
+    /* tsc is at offset 0 in every service payload */
     ph = (struct payload_hdr *)c->rxbuf;
     rtt_us = us_since_tsc(ph->tsc);
     c->total_rx_pkts += 1;
@@ -550,6 +605,8 @@ static inline struct rpc_context_lib *core_init(struct core *c)
   c->total_tx_pkts = 0;
   c->total_rx_pkts = 0;
   c->tokens = 0.0;
+  /* Seed per-core pseudo random generator with core id so each core has an independent sequence */
+  c->prng_state = 0xdeadbeef12345678ULL ^ ((__u64)c->id + 1);
 
   return rpc_ctx;
 }
@@ -689,17 +746,19 @@ int main(int argc, char **argv)
   __u64 p50 = 0, p99 = 0, p999 = 0;
   hist_percentiles(&p50, &p99, &p999);
 
-  /* Sum total sent packets across cores */
-  __u64 totalp_tx = 0, totalp_rx = 0;
+  /* Sum totals across cores */
+  __u64 totalp_tx = 0, totalp_rx = 0, total_rid_mismatches = 0;
   for (int i = 0; i < ncores; i++)
   {
-    totalp_tx += cores[i].total_tx_pkts;
-    totalp_rx += cores[i].total_rx_pkts;
+    totalp_tx           += cores[i].total_tx_pkts;
+    totalp_rx           += cores[i].total_rx_pkts;
+    total_rid_mismatches += cores[i].rid_mismatches;
   }
 
   printf("Cores               : %d\n", ncores);
   printf("TX packets          : %llu\n", (unsigned long long)totalp_tx);
   printf("RX packets          : %llu\n", (unsigned long long)totalp_rx);
+  printf("RID mismatches      : %llu\n", (unsigned long long)total_rid_mismatches);
   printf("Avg Load            : %lld rps %.2f Mb/s\n",
          totalp_tx / duration,
          ((double)totalp_tx * msize * 8 / 1000000) / duration);
