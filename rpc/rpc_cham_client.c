@@ -604,6 +604,11 @@ static inline struct rpc_context_lib *core_init(struct core *c)
     }
 
     fprintf(stderr, "Resolved ARP for RPC benchmark\n");
+
+    /* drain any warmup responses still in the rx buffer so they don't
+     * leak into the timed run and trigger false RID mismatches */
+    while (rpc_response(c->client, c->rxbuf, msize) >= 0)
+      ;
   }
 
   c->txb_load_interval = 0;
