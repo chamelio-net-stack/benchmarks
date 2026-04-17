@@ -648,13 +648,13 @@ static inline void *core_thread(void *arg)
   /* Synchronize start with all other cores and main */
   pthread_barrier_wait(&start_barrier);
 
-  /* Drain any warmup responses that arrived during the barrier wait */
-  rpc_poll_calls(rpc_ctx);
-  while (1)
-  {
-    if (rpc_response(c->client, c->rxbuf, msize) < 0)
-      break;
-  }
+  // /* Drain any warmup responses that arrived during the barrier wait */
+  // rpc_poll_calls(rpc_ctx);
+  // while (1)
+  // {
+  //   if (rpc_response(c->client, c->rxbuf, msize) < 0)
+  //     break;
+  // }
 
   c->last_tsc = util_rdtsc();
   start_tsc = util_rdtsc();
