@@ -26,20 +26,6 @@
 #include <unistd.h>
 #include <pthread.h>
 #include "services.h"
-#include <stdint.h>
-
-/* Sentinel value meaning "this sent_rids slot is empty".
- * UINT32_MAX is safe because next_rid wraps at 2^32 and the library
- * uses __sync_fetch_and_add so it will never naturally produce UINT32_MAX
- * as the first value seen during a short benchmark run. */
-#define RID_SLOT_EMPTY UINT32_MAX
-
-/* next_rid is global across all cores, so RIDs assigned to a single core
- * are not consecutive — they can be any value in the global sequence.
- * RID_TABLE_SIZE must be large enough that two in-flight RIDs from the
- * same core never collide under % RID_TABLE_SIZE.
- * 65536 entries = 256 KB, far beyond any realistic in-flight window. */
-#define RID_TABLE_SIZE 65536
 
 struct payload_hdr
 {
@@ -60,18 +46,10 @@ struct core
   __u64 txp_tp_interval;
   __u64 total_tx_pkts;
   __u64 total_rx_pkts;
-  __u64 rid_mismatches; /* responses whose RID did not match the expected sent RID */
   double rate;
   double tokens;
   __u64 last_tsc;
   __u64 prng_state; /* xorshift64 state for operand generation */
-
-  /* Circular buffer of sent RIDs — indexed by (rid % RID_TABLE_SIZE).
-   * Filled in core_tx immediately after rpc_call; checked in core_rx. */
-  /* sent RIDs indexed by (rid % RID_TABLE_SIZE).
-   * Filled in core_tx after rpc_call; checked and cleared in core_rx.
-   * Empty slots hold RID_SLOT_EMPTY to distinguish from valid RID 0. */
-  __u32 sent_rids[RID_TABLE_SIZE];
 };
 
 /* Default arg values */
@@ -437,11 +415,10 @@ static inline void prepare_cores()
       fprintf(stderr, "Invalid server_ip\n");
       abort();
     }
-    // cores[i].dst_len = sizeof(cores[i].dst_addr);
   }
 }
 
-// random number generator for compute operands
+/* Fast pseudo-random number generator for compute operands */
 static inline __u64 xorshift64(__u64 *state)
 {
   __u64 x = *state;
@@ -478,14 +455,8 @@ static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
     ntx = rpc_call(c->client, ntohl(c->dst_addr.sin_addr.s_addr),
                    ntohs(c->dst_addr.sin_port), service, c->txbuf, msize);
 
-    // assert(ntx == msize || ntx <= 0);
-    // assert(c->tokens >= msize);
-
     if (ntx < 0)
       break;
-
-    /* record sent RID indexed by RID value, not position */
-    c->sent_rids[c->client->last_sent_rid % RID_TABLE_SIZE] = c->client->last_sent_rid;
 
     c->tokens -= msize;
     c->total_tx_pkts++;
@@ -505,21 +476,6 @@ static inline void core_rx(struct rpc_context_lib *rpc_ctx, struct core *c)
     nrx = rpc_response(c->client, c->rxbuf, msize);
     if (nrx < 0)
       break;
-
-    /* verify RID by looking up the slot the sent RID was stored in */
-    __u32 recv_rid = c->client->last_recv_rid;
-    __u32 slot_val = c->sent_rids[recv_rid % RID_TABLE_SIZE];
-    if (slot_val == recv_rid)
-    {
-      /* correct match — clear slot */
-      c->sent_rids[recv_rid % RID_TABLE_SIZE] = RID_SLOT_EMPTY;
-    }
-    else if (slot_val != RID_SLOT_EMPTY)
-    {
-      /* slot occupied by a *different* sent RID: genuine RID corruption */
-      c->rid_mismatches++;
-    }
-    /* slot_val == RID_SLOT_EMPTY: stale/warmup response — discard silently */
 
     /* tsc is at offset 0 in every service payload */
     ph = (struct payload_hdr *)c->rxbuf;
@@ -620,8 +576,7 @@ static inline struct rpc_context_lib *core_init(struct core *c)
 
     fprintf(stderr, "Resolved ARP for RPC benchmark\n");
 
-    /* drain any warmup responses still in the rx buffer so they don't
-     * leak into the timed run and trigger false RID mismatches */
+    /* Drain any warmup responses still in the rx buffer */
     while (rpc_response(c->client, c->rxbuf, msize) >= 0)
       ;
   }
@@ -633,12 +588,8 @@ static inline struct rpc_context_lib *core_init(struct core *c)
   c->total_tx_pkts = 0;
   c->total_rx_pkts = 0;
   c->tokens = 0.0;
-  /* Seed per-core pseudo random generator with core id so each core has an independent sequence */
+  /* Seed per-core PRNG with core id so each core has an independent sequence */
   c->prng_state = 0xdeadbeef12345678ULL ^ ((__u64)c->id + 1);
-
-  /* mark all slots empty — distinguishes "unsent" from valid RID 0 */
-  for (int i = 0; i < RID_TABLE_SIZE; i++)
-    c->sent_rids[i] = RID_SLOT_EMPTY;
 
   return rpc_ctx;
 }
@@ -655,14 +606,6 @@ static inline void *core_thread(void *arg)
 
   /* Synchronize start with all other cores and main */
   pthread_barrier_wait(&start_barrier);
-
-  // /* Drain any warmup responses that arrived during the barrier wait */
-  // rpc_poll_calls(rpc_ctx);
-  // while (1)
-  // {
-  //   if (rpc_response(c->client, c->rxbuf, msize) < 0)
-  //     break;
-  // }
 
   c->last_tsc = util_rdtsc();
   start_tsc = util_rdtsc();
@@ -724,8 +667,6 @@ int main(int argc, char **argv)
 {
   int ret, i;
   __u64 now;
-  // struct rpc_client_lib *rpc_client;
-  // struct rpc_context_lib *rpc_ctx;
 
   ret = parse_args(argc, argv);
   if (ret != 0)
@@ -787,19 +728,16 @@ int main(int argc, char **argv)
   __u64 p50 = 0, p99 = 0, p999 = 0;
   hist_percentiles(&p50, &p99, &p999);
 
-  /* Sum totals across cores */
-  __u64 totalp_tx = 0, totalp_rx = 0, total_rid_mismatches = 0;
+  __u64 totalp_tx = 0, totalp_rx = 0;
   for (int i = 0; i < ncores; i++)
   {
     totalp_tx += cores[i].total_tx_pkts;
     totalp_rx += cores[i].total_rx_pkts;
-    total_rid_mismatches += cores[i].rid_mismatches;
   }
 
   printf("Cores               : %d\n", ncores);
   printf("TX packets          : %llu\n", (unsigned long long)totalp_tx);
   printf("RX packets          : %llu\n", (unsigned long long)totalp_rx);
-  printf("RID mismatches      : %llu\n", (unsigned long long)total_rid_mismatches);
   printf("Avg Load            : %lld rps %.2f Mb/s\n",
          totalp_tx / duration,
          ((double)totalp_tx * msize * 8 / 1000000) / duration);
