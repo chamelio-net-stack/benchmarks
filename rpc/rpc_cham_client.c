@@ -85,7 +85,7 @@ double rate = 10.0;
 int ncores = 1;
 const char *rem_ip;
 int rem_port;
-int service = SERVICE_ECHO; 
+int service = SERVICE_ECHO;
 
 /* Global time and stats variables */
 __u64 t_start_ns, t_end_ns;
@@ -360,8 +360,8 @@ static inline int parse_args(int argc, char **argv)
   }
 
   size_t min_msize = (service == SERVICE_COMPUTE)
-                     ? COMPUTE_REQ_MIN_MSIZE
-                     : sizeof(struct payload_hdr);
+                         ? COMPUTE_REQ_MIN_MSIZE
+                         : sizeof(struct payload_hdr);
   if (msize < min_msize)
   {
     fprintf(stderr, "msize must be at least %zu bytes for service %d\n",
@@ -441,7 +441,7 @@ static inline void prepare_cores()
   }
 }
 
-//random number generator for compute operands
+// random number generator for compute operands
 static inline __u64 xorshift64(__u64 *state)
 {
   __u64 x = *state;
@@ -462,22 +462,22 @@ static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
   {
     if (service == SERVICE_COMPUTE)
     {
-      creq             = (struct compute_req *)c->txbuf;
-      creq->tsc        = util_rdtsc();
+      creq = (struct compute_req *)c->txbuf;
+      creq->tsc = util_rdtsc();
       creq->service_id = SERVICE_COMPUTE;
-      creq->op         = (__u8)(xorshift64(&c->prng_state) % 3);
-      creq->a          = xorshift64(&c->prng_state);
-      creq->b          = xorshift64(&c->prng_state);
+      creq->op = (__u8)(xorshift64(&c->prng_state) % 3);
+      creq->a = xorshift64(&c->prng_state);
+      creq->b = xorshift64(&c->prng_state);
     }
     else
     {
-      ph      = (struct payload_hdr *)c->txbuf;
+      ph = (struct payload_hdr *)c->txbuf;
       ph->tsc = util_rdtsc();
     }
 
     ntx = rpc_call(c->client, ntohl(c->dst_addr.sin_addr.s_addr),
                    ntohs(c->dst_addr.sin_port), service, c->txbuf, msize);
-  
+
     // assert(ntx == msize || ntx <= 0);
     // assert(c->tokens >= msize);
 
@@ -647,11 +647,20 @@ static inline void *core_thread(void *arg)
 
   /* Synchronize start with all other cores and main */
   pthread_barrier_wait(&start_barrier);
+
+  /* Drain any warmup responses that arrived during the barrier wait */
+  rpc_poll_calls(rpc_ctx);
+  while (1)
+  {
+    if (rpc_response(c->client, c->rxbuf, msize) < 0)
+      break;
+  }
+
   c->last_tsc = util_rdtsc();
   start_tsc = util_rdtsc();
 
-  fprintf(stderr, "core %d: rpc_ctx=%p ncores=%d\n", 
-        c->id, rpc_ctx, rpc_ctx->ncores);
+  fprintf(stderr, "core %d: rpc_ctx=%p ncores=%d\n",
+          c->id, rpc_ctx, rpc_ctx->ncores);
 
   while (1)
   {
@@ -774,8 +783,8 @@ int main(int argc, char **argv)
   __u64 totalp_tx = 0, totalp_rx = 0, total_rid_mismatches = 0;
   for (int i = 0; i < ncores; i++)
   {
-    totalp_tx           += cores[i].total_tx_pkts;
-    totalp_rx           += cores[i].total_rx_pkts;
+    totalp_tx += cores[i].total_tx_pkts;
+    totalp_rx += cores[i].total_rx_pkts;
     total_rid_mismatches += cores[i].rid_mismatches;
   }
 
