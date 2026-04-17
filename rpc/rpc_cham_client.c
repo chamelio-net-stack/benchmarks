@@ -508,10 +508,18 @@ static inline void core_rx(struct rpc_context_lib *rpc_ctx, struct core *c)
 
     /* verify RID by looking up the slot the sent RID was stored in */
     __u32 recv_rid = c->client->last_recv_rid;
-    if (c->sent_rids[recv_rid % RID_TABLE_SIZE] != recv_rid)
+    __u32 slot_val = c->sent_rids[recv_rid % RID_TABLE_SIZE];
+    if (slot_val == recv_rid)
+    {
+      /* correct match — clear slot */
+      c->sent_rids[recv_rid % RID_TABLE_SIZE] = RID_SLOT_EMPTY;
+    }
+    else if (slot_val != RID_SLOT_EMPTY)
+    {
+      /* slot occupied by a *different* sent RID: genuine RID corruption */
       c->rid_mismatches++;
-    else
-      c->sent_rids[recv_rid % RID_TABLE_SIZE] = RID_SLOT_EMPTY; /* clear matched slot */
+    }
+    /* slot_val == RID_SLOT_EMPTY: stale/warmup response — discard silently */
 
     /* tsc is at offset 0 in every service payload */
     ph = (struct payload_hdr *)c->rxbuf;
