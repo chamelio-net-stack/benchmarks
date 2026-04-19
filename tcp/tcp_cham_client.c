@@ -85,6 +85,7 @@ int rem_port;
 const char *src_ip;
 int src_port;
 struct sockaddr_in src_addr;
+socklen_t src_len;
 
 /* Global time and stats variables */
 __u64 t_start_ns, t_end_ns;
@@ -265,6 +266,7 @@ static void conn_rearm(struct core *c, struct conn *con)
 
 static inline void core_init(struct core *c)
 {
+  int ret;
   int fd, i, nevs;
   struct conn *conns, *con;
   struct tcp_wait_event *evs;
@@ -318,6 +320,17 @@ static inline void core_init(struct core *c)
     {
       fprintf(stderr, "failed to create socket\n");
       abort();
+    }
+    
+    if (src_port != 0 || src_ip != 0)
+    {
+      ret = tcp_bind(c->tcp_ctx, fd, 
+          (struct sockaddr *) &src_addr, sizeof(src_addr));
+      if (ret < 0)
+      {
+        fprintf(stderr, "failed to bind src ip and port\n");
+        abort();
+      } 
     }
   
     con = &conns[i];
@@ -662,6 +675,7 @@ static inline void prepare_cores()
   {
     memset(&cores[i], 0, sizeof(struct core));
     cores[i].id = i;
+    
     memset(&cores[i].dst_addr, 0, sizeof(cores[i].dst_addr));
     cores[i].dst_addr.sin_family = AF_INET;
     cores[i].dst_addr.sin_port   = htons((__u16) rem_port);
@@ -705,6 +719,17 @@ static inline void init_client()
     perror("calloc cores/threads");
     exit(EXIT_FAILURE);
   }
+  
+  /* Initialise src address */
+  memset(&src_addr, 0, sizeof(src_addr));
+  src_addr.sin_family = AF_INET;
+  src_addr.sin_port   = htons((__u16) src_port);
+  if (inet_pton(AF_INET, src_ip, &src_addr.sin_addr) != 1)
+  {
+    fprintf(stderr, "Invalid src_ip\n");
+    abort();
+  }
+  src_len = sizeof(src_addr);
   
   /* Barrier for all cores + main (to synchronize start of sending) */
   if (pthread_barrier_init(&start_barrier, NULL, 
