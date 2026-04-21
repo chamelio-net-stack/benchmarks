@@ -1,13 +1,13 @@
 /* Usage:
  *   ./rpc_cham_server <bind_ip> <port> [--nworkers N][--service id1,id2,...]
  *  [--ncores N] [--buf-size] [--msize N] [--cores LIST]
- * 
+ *
  * Example:
  *   ./rpc_cham_server 0.0.0.0 9000 --nworkers 2 --service 1,2,3,4
- *   --ncores 2 --buf-size 4096 --msize 64 
- *                
+ *   --ncores 2 --buf-size 4096 --msize 64
+ *
  *   --nworkers Number of worker threads to create (default: 1)
- *   --service Comma-separated list of service IDs to register (default: none)  
+ *   --service Comma-separated list of service IDs to register (default: none)
  *   --msize Size of expected message
  *   --ncores Number of cores to use
  *   --buf-size Size of transmit buffer
@@ -41,8 +41,8 @@ struct core
   int nrx;
   int ntx;
 
-  __u8  *buf;
-  __u32 *rids;  /* per-slot RID captured from worker->last_rid after each rpc_handle_call */
+  __u8 *buf;
+  __u32 *rids; /* per-slot RID returned by rpc_handle_call() */
   __u64 rxb_interval;
   __u64 rxp_interval;
   __u64 txb_interval;
@@ -96,11 +96,11 @@ static inline int parse_core_list(const char *arg, int expected_len)
   if (expected_len > 0 && count != expected_len)
   {
     fprintf(stderr, "cores list must have %d entries (main + %d threads)\n",
-        expected_len, expected_len - 1);
+            expected_len, expected_len - 1);
     return -1;
   }
 
-  core_list = (int *) calloc((size_t) count, sizeof(int));
+  core_list = (int *)calloc((size_t)count, sizeof(int));
   if (!core_list)
   {
     perror("calloc core_list");
@@ -129,7 +129,7 @@ static inline int parse_core_list(const char *arg, int expected_len)
       return -1;
     }
     errno = 0;
-    core_list[idx] = (int) strtol(tok, &end, 10);
+    core_list[idx] = (int)strtol(tok, &end, 10);
     if (errno != 0 || end == tok || (*end != '\0' && *end != ' ' && *end != '\t'))
     {
       fprintf(stderr, "invalid core id: %s\n", tok);
@@ -163,7 +163,8 @@ static inline int parse_args(int argc, char **argv)
   {
     fprintf(stderr, "Usage: %s <bind_ip> <port> [--nworkers N]"
                     " [--service id1,id2,...] [--ncores N] [--buf-size]"
-                    " [--msize N] [--cores LIST]\n",argv[0]);
+                    " [--msize N] [--cores LIST]\n",
+            argv[0]);
     return -1;
   }
   src_ip = argv[1];
@@ -243,7 +244,6 @@ static inline int parse_args(int argc, char **argv)
     else if (strcmp(argv[i], "--cores") == 0 && i + 1 < argc)
     {
       cores_arg = argv[++i];
-      
     }
     else
     {
@@ -253,10 +253,11 @@ static inline int parse_args(int argc, char **argv)
   }
   if (cores_arg != NULL)
   {
-    if (parse_core_list(cores_arg, ncores + 1) != 0) return -1;
+    if (parse_core_list(cores_arg, ncores + 1) != 0)
+      return -1;
   }
 
-  //each worker has its own thread/core, so nworkers must match ncores
+  // each worker has its own thread/core, so nworkers must match ncores
   if (nworkers != ncores)
   {
     fprintf(stderr, "rpc benchmark requires --nworkers to match --ncores "
@@ -283,7 +284,9 @@ static inline void print_stats(__u64 now)
     pkts_rx += __sync_fetch_and_add(&cores[i].rxp_interval, 0);
     bytes_tx += __sync_fetch_and_add(&cores[i].txb_interval, 0);
     pkts_tx += __sync_fetch_and_add(&cores[i].txp_interval, 0);
-    fprintf(stderr, "core=%d bytes_rx=%.2f Mb/s bytes_tx=%.2f Mb/s\n", i, (double)cores[i].rxb_interval * 8.0 / 1e6, (double)cores[i].txb_interval * 8.0 / 1e6);
+    fprintf(stderr, "core=%d bytes_rx=%.2f Mb/s bytes_tx=%.2f Mb/s\n",
+            i, (double)cores[i].rxb_interval * 8.0 / 1e6,
+            (double)cores[i].txb_interval * 8.0 / 1e6);
     __sync_fetch_and_and(&cores[i].rxb_interval, 0);
     __sync_fetch_and_and(&cores[i].rxp_interval, 0);
     __sync_fetch_and_and(&cores[i].txb_interval, 0);
@@ -315,7 +318,6 @@ static inline void print_stats(__u64 now)
   }
 }
 
-
 static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
 {
   int ntx;
@@ -325,7 +327,7 @@ static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
   while (c->ntx < c->nrx)
   {
     assert(msize <= c->nrx - c->ntx);
-    ntx = rpc_return(c->rpc_server, c->worker, c->worker->rx_ip, c->worker->rx_port,
+    ntx = rpc_return(c->rpc_server, c->worker,
                      c->rids[c->ntx / msize], c->buf + c->ntx, msize);
 
     if (ntx <= 0)
@@ -343,18 +345,19 @@ static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
 static inline void core_rx(struct rpc_context_lib *rpc_ctx, struct core *c)
 {
   int nrx;
+  __u32 rid;
 
   if (c->worker == NULL)
     return;
   while (c->nrx < bsize)
   {
     assert(msize <= bsize - c->nrx);
-    nrx = rpc_handle_call(c->worker, c->buf + c->nrx, msize);
+    nrx = rpc_handle_call(c->worker, &rid, c->buf + c->nrx, msize);
     if (nrx < 0)
       break;
 
-    /* capture RID immediately before the next call overwrites last_rid */
-    c->rids[c->nrx / msize] = c->worker->last_rid;
+    c->rids[c->nrx / msize] = rid;
+
     c->nrx += nrx;
     __sync_fetch_and_add(&c->rxp_interval, 1);
     __sync_fetch_and_add(&c->rxb_interval, nrx);
@@ -372,12 +375,7 @@ static inline struct rpc_context_lib *core_init(struct core *c)
   return c->rpc_ctx;
 }
 
-/*
- * dispatch_buf — process every msize-byte slot received since the last tx.
- * For SERVICE_ECHO the bytes are returned as-is (no transformation needed).
- * For SERVICE_COMPUTE the request is evaluated and the result is written back
- * into the same slot so core_tx can send it without any extra copy.
- */
+/* dispatch_buf — process every msize-byte slot received since the last tx*/
 static inline void dispatch_buf(struct core *c)
 {
   int offset;
@@ -393,21 +391,31 @@ static inline void dispatch_buf(struct core *c)
     if (slot[8] == SERVICE_COMPUTE)
     {
       req = (struct compute_req *)slot;
-      resp.tsc        = req->tsc;
+      resp.tsc = req->tsc;
       resp.service_id = SERVICE_COMPUTE;
-      resp._pad[0]    = 0; resp._pad[1] = 0; resp._pad[2] = 0;
-      resp._pad[3]    = 0; resp._pad[4] = 0; resp._pad[5] = 0;
-      resp.status     = 0;
+      resp._pad[0] = 0;
+      resp._pad[1] = 0;
+      resp._pad[2] = 0;
+      resp._pad[3] = 0;
+      resp._pad[4] = 0;
+      resp._pad[5] = 0;
+      resp.status = 0;
 
       switch (req->op)
       {
-        case COMPUTE_OP_ADD: resp.result = req->a + req->b; break;
-        case COMPUTE_OP_MUL: resp.result = req->a * req->b; break;
-        case COMPUTE_OP_MAX: resp.result = req->a > req->b ? req->a : req->b; break;
-        default:
-          resp.result = 0;
-          resp.status = 1;
-          break;
+      case COMPUTE_OP_ADD:
+        resp.result = req->a + req->b;
+        break;
+      case COMPUTE_OP_MUL:
+        resp.result = req->a * req->b;
+        break;
+      case COMPUTE_OP_MAX:
+        resp.result = req->a > req->b ? req->a : req->b;
+        break;
+      default:
+        resp.result = 0;
+        resp.status = 1;
+        break;
       }
 
       memcpy(slot, &resp, sizeof(resp));
@@ -428,7 +436,7 @@ static inline void *core_thread(void *arg)
   if (core_list_len > 0)
   {
     if (pin_thread_to_core(core_list[c->id + 1]) != 0)
-      pthread_exit((void *) (intptr_t) -1);
+      pthread_exit((void *)(intptr_t)-1);
   }
   rpc_ctx = core_init(c);
   pthread_barrier_wait(&start_barrier);

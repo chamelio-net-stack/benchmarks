@@ -526,11 +526,11 @@ static inline struct rpc_context_lib *core_init(struct core *c)
           c->client->rx_buf,
           c->client->core);
 
-  fprintf(stderr, "client core=%u rx_ip=%u rx_port=%u tx_ip=%u\n",
-          c->client->core,
-          c->client->rx_ip,
-          c->client->rx_port,
-          c->client->tx_ip);
+  // fprintf(stderr, "client core=%u rx_ip=%u rx_port=%u tx_ip=%u\n",
+  //         c->client->core,
+  //         c->client->rx_ip,
+  //         c->client->rx_port,
+  //         c->client->tx_ip);
 
   /* Resolve ARP before the timed run */
   if (c->id == 0)
@@ -578,7 +578,9 @@ static inline struct rpc_context_lib *core_init(struct core *c)
 
     /* Drain any warmup responses still in the rx buffer */
     while (rpc_response(c->client, c->rxbuf, msize) >= 0)
-      ;
+    {
+        /* no-op */
+    }
   }
 
   c->txb_load_interval = 0;
