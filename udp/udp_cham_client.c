@@ -335,7 +335,7 @@ static inline struct udp_context_lib * core_init(struct core *c)
     pthread_exit((void *) (intptr_t) -1);
   }
 
-  if (src_port != 0)
+  if (src_ip != 0 || src_port != 0)
   {
     ret = udp_bind(udp_ctx, c->fd, 
         (struct sockaddr *) &src_addr, sizeof(src_addr));
