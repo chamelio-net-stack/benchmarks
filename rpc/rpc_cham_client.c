@@ -612,8 +612,8 @@ static inline void *core_thread(void *arg)
   c->last_tsc = util_rdtsc();
   start_tsc = util_rdtsc();
 
-  fprintf(stderr, "core %d: rpc_ctx=%p ncores=%d\n",
-          c->id, rpc_ctx, rpc_ctx->ncores);
+  // fprintf(stderr, "core %d: rpc_ctx=%p ncores=%d\n",
+  //         c->id, rpc_ctx, rpc_ctx->ncores);
 
   while (1)
   {
