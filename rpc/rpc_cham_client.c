@@ -518,13 +518,13 @@ static inline struct rpc_context_lib *core_init(struct core *c)
     fprintf(stderr, "core %d: failed to create RPC client\n", c->id);
     pthread_exit((void *)(intptr_t)-1);
   }
-  fprintf(stderr, "client: bind_success=%d tx_len=%u rx_len=%u tx_buf=%p rx_buf=%p core=%u\n",
-          c->client->bind_success,
-          c->client->tx_len,
-          c->client->rx_len,
-          c->client->tx_buf,
-          c->client->rx_buf,
-          c->client->core);
+  // fprintf(stderr, "client: bind_success=%d tx_len=%u rx_len=%u tx_buf=%p rx_buf=%p core=%u\n",
+  //         c->client->bind_success,
+  //         c->client->tx_len,
+  //         c->client->rx_len,
+  //         c->client->tx_buf,
+  //         c->client->rx_buf,
+  //         c->client->core);
 
   // fprintf(stderr, "client core=%u rx_ip=%u rx_port=%u tx_ip=%u\n",
   //         c->client->core,
