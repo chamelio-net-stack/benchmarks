@@ -24,7 +24,7 @@ if cham_tcp_enabled
     tcp_clock_src,
     tcp_hist_src,
     tcp_core_src,
-    dependencies: [threads_dep, cham_tcp_deps],
+    dependencies: [threads_dep, math_dep, cham_tcp_deps],
   )
   tcp_cham_server = executable(
     'tcp_cham_server',

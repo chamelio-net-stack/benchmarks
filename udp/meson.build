@@ -28,7 +28,7 @@ if cham_enabled
     udp_clock_src,
     udp_hist_src,
     udp_core_src,
-    dependencies: [threads_dep, cham_deps],
+    dependencies: [threads_dep, math_dep, cham_deps],
   )
   udp_cham_server = executable(
     'udp_cham_server',

@@ -9,6 +9,11 @@
  *   --duration Duration in seconds to run benchmark
  *   --rate Per-core send rate in megabits per second
  *   --ncores Number of cores to use
+ *   --burst Enable bursty workload
+ *   --burst-dur-mean Mean burst duration in microseconds
+ *   --burst-dur-std Burst duration standard deviation in microseconds
+ *   --burst-per-mean Mean off period in microseconds
+ *   --burst-per-std Off period standard deviation in microseconds
  */
 
 #define _GNU_SOURCE
@@ -28,6 +33,7 @@
 #include <linux/types.h>
 #include "../utils/clock.h"
 #include "../utils/hist.h"
+#include "../utils/burst.h"
 
 struct payload_hdr {
   __u64 tsc;
@@ -45,6 +51,7 @@ struct conn {
   __u8 *rxbuf;
   double tokens;
   __u64 last_tsc;
+  struct burst_state burst;
   int next;
 };
 
@@ -80,6 +87,11 @@ int ncores = 1;
 int nconns = 1;
 int mpending = 0;
 int cwait = 0;
+bool burst = false;
+double burst_dur_mean = 1.0;
+double burst_dur_std = 1000.0;
+double burst_per_mean = 1000.0;
+double burst_per_std = 1000.0;
 const char *rem_ip;
 int rem_port;
 const char *src_ip;
@@ -108,7 +120,9 @@ static inline int parse_args(int argc, char **argv)
     fprintf(stderr,
         "Usage: %s <src_ip> <src_port> <rem_ip> <rem_port> [--msize N]"
         " [--duration S] [--rate R] [--ncores N]"
-        " [--nconns N] [--mpending N] [--cwait S]\n",
+        " [--nconns N] [--mpending N] [--cwait S]"
+        " [--burst] [--burst-dur-mean US] [--burst-dur-std US]"
+        " [--burst-per-mean US] [--burst-per-std US]\n",
         argv[0]);
     return -1;
   }
@@ -161,6 +175,26 @@ static inline int parse_args(int argc, char **argv)
     {
       cwait = atoi(argv[++i]);
     }
+    else if (strcmp(argv[i], "--burst") == 0)
+    {
+      burst = true;
+    }
+    else if (strcmp(argv[i], "--burst-dur-mean") == 0 && i + 1 < argc)
+    {
+      burst_dur_mean = strtod(argv[++i], NULL);
+    }
+    else if (strcmp(argv[i], "--burst-dur-std") == 0 && i + 1 < argc)
+    {
+      burst_dur_std = strtod(argv[++i], NULL);
+    }
+    else if (strcmp(argv[i], "--burst-per-mean") == 0 && i + 1 < argc)
+    {
+      burst_per_mean = strtod(argv[++i], NULL);
+    }
+    else if (strcmp(argv[i], "--burst-per-std") == 0 && i + 1 < argc)
+    {
+      burst_per_std = strtod(argv[++i], NULL);
+    }
     else
     {
       fprintf(stderr, "Unknown arg: %s\n", argv[i]);
@@ -173,6 +207,11 @@ static inline int parse_args(int argc, char **argv)
     fprintf(stderr, "rate must be > 0\n");
     return -1;
   }
+
+  if (burst_dur_mean < 1.0)
+    burst_dur_mean = 1.0;
+  if (burst_per_mean < 1.0)
+    burst_per_mean = 1.0;
 
   if (msize < sizeof(struct payload_hdr))
   {
@@ -353,6 +392,10 @@ static inline void core_init(struct core *c)
     con->rx_remain = msize;
     con->next = -1;
     con->last_tsc = util_rdtsc();
+    con->burst.on = 0;
+    con->burst.next_tsc = 0;
+    con->burst.seed = (unsigned int) (con->last_tsc ^ (c->id + 1) *
+        2654435761u ^ (i + 1) * 2246822519u);
     conn_rearm(c, con);
   }
   
@@ -369,6 +412,17 @@ static inline void core_init(struct core *c)
 static inline void conn_refill(struct conn *con, __u64 tsc_now)
 {
     double bytes_per_us, delta_cycles, delta_us, max_tokens;
+
+    if (burst && burst_expired(&con->burst, tsc_now))
+      burst_toggle(&con->burst, tsc_now, burst_dur_mean, burst_dur_std,
+          burst_per_mean, burst_per_std);
+
+    if (burst && !con->burst.on)
+    {
+      con->tokens = 0.0;
+      con->last_tsc = tsc_now;
+      return;
+    }
     
     delta_cycles = (double) (tsc_now - con->last_tsc);
     delta_us = delta_cycles / clock_tsc_per_us();
@@ -376,8 +430,7 @@ static inline void conn_refill(struct conn *con, __u64 tsc_now)
     bytes_per_us = (rate / 8.0);
     con->tokens += delta_us * bytes_per_us;
     
-    /* Cap bucket to 1 ms worth of traffic to avoid unbounded bursts */
-    max_tokens = bytes_per_us * 1000;
+    max_tokens = bytes_per_us * (burst ? burst_dur_mean : 1000.0);
     if (con->tokens > max_tokens)
       con->tokens = max_tokens;
 
@@ -651,6 +704,16 @@ static inline void * core_thread(void *arg)
   /* Synchronize start with all other cores and main */
   pthread_barrier_wait(&start_barrier);
   start_tsc = util_rdtsc();
+  if (burst)
+  {
+    for (int i = 0; i < nconns; i++)
+    {
+      c->conns[i].tokens = 0.0;
+      c->conns[i].last_tsc = start_tsc;
+      burst_start(&c->conns[i].burst, start_tsc, burst_dur_mean,
+          burst_dur_std);
+    }
+  }
   
   while(1)
   {

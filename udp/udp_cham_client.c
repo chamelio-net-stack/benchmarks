@@ -10,6 +10,11 @@
  *   --rate Per-core send rate in megabits per second
  *   --ncores Number of cores to use
  *   --cores Comma-separated core list (main, thread0, thread1, ...)
+ *   --burst Enable bursty workload
+ *   --burst-dur-mean Mean burst duration in microseconds
+ *   --burst-dur-std Burst duration standard deviation in microseconds
+ *   --burst-per-mean Mean off period in microseconds
+ *   --burst-per-std Off period standard deviation in microseconds
  */
 
 #define _GNU_SOURCE
@@ -29,6 +34,7 @@
 #include "../utils/clock.h"
 #include "../utils/hist.h"
 #include "../utils/core.h"
+#include "../utils/burst.h"
 
 struct payload_hdr {
   __u64 tsc;
@@ -54,6 +60,7 @@ struct core {
   double rate;
   double tokens;
   __u64 last_tsc;
+  struct burst_state burst;
   __u8 tx_blocked;
 };
 
@@ -62,6 +69,11 @@ size_t msize = 64;
 int duration = 30;
 double rate = 10.0;
 int ncores = 1;
+bool burst = false;
+double burst_dur_mean = 1.0;
+double burst_dur_std = 1000.0;
+double burst_per_mean = 1000.0;
+double burst_per_std = 1000.0;
 static char *cores_arg = NULL;
 static int *core_list = NULL;
 static int core_list_len = 0;
@@ -186,7 +198,9 @@ static inline int parse_args(int argc, char **argv)
   {
     fprintf(stderr,
         "Usage: %s <src_ip> <src_port> <rem_ip> <rem_port> [--msize N]"
-        " [--duration S] [--rate R] [--ncores N] [--cores LIST]\n",
+        " [--duration S] [--rate R] [--ncores N] [--cores LIST]"
+        " [--burst] [--burst-dur-mean US] [--burst-dur-std US]"
+        " [--burst-per-mean US] [--burst-per-std US]\n",
         argv[0]);
     return -1;
   }
@@ -229,6 +243,26 @@ static inline int parse_args(int argc, char **argv)
     {
       cores_arg = argv[++i];
     }
+    else if (strcmp(argv[i], "--burst") == 0)
+    {
+      burst = true;
+    }
+    else if (strcmp(argv[i], "--burst-dur-mean") == 0 && i + 1 < argc)
+    {
+      burst_dur_mean = strtod(argv[++i], NULL);
+    }
+    else if (strcmp(argv[i], "--burst-dur-std") == 0 && i + 1 < argc)
+    {
+      burst_dur_std = strtod(argv[++i], NULL);
+    }
+    else if (strcmp(argv[i], "--burst-per-mean") == 0 && i + 1 < argc)
+    {
+      burst_per_mean = strtod(argv[++i], NULL);
+    }
+    else if (strcmp(argv[i], "--burst-per-std") == 0 && i + 1 < argc)
+    {
+      burst_per_std = strtod(argv[++i], NULL);
+    }
     else
     {
       fprintf(stderr, "Unknown arg: %s\n", argv[i]);
@@ -241,6 +275,11 @@ static inline int parse_args(int argc, char **argv)
     fprintf(stderr, "rate must be > 0\n");
     return -1;
   }
+
+  if (burst_dur_mean < 1.0)
+    burst_dur_mean = 1.0;
+  if (burst_per_mean < 1.0)
+    burst_per_mean = 1.0;
 
   if (msize < sizeof(struct payload_hdr))
   {
@@ -378,6 +417,8 @@ static inline struct udp_context_lib * core_init(struct core *c)
   c->total_tx_pkts = 0;
   c->total_rx_pkts = 0;
   c->tokens  = 0.0;
+  c->burst.on = 0;
+  c->burst.next_tsc = 0;
   c->tx_blocked = 0;
   c->wait = udp_wait_new(udp_ctx);
   if (c->wait == NULL)
@@ -478,7 +519,9 @@ static inline void * core_thread(void *arg)
   /* Synchronize start with all other cores and main */
   pthread_barrier_wait(&start_barrier);
   c->last_tsc = util_rdtsc();
-  start_tsc = util_rdtsc();
+  start_tsc = c->last_tsc;
+  if (burst)
+    burst_start(&c->burst, start_tsc, burst_dur_mean, burst_dur_std);
   
   while(1)
   {
@@ -488,14 +531,25 @@ static inline void * core_thread(void *arg)
 
     /* Update token bucket using TSC */
     tsc_now = util_rdtsc();
+    if (burst && burst_expired(&c->burst, tsc_now))
+      burst_toggle(&c->burst, tsc_now, burst_dur_mean, burst_dur_std,
+          burst_per_mean, burst_per_std);
+
+    if (burst && !c->burst.on)
+    {
+      c->tokens = 0.0;
+      c->last_tsc = tsc_now;
+      core_rx(udp_ctx, c);
+      continue;
+    }
+
     delta_cycles = (double) (tsc_now - c->last_tsc);
     delta_us = delta_cycles / clock_tsc_per_us();
     assert(delta_us >= 0);
     bytes_per_us = (c->rate / 8.0);
     c->tokens += delta_us * bytes_per_us;
     
-    /* Cap bucket to 1 ms worth of traffic to avoid unbounded bursts */
-    max_tokens = bytes_per_us * 1000;
+    max_tokens = bytes_per_us * (burst ? burst_dur_mean : 1000.0);
     if (c->tokens > max_tokens)
       c->tokens = max_tokens;
 
@@ -519,6 +573,7 @@ static inline void prepare_cores()
     cores[i].rate = rate;
     cores[i].tokens = 0.0;
     cores[i].last_tsc = 0;
+    cores[i].burst.seed = (unsigned int) (time(NULL) ^ (i + 1) * 2654435761u);
 
     memset(&cores[i].dst_addr, 0, sizeof(cores[i].dst_addr));
     cores[i].dst_addr.sin_family = AF_INET;

@@ -11,6 +11,7 @@ project('chamelio-benchmarks', ['c'],
 # TODO: Maybe we need to link dpdk statically for better performance
 cc = meson.get_compiler('c')
 threads_dep = dependency('threads', required: true)
+math_dep = cc.find_library('m', required: true)
 dpdk_dep = dependency('libdpdk', required: false)
 
 demi_lib = cc.find_library(
