@@ -266,7 +266,7 @@ static inline void print_stats(__u64 now)
 static inline struct udp_context_lib * core_init(struct core *c)
 {
   __u8 *buf;
-  int ret, fd, n;
+  int ret, fd;
   struct udp_context_lib *udp_ctx;
 
   buf = (__u8 *) malloc(bsize);
