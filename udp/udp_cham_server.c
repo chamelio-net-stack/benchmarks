@@ -305,17 +305,6 @@ static inline struct udp_context_lib * core_init(struct core *c)
     abort();
   }
 
-  /* Core 0 resolves ARP */
-  if (c->id == 0)
-  {
-    while(udp_poll_fast(udp_ctx) == 0){}
-    n = udp_recvfrom(udp_ctx, fd, c->buf, msize, 
-        (struct sockaddr *) &c->dst_addr, sizeof(c->dst_addr));
-    udp_sendto(udp_ctx, fd, c->buf, (size_t) n, 
-      (struct sockaddr *) &c->dst_addr, sizeof(c->dst_addr));
-    printf("ARP initialized\n");
-  }
-
   c->fd = fd;
   c->nrx = 0;
   c->ntx = 0;
