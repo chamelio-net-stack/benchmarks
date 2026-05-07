@@ -396,19 +396,8 @@ static inline struct udp_context_lib * core_init(struct core *c)
   memset(c->rxbuf, 0, msize);
 
   /* Core 0 resolves ARP */
-  if (c->id == 0)
-  {
-    udp_sendto(udp_ctx, c->fd, c->txbuf, msize, 
+  udp_sendto(udp_ctx, c->fd, c->txbuf, msize, 
         (struct sockaddr *) &c->dst_addr, c->dst_len);
-    sleep(1);
-    udp_sendto(udp_ctx, c->fd, c->txbuf, msize, 
-        (struct sockaddr *) &c->dst_addr, c->dst_len);
-    sleep(1);
-    while(udp_poll_fast(udp_ctx) == 0);
-    while(udp_recvfrom(udp_ctx, c->fd, c->rxbuf, 
-        msize, NULL, 0) == 0);
-    fprintf(stderr, "Resolved ARP\n");
-  }
 
   c->txb_load_interval = 0;
   c->txp_load_interval = 0;
