@@ -270,9 +270,7 @@ struct item *ialloc_alloc(struct item_allocator *ia, size_t total, bool cleanup)
             h = ia->reserved;
             ia->reserved = NULL;
         } else {
-            printf("Fail 2! seg_alloced=%zu segmaxnum=%zu reserved=%p cleanup=%d\n",
-                    seg_alloced, settings.segmaxnum, (void *) ia->reserved,
-                    cleanup);
+            printf("Fail 2!");
             return NULL;
         }
     }
