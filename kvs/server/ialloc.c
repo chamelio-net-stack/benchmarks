@@ -123,7 +123,6 @@ static struct segment_header *segment_alloc(void)
     /* Check if there are still unallocated segments (note: unlocked) */
     i = seg_alloced;
     if (i >= settings.segmaxnum) {
-        pthread_spin_unlock(&segalloc_lock);
         return NULL;
     }
 
@@ -271,7 +270,9 @@ struct item *ialloc_alloc(struct item_allocator *ia, size_t total, bool cleanup)
             h = ia->reserved;
             ia->reserved = NULL;
         } else {
-            printf("Fail 2!\n");
+            printf("Fail 2! seg_alloced=%zu segmaxnum=%zu reserved=%p cleanup=%d\n",
+                    seg_alloced, settings.segmaxnum, (void *) ia->reserved,
+                    cleanup);
             return NULL;
         }
     }
