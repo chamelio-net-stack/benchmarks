@@ -11,10 +11,6 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
-#include <demi/libos.h>
-#include <demi/sga.h>
-#include <demi/wait.h>
-
 #include <protocol_binary.h>
 
 #include "iokvs.h"
@@ -22,8 +18,6 @@
 
 struct core {
     int fd;
-    demi_qtoken_t rx_qt;
-    bool rx_pending;
     uint16_t id;
     uint8_t *rx_buf;
     uint8_t *tx_buf;
@@ -36,32 +30,38 @@ struct core {
 static struct core *cores;
 static struct item_allocator **iallocs;
 static volatile size_t n_ready = 0;
-static const struct timespec zero_timeout = { .tv_sec = 0, .tv_nsec = 0 };
 
 static int core_socket(uint16_t id)
 {
     int fd;
     struct sockaddr_in si;
-    int ret;
 
-    ret = demi_socket(&fd, AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (ret != 0) {
-        errno = ret;
-        perror("demi_socket failed");
+    if ((fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0) {
         fprintf(stderr, "[%u] socket failed\n", id);
+        return -1;
+    }
+
+    if (set_reuseport(fd) != 0) {
+        fprintf(stderr, "[%u] set_reuseport failed\n", id);
+        close(fd);
+        return -1;
+    }
+
+    if (set_nonblock(fd) != 0) {
+        fprintf(stderr, "[%u] set_nonblock failed\n", id);
+        close(fd);
         return -1;
     }
 
     memset(&si, 0, sizeof(si));
     si.sin_family = AF_INET;
     si.sin_addr.s_addr = settings.bindip;
-    si.sin_port = htons(settings.udpport);
+    si.sin_port = htons(settings.port);
 
-    ret = demi_bind(fd, (const struct sockaddr *) &si, sizeof(si));
-    if (ret != 0) {
-        errno = ret;
-        perror("demi_bind failed");
+    if (bind(fd, (struct sockaddr *) &si, sizeof(si)) != 0) {
+        perror("bind failed");
         fprintf(stderr, "[%u] bind failed\n", id);
+        close(fd);
         return -1;
     }
 
@@ -70,125 +70,50 @@ static int core_socket(uint16_t id)
 
 static int core_rx(struct core *c, ssize_t *rx_len)
 {
-    demi_qresult_t qr;
-    demi_sgarray_t *sga;
-    int ret;
-    ssize_t ret_len;
+    ssize_t ret;
 
-    if (!c->rx_pending) {
-        ret = demi_pop(&c->rx_qt, c->fd);
-        if (ret != 0) {
-            errno = ret;
-            perror("demi_pop failed");
-            return -1;
-        }
-        c->rx_pending = true;
-    }
-
-    ret = demi_wait(&qr, c->rx_qt, &zero_timeout);
-    if (ret == ETIMEDOUT) {
-        return 0;
-    }
-    if (ret != 0) {
-        errno = ret;
-        perror("demi_wait pop failed");
-        c->rx_pending = false;
-        return -1;
-    }
-    c->rx_pending = false;
-
-    if (qr.qr_opcode != DEMI_OPC_POP) {
-        fprintf(stderr, "[%u] unexpected opcode on pop: %d\n",
-            c->id, (int) qr.qr_opcode);
-        return -1;
-    }
-
-    sga = &qr.qr_value.sga;
-    if (sga->sga_numsegs != 1) {
-        fprintf(stderr, "[%u] invalid pop segment count: %u\n",
-            c->id, sga->sga_numsegs);
-        demi_sgafree(sga);
-        return -1;
-    }
-
-    ret_len = (ssize_t) sga->segments[0].data_len_bytes;
-    if (ret_len < 0 || ret_len > (ssize_t) settings.max_msg_size) {
-        fprintf(stderr, "[%u] invalid pop length: %zd\n", c->id, ret_len);
-        demi_sgafree(sga);
-        return -1;
-    }
-
-    c->peer_addr = sga->sga_addr;
     c->peer_addr_len = sizeof(c->peer_addr);
-    memcpy(c->rx_buf, sga->segments[0].data_buf_ptr, (size_t) ret_len);
+    ret = recvfrom(c->fd, c->rx_buf, settings.max_msg_size, 0,
+        (struct sockaddr *) &c->peer_addr, &c->peer_addr_len);
+    if (ret < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return 0;
+        }
 
-    ret = demi_sgafree(sga);
-    if (ret != 0) {
-        errno = ret;
-        perror("demi_sgafree failed");
+        perror("recvfrom failed");
         return -1;
     }
 
-    *rx_len = ret_len;
+    *rx_len = ret;
     return 1;
 }
 
 static int core_tx(struct core *c, size_t tx_len)
 {
-    demi_qtoken_t tx_qt;
-    demi_qresult_t qr;
-    demi_sgarray_t sga;
-    int ret;
-
-    if (tx_len > settings.max_msg_size) {
-        fprintf(stderr, "[%u] tx_len too large: %zu\n", c->id, tx_len);
-        return -1;
-    }
-
-    sga = demi_sgaalloc(tx_len);
-    if (sga.sga_numsegs != 1 || sga.segments[0].data_len_bytes < tx_len) {
-        fprintf(stderr, "[%u] demi_sgaalloc failed for tx_len=%zu\n",
-            c->id, tx_len);
-        return -1;
-    }
-    sga.sga_numsegs = 1;
-    sga.segments[0].data_len_bytes = (uint32_t) tx_len;
-    memcpy(sga.segments[0].data_buf_ptr, c->tx_buf, tx_len);
-
-    ret = demi_pushto(&tx_qt, c->fd, &sga,
-        (const struct sockaddr *) &c->peer_addr, c->peer_addr_len);
-    if (ret != 0) {
-        errno = ret;
-        perror("demi_pushto failed");
-        (void) demi_sgafree(&sga);
-        return -1;
-    }
+    ssize_t ret;
 
     while (1) {
-        ret = demi_wait(&qr, tx_qt, &zero_timeout);
-        if (ret == ETIMEDOUT) {
+        ret = sendto(c->fd, c->tx_buf, tx_len, 0,
+            (const struct sockaddr *) &c->peer_addr, c->peer_addr_len);
+        if (ret == (ssize_t) tx_len) {
+            return 0;
+        }
+
+        if (ret < 0 && errno == EINTR) {
+            continue;
+        }
+
+        if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             sched_yield();
             continue;
         }
-        if (ret != 0) {
-            errno = ret;
-            perror("demi_wait push failed");
-            (void) demi_sgafree(&sga);
-            return -1;
+
+        if (ret >= 0) {
+            fprintf(stderr, "[%u] short sendto: %zd of %zu\n", c->id, ret, tx_len);
+        } else {
+            perror("sendto failed");
         }
-        if (qr.qr_opcode != DEMI_OPC_PUSH) {
-            fprintf(stderr, "[%u] unexpected opcode on push: %d\n",
-                c->id, (int) qr.qr_opcode);
-            (void) demi_sgafree(&sga);
-            return -1;
-        }
-        ret = demi_sgafree(&sga);
-        if (ret != 0) {
-            errno = ret;
-            perror("demi_sgafree failed");
-            return -1;
-        }
-        return 0;
+        return -1;
     }
 }
 
@@ -348,20 +273,7 @@ static size_t clean_log(struct item_allocator *ia, bool idle)
 
 static void *processing_thread(void *data)
 {
-    int ret;
     struct core *c = (struct core *) data;
-    const struct demi_args args = {
-        .argc = 0,
-        .argv = NULL,
-        .callback = NULL,
-    };
-
-    ret = demi_init(&args);
-    if (ret != 0) {
-        errno = ret;
-        perror("demi_init failed");
-        abort();
-    }
 
     if ((c->fd = core_socket(c->id)) < 0) {
         abort();
@@ -373,8 +285,6 @@ static void *processing_thread(void *data)
         abort();
     }
     c->tx_buf = c->rx_buf + settings.max_msg_size;
-    c->rx_pending = false;
-    c->rx_qt = 0;
 
     ialloc_init_allocator(&c->ia);
 
@@ -426,11 +336,6 @@ int main(int argc, char *argv[])
 
     if (settings_init(argc, argv) != 0) {
         return EXIT_FAILURE;
-    }
-    if (settings.numcores != 1) {
-        fprintf(stderr,
-            "Demikernel server is single-threaded, forcing THREADS=1\n");
-        settings.numcores = 1;
     }
 
     hasht_init();

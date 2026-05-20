@@ -45,8 +45,8 @@ struct settings {
     size_t segcqsize;
     /** Segment cleaning ratio */
     double clean_ratio;
-    /** UDP port to listen on */
-    uint16_t udpport;
+    /** TCP/UDP port to listen on */
+    uint16_t port;
     /** IPv4 address to bind in network byte order */
     uint32_t bindip;
     /** Maximum message size for RX/TX buffers */

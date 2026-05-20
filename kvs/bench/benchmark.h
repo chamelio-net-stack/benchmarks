@@ -39,6 +39,8 @@ struct settings {
     uint16_t srcport;
     uint16_t threads;
     uint32_t rate;
+    uint32_t nconns;
+    uint32_t mpending;
 
     uint32_t keynum;
     union {

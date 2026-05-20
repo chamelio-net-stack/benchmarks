@@ -74,7 +74,7 @@ static int core_socket(struct core *c)
     memset(&si, 0, sizeof(si));
     si.sin_family = AF_INET;
     si.sin_addr.s_addr = settings.bindip;
-    si.sin_port = htons(settings.udpport);
+    si.sin_port = htons(settings.port);
 
     if (udp_bind(c->ctx, fd, (struct sockaddr *) &si, sizeof(si)) != 0) {
         perror("bind failed");

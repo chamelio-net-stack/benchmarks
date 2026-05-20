@@ -106,7 +106,7 @@ int settings_init(int argc, char *argv[])
     int i;
     bool have_threads = false;
 
-    settings.udpport = 11211;
+    settings.port = 11211;
     settings.bindip = htonl(INADDR_ANY);
     settings.max_msg_size = 2048;
     settings.max_conns = 128 * 1024;
@@ -173,7 +173,7 @@ int settings_init(int argc, char *argv[])
             if (parse_u32_arg("port", val, 1, 65535, &tmp_u32) != 0) {
                 return -1;
             }
-            settings.udpport = (uint16_t) tmp_u32;
+            settings.port = (uint16_t) tmp_u32;
             continue;
         }
 

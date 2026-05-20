@@ -39,7 +39,9 @@ void print_usage(void)
         "./benchmark [options] dst-ip:dst-port\n"
         "Options:\n"
         "  -t, --threads=COUNT   Number of sending threads [default 1].\n"
-        "  -R, --rate=KREQPS     Per-core rate in kreq/s   [default 1000].\n"
+        "  -R, --rate=KREQPS     UDP per-thread/TCP per-connection rate [default 1000].\n"
+        "      --nconns=COUNT    TCP connections per thread [default 1].\n"
+        "      --mpending=COUNT  TCP pending connects per thread [default 1].\n"
         "  -k, --key-size=BYTES  Key size in bytes         [default 32].\n"
         "  -n, --key-num=COUNT   Number of keys            [default 1000].\n"
         "  -u, --key-uniform     Uniform key distribution  [default]\n"
@@ -54,7 +56,7 @@ void print_usage(void)
         "  -s, --key-seed=SEED   Seed for key PRG.\n"
         "  -o, --op-seed=SEED    Seed for operation PRG.\n"
         "  -S, --src-ip=IP       Source IPv4 address to bind [default 0.0.0.0].\n"
-        "  -P, --src-port=PORT   Source UDP port to bind     [default 0].\n"
+        "  -P, --src-port=PORT   Source port to bind         [default 0].\n"
         "  -r, --trace=FILE      Write operation trace to file.\n"
         "  -K, --keysteer        Key-based steering.\n"
         "  -B  --bypass-arp      Bypass ARP wait");
@@ -64,6 +66,8 @@ void init_settings(struct settings *s)
 {
     s->threads = 1;
     s->rate = 1000;
+    s->nconns = 1;
+    s->mpending = 1;
     s->keysize = 32;
     s->keynum = 1000;
     s->keydist = DIST_UNIFORM;
@@ -85,6 +89,8 @@ int parse_settings(int argc, char *argv[], struct settings *s)
     static struct option long_opts[] = {
             {"threads",     required_argument, NULL, 't'},
             {"rate",        required_argument, NULL, 'R'},
+            {"nconns",      required_argument, NULL, 1000},
+            {"mpending",    required_argument, NULL, 1001},
             {"key-size",    required_argument, NULL, 'k'},
             {"key-num",     required_argument, NULL, 'n'},
             {"key-uniform", no_argument,       NULL, 'u'},
@@ -122,6 +128,20 @@ int parse_settings(int argc, char *argv[], struct settings *s)
                 if (!*optarg || *end || s->rate < 1) {
                     fprintf(stderr, "rate needs to be a positive integer "
                             "(kreq/s)\n");
+                    return -1;
+                }
+                break;
+            case 1000:
+                s->nconns = strtoul(optarg, &end, 10);
+                if (!*optarg || *end || s->nconns < 1) {
+                    fprintf(stderr, "nconns needs to be a positive integer\n");
+                    return -1;
+                }
+                break;
+            case 1001:
+                s->mpending = strtoul(optarg, &end, 10);
+                if (!*optarg || *end || s->mpending < 1) {
+                    fprintf(stderr, "mpending needs to be a positive integer\n");
                     return -1;
                 }
                 break;

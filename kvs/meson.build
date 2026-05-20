@@ -28,48 +28,77 @@ if librt.found()
   kvs_deps += librt
 endif
 
-kvsbench_linux = executable(
-  'kvsbench_linux',
-  kvs_bench_common + files('bench/linux_main.c') + clock_util_src + sock_util_src,
+kvsbench_udp_linux = executable(
+  'kvsbench_udp_linux',
+  kvs_bench_common + files('bench/udp_linux_main.c') + clock_util_src + sock_util_src,
   include_directories: [kvs_inc, utils_inc],
   dependencies: kvs_deps,
 )
-flexkvs_linux = executable(
-  'flexkvs_linux',
-  kvs_server_common + files('server/linux_main.c') + sock_util_src,
+flexkvs_udp_linux = executable(
+  'flexkvs_udp_linux',
+  kvs_server_common + files('server/udp_linux_main.c') + sock_util_src,
   include_directories: [kvs_inc, utils_inc],
   dependencies: kvs_deps,
 )
-alias_target('kvs_linux', [kvsbench_linux, flexkvs_linux])
+kvsbench_tcp_linux = executable(
+  'kvsbench_tcp_linux',
+  kvs_bench_common + files('bench/tcp_linux_main.c') + clock_util_src + sock_util_src,
+  include_directories: [kvs_inc, utils_inc],
+  dependencies: kvs_deps,
+)
+flexkvs_tcp_linux = executable(
+  'flexkvs_tcp_linux',
+  kvs_server_common + files('server/tcp_linux_main.c') + sock_util_src,
+  include_directories: [kvs_inc, utils_inc],
+  dependencies: kvs_deps,
+)
+alias_target('kvs_udp_linux', [kvsbench_udp_linux, flexkvs_udp_linux])
+alias_target('kvs_tcp_linux', [kvsbench_tcp_linux, flexkvs_tcp_linux])
 
 if cham_enabled
-  kvsbench_cham = executable(
-    'kvsbench_cham',
-    kvs_bench_common + files('bench/cham_main.c') + clock_util_src + sock_util_src,
+  kvsbench_udp_cham = executable(
+    'kvsbench_udp_cham',
+    kvs_bench_common + files('bench/udp_cham_main.c') + clock_util_src + sock_util_src,
     include_directories: [kvs_inc, utils_inc],
     dependencies: [kvs_deps, cham_deps],
   )
-  flexkvs_cham = executable(
-    'flexkvs_cham',
-    kvs_server_common + files('server/cham_main.c') + sock_util_src,
+  flexkvs_udp_cham = executable(
+    'flexkvs_udp_cham',
+    kvs_server_common + files('server/udp_cham_main.c') + sock_util_src,
     include_directories: [kvs_inc, utils_inc],
     dependencies : [kvs_deps, cham_deps],
   )
-  alias_target('kvs_cham', [kvsbench_cham, flexkvs_cham])
+  alias_target('kvs_udp_cham', [kvsbench_udp_cham, flexkvs_udp_cham])
+endif
+
+if cham_tcp_enabled
+  kvsbench_tcp_cham = executable(
+    'kvsbench_tcp_cham',
+    kvs_bench_common + files('bench/tcp_cham_main.c') + clock_util_src,
+    include_directories: [kvs_inc, utils_inc],
+    dependencies: [kvs_deps, cham_tcp_deps],
+  )
+  flexkvs_tcp_cham = executable(
+    'flexkvs_tcp_cham',
+    kvs_server_common + files('server/tcp_cham_main.c'),
+    include_directories: [kvs_inc, utils_inc],
+    dependencies : [kvs_deps, cham_tcp_deps],
+  )
+  alias_target('kvs_tcp_cham', [kvsbench_tcp_cham, flexkvs_tcp_cham])
 endif
 
 if demi_enabled
-  kvsbench_demi = executable(
-    'kvsbench_demi',
-    kvs_bench_common + files('bench/demi_main.c') + clock_util_src + sock_util_src,
+  kvsbench_udp_demi = executable(
+    'kvsbench_udp_demi',
+    kvs_bench_common + files('bench/udp_demi_main.c') + clock_util_src + sock_util_src,
     include_directories: [kvs_inc, utils_inc],
     dependencies: [kvs_deps, demi_dep],
   )
-  flexkvs_demi = executable(
-    'flexkvs_demi',
-    kvs_server_common + files('server/demi_main.c') + sock_util_src,
+  flexkvs_udp_demi = executable(
+    'flexkvs_udp_demi',
+    kvs_server_common + files('server/udp_demi_main.c') + sock_util_src,
     include_directories: [kvs_inc, utils_inc],
     dependencies: [kvs_deps, demi_dep],
   )
-  alias_target('kvs_demi', [kvsbench_demi, flexkvs_demi])
+  alias_target('kvs_udp_demi', [kvsbench_udp_demi, flexkvs_udp_demi])
 endif
