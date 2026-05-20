@@ -314,7 +314,7 @@ static void open_connections(struct core *c)
         }
 
         tcp_poll_slow(c->ctx);
-        int ret = tcp_wait(c->wait, evs, (int) pending_limit, 0);
+        int ret = tcp_wait(c->wait, evs, pending_limit, TCP_WAIT_NONBLOCK);
         if (ret < 0) {
             fprintf(stderr, "[%"PRIu64"] tcp_wait failed\n", c->id);
             abort();
@@ -560,11 +560,10 @@ static int core_poll(struct core *c, int timeout)
 {
     int processed = 0;
     int ret;
-    int flags = timeout == 0 ? TCP_WAIT_NONBLOCK : 0;
 
     tcp_poll_fast(c->ctx);
     tcp_poll_slow(c->ctx);
-    ret = tcp_wait(c->wait, c->events, (int) c->events_num, flags);
+    ret = tcp_wait(c->wait, c->events, (int) c->events_num, TCP_WAIT_NONBLOCK);
     tcp_poll_fast(c->ctx);
     tcp_poll_slow(c->ctx);
     if (ret < 0) {

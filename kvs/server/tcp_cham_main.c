@@ -520,8 +520,13 @@ static void *processing_thread(void *data)
                     }
                 }
             }
-            if ((events & TCP_WAIT_IN) != 0 && conn_rx(c, con) != 0) {
-                abort();
+            if ((events & TCP_WAIT_IN) != 0) {
+                if (conn_rx(c, con) != 0) {
+                    abort();
+                }
+                if (con->tx_len != con->tx_off && conn_tx(c, con) != 0) {
+                    abort();
+                }
             }
         }
 
