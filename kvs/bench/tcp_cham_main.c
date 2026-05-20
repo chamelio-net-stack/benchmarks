@@ -167,14 +167,15 @@ static void prepare_conn(struct core *c, struct conn *con, uint32_t id)
         abort();
     }
 
-    if (settings.srcip != INADDR_ANY || settings.srcport != 0) {
+    if (settings.srcport != -1 &&
+        (settings.srcip != INADDR_ANY || settings.srcport != 0)) {
         struct sockaddr_in bind_addr;
         int ret;
 
         memset(&bind_addr, 0, sizeof(bind_addr));
         bind_addr.sin_family = AF_INET;
         bind_addr.sin_addr.s_addr = htonl(settings.srcip);
-        bind_addr.sin_port = htons(settings.srcport);
+        bind_addr.sin_port = htons((uint16_t) settings.srcport);
         ret = tcp_bind(c->ctx, con->fd, (struct sockaddr *) &bind_addr,
             sizeof(bind_addr));
         if (ret != 0) {
@@ -344,7 +345,7 @@ static int conn_send_pending(struct core *c, struct conn *con)
             con->tx_len - con->tx_off, NULL, 0);
 
         if (ret > 0) {
-            con->tx_off += (size_t) ret;
+            con->tx_off += ret;
             continue;
         }
         if (ret == 0 || (ret < 0 &&

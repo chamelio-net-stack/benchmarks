@@ -184,13 +184,14 @@ static void prepare_conn(struct core *c, struct conn *con, uint32_t id)
         abort();
     }
 
-    if (settings.srcip != INADDR_ANY || settings.srcport != 0) {
+    if (settings.srcport != -1 &&
+        (settings.srcip != INADDR_ANY || settings.srcport != 0)) {
         struct sockaddr_in bind_addr;
 
         memset(&bind_addr, 0, sizeof(bind_addr));
         bind_addr.sin_family = AF_INET;
         bind_addr.sin_addr.s_addr = htonl(settings.srcip);
-        bind_addr.sin_port = htons(settings.srcport);
+        bind_addr.sin_port = htons((uint16_t) settings.srcport);
         if (bind(con->fd, (struct sockaddr *) &bind_addr, sizeof(bind_addr)) != 0) {
             perror("bind failed");
             fprintf(stderr, "[%"PRIu64"] bind failed\n", c->id);

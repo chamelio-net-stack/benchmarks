@@ -159,16 +159,18 @@ static void prepare_core(struct core *c)
         abort();
     }
 
-    memset(&bind_addr, 0, sizeof(bind_addr));
-    bind_addr.sin_family = AF_INET;
-    bind_addr.sin_addr.s_addr = htonl(settings.srcip);
-    bind_addr.sin_port = htons(settings.srcport);
-    ret = udp_bind(c->ctx, c->fd, (struct sockaddr *) &bind_addr,
-        sizeof(bind_addr));
-    if (ret != 0) {
-        perror("bind failed");
-        fprintf(stderr, "[%"PRIu64"] bind failed\n", c->id);
-        abort();
+    if (settings.srcport != -1) {
+        memset(&bind_addr, 0, sizeof(bind_addr));
+        bind_addr.sin_family = AF_INET;
+        bind_addr.sin_addr.s_addr = htonl(settings.srcip);
+        bind_addr.sin_port = htons((uint16_t) settings.srcport);
+        ret = udp_bind(c->ctx, c->fd, (struct sockaddr *) &bind_addr,
+            sizeof(bind_addr));
+        if (ret != 0) {
+            perror("bind failed");
+            fprintf(stderr, "[%"PRIu64"] bind failed\n", c->id);
+            abort();
+        }
     }
 
     addr = &c->addr;

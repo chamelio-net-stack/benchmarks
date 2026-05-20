@@ -36,7 +36,7 @@ struct settings {
     uint32_t dstip;
     uint16_t dstport;
     uint32_t srcip;
-    uint16_t srcport;
+    int srcport;
     uint16_t threads;
     uint32_t rate;
     uint32_t nconns;

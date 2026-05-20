@@ -56,7 +56,7 @@ void print_usage(void)
         "  -s, --key-seed=SEED   Seed for key PRG.\n"
         "  -o, --op-seed=SEED    Seed for operation PRG.\n"
         "  -S, --src-ip=IP       Source IPv4 address to bind [default 0.0.0.0].\n"
-        "  -P, --src-port=PORT   Source port to bind         [default 0].\n"
+        "  -P, --src-port=PORT   Source port to bind         [default 0, -1 disables bind].\n"
         "  -r, --trace=FILE      Write operation trace to file.\n"
         "  -K, --keysteer        Key-based steering.\n"
         "  -B  --bypass-arp      Bypass ARP wait");
@@ -243,12 +243,12 @@ int parse_settings(int argc, char *argv[], struct settings *s)
                 }
                 break;
             case 'P': {
-                unsigned long port = strtoul(optarg, &end, 10);
-                if (!*optarg || *end || port > UINT16_MAX) {
-                    fprintf(stderr, "Source port must be in range [0, 65535].\n");
+                long port = strtol(optarg, &end, 10);
+                if (!*optarg || *end || port < -1 || port > UINT16_MAX) {
+                    fprintf(stderr, "Source port must be in range [-1, 65535].\n");
                     return -1;
                 }
-                s->srcport = (uint16_t) port;
+                s->srcport = (int) port;
                 break;
             }
             case 'K':
