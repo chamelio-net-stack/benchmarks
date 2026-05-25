@@ -23,7 +23,7 @@
 
 #define PRINT_STATS
 #ifdef PRINT_STATS
-#   define STATS_ADD(c, f, n) c->f += n
+#   define STATS_ADD(c, f, n) __atomic_fetch_add(&(c)->f, (n), __ATOMIC_RELAXED)
 #else
 #   define STATS_ADD(c, f, n) do { } while (0)
 #endif
@@ -92,10 +92,7 @@ static inline void record_latency(struct core *c, uint64_t nanos)
 #ifdef PRINT_STATS
 static inline uint64_t read_cnt(uint64_t *p)
 {
-    uint64_t v = *p;
-
-    __sync_fetch_and_sub(p, v);
-    return v;
+    return __atomic_exchange_n(p, 0, __ATOMIC_RELAXED);
 }
 #endif
 

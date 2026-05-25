@@ -24,7 +24,7 @@
 
 #define PRINT_STATS
 #ifdef PRINT_STATS
-#   define STATS_ADD(c, f, n) c->f += n
+#   define STATS_ADD(c, f, n) __atomic_fetch_add(&(c)->f, (n), __ATOMIC_RELAXED)
 #else
 #   define STATS_ADD(c, f, n) do { } while (0)
 #endif
