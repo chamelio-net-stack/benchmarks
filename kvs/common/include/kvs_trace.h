@@ -132,6 +132,9 @@ static inline struct kvs_trace *kvs_trace_find_msg(const void *buf, size_t len)
     {
         return NULL;
     }
+    if ((uint32_t) tr->orig_bodylen + sizeof(*tr) != bodylen) {
+        return NULL;
+    }
 
     return tr;
 }

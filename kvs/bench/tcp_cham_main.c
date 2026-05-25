@@ -77,6 +77,12 @@ struct core {
     uint64_t rx_set;
     uint64_t rx_success;
     uint64_t rx_fail;
+    uint64_t trace_seen;
+    uint64_t trace_match;
+    uint64_t trace_under_thresh;
+    uint64_t trace_reject_empty;
+    uint64_t trace_reject_opaque;
+    uint64_t trace_reject_core;
     uint64_t *hist;
 #endif
     struct tcp_context_lib *ctx;
@@ -540,6 +546,25 @@ static bool trace_matches_response(struct core *c, const struct kvs_trace *tr,
         (tr->trace_id >> 48) == c->id;
 }
 
+static void trace_account_match(struct core *c, const struct kvs_trace *tr,
+    uint32_t opaque)
+{
+    if (tr == NULL) {
+        return;
+    }
+
+    STATS_ADD(c, trace_seen, 1);
+    if (tr->count == 0) {
+        STATS_ADD(c, trace_reject_empty, 1);
+    } else if (tr->opaque != opaque) {
+        STATS_ADD(c, trace_reject_opaque, 1);
+    } else if ((tr->trace_id >> 48) != c->id) {
+        STATS_ADD(c, trace_reject_core, 1);
+    } else {
+        STATS_ADD(c, trace_match, 1);
+    }
+}
+
 static void print_trace(struct core *c, const struct kvs_trace *tr,
     uint32_t latency_us)
 {
@@ -590,6 +615,7 @@ static inline void account_response(struct core *c, enum workload_op op,
     }
 
     tr = kvs_trace_find_msg(buf, len);
+    trace_account_match(c, tr, opaque);
     if (trace_matches_response(c, tr, opaque)) {
         uint64_t now_tsc = kvs_trace_rdtsc();
         uint64_t delta_tsc = now_tsc >= tr->events[0].tsc ?
@@ -607,6 +633,8 @@ static inline void account_response(struct core *c, enum workload_op op,
             KVS_TRACE_WHERE_CLIENT_APP, -1, err, 0);
         if (settings.trace_slow_us != 0 && delta_us >= settings.trace_slow_us) {
             print_trace(c, tr, delta_us);
+        } else {
+            STATS_ADD(c, trace_under_thresh, 1);
         }
     }
 
@@ -803,10 +831,6 @@ static void core_tx(struct core *c)
                 if (((seq - 1) % settings.trace_sample) == 0) {
                     trace_id = (c->id << 48) |
                         (seq & 0x0000ffffffffffffULL);
-                    opaque = (uint32_t) seq;
-                    if (opaque == 0) {
-                        opaque = 1;
-                    }
                 }
             }
             if (tx_op == WL_OP_GET) {
@@ -904,6 +928,12 @@ int main(int argc, char *argv[])
     uint64_t tp_total = 0;
     uint64_t gen_int = 0;
     uint64_t tp_int = 0;
+    uint64_t trace_seen_int = 0;
+    uint64_t trace_match_int = 0;
+    uint64_t trace_under_int = 0;
+    uint64_t trace_empty_int = 0;
+    uint64_t trace_opaque_int = 0;
+    uint64_t trace_core_int = 0;
     uint64_t sec;
     long double load_mops;
     long double tp_mops;
@@ -969,11 +999,23 @@ int main(int argc, char *argv[])
         }
         gen_int = 0;
         tp_int = 0;
+        trace_seen_int = 0;
+        trace_match_int = 0;
+        trace_under_int = 0;
+        trace_empty_int = 0;
+        trace_opaque_int = 0;
+        trace_core_int = 0;
         msg_total = 0;
 
         for (i = 0; i < num_threads; i++) {
             gen_int += read_cnt(&cs[i].tx_get) + read_cnt(&cs[i].tx_set);
             tp_int += read_cnt(&cs[i].rx_success);
+            trace_seen_int += read_cnt(&cs[i].trace_seen);
+            trace_match_int += read_cnt(&cs[i].trace_match);
+            trace_under_int += read_cnt(&cs[i].trace_under_thresh);
+            trace_empty_int += read_cnt(&cs[i].trace_reject_empty);
+            trace_opaque_int += read_cnt(&cs[i].trace_reject_opaque);
+            trace_core_int += read_cnt(&cs[i].trace_reject_core);
         }
 
         gen_total += gen_int;
@@ -1002,13 +1044,21 @@ int main(int argc, char *argv[])
 
         printf("[ %3"PRIu64"s ] load=%'.4Lf mops  tp=%'.4Lf mops  50p=%d us  "
                "90p=%d us  95p=%d us  "
-               "99p=%d us  99.9p=%d us  99.99p=%d us\n",
+               "99p=%d us  99.9p=%d us  99.99p=%d us",
             sec,
             load_mops,
             tp_mops,
             hist_value(fracs_pos[0]), hist_value(fracs_pos[1]),
             hist_value(fracs_pos[2]), hist_value(fracs_pos[3]),
             hist_value(fracs_pos[4]), hist_value(fracs_pos[5]));
+        if (settings.trace_slow_us != 0) {
+            printf("  trace seen=%"PRIu64" match=%"PRIu64" under=%"PRIu64
+                   " rej_empty=%"PRIu64" rej_opaque=%"PRIu64
+                   " rej_core=%"PRIu64,
+                trace_seen_int, trace_match_int, trace_under_int,
+                trace_empty_int, trace_opaque_int, trace_core_int);
+        }
+        printf("\n");
 
         fflush(stdout);
         t_prev = t_cur;
