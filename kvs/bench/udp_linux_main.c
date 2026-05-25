@@ -53,7 +53,7 @@ struct core {
     uint64_t rx_set;
     uint64_t rx_success;
     uint64_t rx_fail;
-    uint32_t *hist;
+    uint64_t *hist;
 #endif
     int fd;
     uint8_t *rx_buf;
@@ -86,7 +86,7 @@ static inline void record_latency(struct core *c, uint64_t nanos)
         bucket = HIST_BUCKETS - 1;
     }
 
-    c->hist[bucket]++;
+    __atomic_fetch_add(&c->hist[bucket], 1, __ATOMIC_RELAXED);
 }
 
 #ifdef PRINT_STATS
@@ -430,7 +430,7 @@ static void *thread_run(void *arg)
     return NULL;
 }
 
-static inline void hist_fract_buckets(uint32_t *hist, uint64_t total,
+static inline void hist_fract_buckets(uint64_t *hist, uint64_t total,
         double *fracs, size_t *idxs, size_t num)
 {
     size_t i;
@@ -467,7 +467,7 @@ int main(int argc, char *argv[])
     struct core *cs;
     uint64_t t_prev;
     uint64_t t_cur;
-    uint32_t *hist_cur;
+    uint64_t *hist_cur;
     uint64_t gen_total = 0;
     uint64_t tp_total = 0;
     uint64_t gen_int = 0;
@@ -544,9 +544,9 @@ int main(int argc, char *argv[])
         for (j = 0; j < HIST_BUCKETS; j++) {
             uint64_t sum = 0;
             for (i = 0; i < num_threads; i++) {
-                sum += cs[i].hist[j];
+                sum += __atomic_load_n(&cs[i].hist[j], __ATOMIC_RELAXED);
             }
-            hist_cur[j] = (uint32_t) sum;
+            hist_cur[j] = sum;
             msg_total += hist_cur[j];
         }
 
@@ -590,9 +590,9 @@ int main(int argc, char *argv[])
     for (j = 0; j < HIST_BUCKETS; j++) {
         uint64_t sum = 0;
         for (i = 0; i < num_threads; i++) {
-            sum += cs[i].hist[j];
+            sum += __atomic_load_n(&cs[i].hist[j], __ATOMIC_RELAXED);
         }
-        hist_cur[j] = (uint32_t) sum;
+        hist_cur[j] = sum;
         msg_total += hist_cur[j];
     }
     if (msg_total > 0) {
