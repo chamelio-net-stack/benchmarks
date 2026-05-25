@@ -6,8 +6,9 @@
 #include <stdint.h>
 
 #define KVS_TRACE_MAGIC 0x4b565354U
-#define KVS_TRACE_VERSION 1
+#define KVS_TRACE_VERSION 2
 #define KVS_TRACE_MAX_EVENTS 22
+#define KVS_TRACE_V1_SIZE (16 + KVS_TRACE_MAX_EVENTS * sizeof(struct kvs_trace_event))
 
 enum kvs_trace_event_type {
     KVS_TRACE_CLIENT_REQ_GENERATED = 1,
@@ -55,6 +56,19 @@ struct kvs_trace_event {
 } __attribute__((packed));
 
 struct kvs_trace {
+    uint32_t magic;
+    uint16_t orig_bodylen;
+    uint8_t count;
+    uint8_t capacity;
+    uint8_t version;
+    uint8_t flags;
+    uint16_t reserved;
+    uint32_t opaque;
+    uint64_t trace_id;
+    struct kvs_trace_event events[KVS_TRACE_MAX_EVENTS];
+} __attribute__((packed));
+
+struct kvs_trace_v1 {
     uint32_t magic;
     uint32_t trace_id;
     uint16_t orig_bodylen;
@@ -142,6 +156,30 @@ static inline struct kvs_trace *kvs_trace_find_trailer(const void *buf,
     return tr;
 }
 
+static inline size_t kvs_trace_trailer_size(const void *buf, size_t len)
+{
+    const struct kvs_trace_v1 *v1;
+
+    if (kvs_trace_find_trailer(buf, len) != NULL) {
+        return sizeof(struct kvs_trace);
+    }
+
+    if (len < KVS_TRACE_V1_SIZE) {
+        return 0;
+    }
+
+    v1 = (const struct kvs_trace_v1 *) ((const uint8_t *) buf + len -
+        KVS_TRACE_V1_SIZE);
+    if (v1->magic == KVS_TRACE_MAGIC &&
+            v1->version == 1 &&
+            v1->capacity == KVS_TRACE_MAX_EVENTS)
+    {
+        return KVS_TRACE_V1_SIZE;
+    }
+
+    return 0;
+}
+
 static inline bool kvs_trace_add(struct kvs_trace *tr, uint8_t type,
     uint8_t where, int sock, uint16_t arg0, uint16_t arg1)
 {
@@ -163,17 +201,18 @@ static inline bool kvs_trace_add(struct kvs_trace *tr, uint8_t type,
     return true;
 }
 
-static inline void kvs_trace_init(struct kvs_trace *tr, uint32_t trace_id,
-    uint16_t orig_bodylen)
+static inline void kvs_trace_init(struct kvs_trace *tr, uint64_t trace_id,
+    uint16_t orig_bodylen, uint32_t opaque)
 {
     tr->magic = KVS_TRACE_MAGIC;
-    tr->trace_id = trace_id;
     tr->orig_bodylen = orig_bodylen;
     tr->count = 0;
     tr->capacity = KVS_TRACE_MAX_EVENTS;
     tr->version = KVS_TRACE_VERSION;
     tr->flags = 0;
     tr->reserved = 0;
+    tr->opaque = opaque;
+    tr->trace_id = trace_id;
 }
 
 #endif

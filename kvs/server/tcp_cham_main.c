@@ -167,6 +167,9 @@ static size_t process_request(struct core *c, const uint8_t *req_buf,
     if (trace_len != 0 && logical_bl + trace_len != bl) {
         return 0;
     }
+    if (req_trace != NULL && req_trace->opaque != req->request.opaque) {
+        return 0;
+    }
     total_len = sizeof(*req) + bl;
     if (total_len != rx_len) {
         return 0;
@@ -197,9 +200,12 @@ static size_t process_request(struct core *c, const uint8_t *req_buf,
 
         value_len = 0;
         if (it != NULL) {
+            size_t stale_trace_len;
+
             value_len = it->vallen;
-            if (kvs_trace_find_trailer(item_value(it), value_len) != NULL) {
-                value_len -= sizeof(struct kvs_trace);
+            stale_trace_len = kvs_trace_trailer_size(item_value(it), value_len);
+            if (stale_trace_len != 0) {
+                value_len -= stale_trace_len;
             }
         }
         tx_len = sizeof(*gres) + value_len + trace_len;

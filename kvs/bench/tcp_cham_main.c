@@ -87,7 +87,7 @@ struct core {
     struct conn *conns;
     struct workload_core wlc;
     uint64_t rx_malformed;
-    uint32_t trace_seq;
+    uint64_t trace_seq;
     uint64_t id;
     pthread_t pthread;
 } __attribute__((aligned(64)));
@@ -379,7 +379,7 @@ static int conn_send_pending(struct core *c, struct conn *con)
 }
 
 static inline void set_request(uint8_t *buf, size_t *len, struct key *k,
-    uint32_t opaque, uint32_t trace_id)
+    uint32_t opaque, uint64_t trace_id)
 {
     protocol_binary_request_set *set;
     protocol_binary_request_header *req;
@@ -410,7 +410,7 @@ static inline void set_request(uint8_t *buf, size_t *len, struct key *k,
         tr = (struct kvs_trace *) ((uint8_t *) (set + 1) + k->keylen +
             settings.valuesize);
         kvs_trace_init(tr, trace_id,
-            (uint16_t) (8 + k->keylen + settings.valuesize));
+            (uint16_t) (8 + k->keylen + settings.valuesize), opaque);
         kvs_trace_add(tr, KVS_TRACE_CLIENT_REQ_GENERATED,
             KVS_TRACE_WHERE_CLIENT_APP, -1, 0, 0);
     }
@@ -419,7 +419,7 @@ static inline void set_request(uint8_t *buf, size_t *len, struct key *k,
 }
 
 static inline void get_request(uint8_t *buf, size_t *len, struct key *k,
-    uint32_t opaque, uint32_t trace_id)
+    uint32_t opaque, uint64_t trace_id)
 {
     protocol_binary_request_get *get;
     protocol_binary_request_header *req;
@@ -444,7 +444,7 @@ static inline void get_request(uint8_t *buf, size_t *len, struct key *k,
     memcpy(get + 1, k->key, k->keylen);
     if (trace_id != 0) {
         tr = (struct kvs_trace *) ((uint8_t *) (get + 1) + k->keylen);
-        kvs_trace_init(tr, trace_id, (uint16_t) k->keylen);
+        kvs_trace_init(tr, trace_id, (uint16_t) k->keylen, opaque);
         kvs_trace_add(tr, KVS_TRACE_CLIENT_REQ_GENERATED,
             KVS_TRACE_WHERE_CLIENT_APP, -1, 0, 0);
     }
@@ -531,6 +531,15 @@ static const char *trace_where_name(uint8_t where)
     }
 }
 
+static bool trace_matches_response(struct core *c, const struct kvs_trace *tr,
+    uint32_t opaque)
+{
+    return tr != NULL &&
+        tr->count != 0 &&
+        tr->opaque == opaque &&
+        (tr->trace_id >> 48) == c->id;
+}
+
 static void print_trace(struct core *c, const struct kvs_trace *tr,
     uint32_t latency_us)
 {
@@ -544,8 +553,8 @@ static void print_trace(struct core *c, const struct kvs_trace *tr,
     pthread_mutex_lock(&trace_print_lock);
     base = tr->events[0].tsc;
     prev = base;
-    printf("slow trace core=%"PRIu64" trace=%"PRIu32" latency=%"PRIu32"us events=%u\n",
-        c->id, tr->trace_id, latency_us, tr->count);
+    printf("slow trace core=%"PRIu64" trace=%"PRIu64" opaque=%"PRIu32" latency=%"PRIu32"us events=%u\n",
+        c->id, tr->trace_id, tr->opaque, latency_us, tr->count);
     printf("  %10s %10s  %-28s %-13s fd arg0 arg1\n", "+us", "prev-us",
         "event", "where");
     for (uint8_t i = 0; i < tr->count; i++) {
@@ -580,10 +589,19 @@ static inline void account_response(struct core *c, enum workload_op op,
         return;
     }
 
-    now_us = (uint32_t) (get_nanos() / 1000);
-    delta_us = now_us - opaque;
-    record_latency(c, (uint64_t) delta_us * 1000);
     tr = kvs_trace_find_msg(buf, len);
+    if (trace_matches_response(c, tr, opaque)) {
+        uint64_t now_tsc = kvs_trace_rdtsc();
+        uint64_t delta_tsc = now_tsc >= tr->events[0].tsc ?
+            now_tsc - tr->events[0].tsc : 0;
+
+        delta_us = (uint32_t) ((double) delta_tsc / tsc_per_us);
+    } else {
+        tr = NULL;
+        now_us = (uint32_t) (get_nanos() / 1000);
+        delta_us = now_us - opaque;
+    }
+    record_latency(c, (uint64_t) delta_us * 1000);
     if (tr != NULL) {
         kvs_trace_add(tr, KVS_TRACE_CLIENT_RESPONSE_ACCOUNTED,
             KVS_TRACE_WHERE_CLIENT_APP, -1, err, 0);
@@ -635,9 +653,15 @@ static int conn_rx(struct core *c, struct conn *con)
                 continue;
             }
 
-            kvs_trace_add(kvs_trace_find_msg(con->rx_buf + parsed, reqlen),
-                KVS_TRACE_CLIENT_RECVFROM, KVS_TRACE_WHERE_CLIENT_APP,
-                con->fd, (uint16_t) con->id, 0);
+            {
+                struct kvs_trace *tr = kvs_trace_find_msg(con->rx_buf + parsed,
+                    reqlen);
+                if (trace_matches_response(c, tr, opaque)) {
+                    kvs_trace_add(tr, KVS_TRACE_CLIENT_RECVFROM,
+                        KVS_TRACE_WHERE_CLIENT_APP, con->fd,
+                        (uint16_t) con->id, 0);
+                }
+            }
             account_response(c, op, err, opaque, con->rx_buf + parsed, reqlen);
             parsed += reqlen;
             processed++;
@@ -769,16 +793,20 @@ static void core_tx(struct core *c)
             struct key *k;
             enum workload_op tx_op;
             uint32_t opaque;
-            uint32_t trace_id = 0;
+            uint64_t trace_id = 0;
 
             workload_op(&workload, &c->wlc, &k, &tx_op);
             opaque = (uint32_t) (get_nanos() / 1000);
-            if (settings.trace_slow_us != 0 &&
-                    (c->trace_seq++ % settings.trace_sample) == 0)
-            {
-                trace_id = ((uint32_t) c->id << 24) | (c->trace_seq & 0x00ffffff);
-                if (trace_id == 0) {
-                    trace_id = 1;
+            if (settings.trace_slow_us != 0) {
+                uint64_t seq = ++c->trace_seq;
+
+                if (((seq - 1) % settings.trace_sample) == 0) {
+                    trace_id = (c->id << 48) |
+                        (seq & 0x0000ffffffffffffULL);
+                    opaque = (uint32_t) seq;
+                    if (opaque == 0) {
+                        opaque = 1;
+                    }
                 }
             }
             if (tx_op == WL_OP_GET) {
