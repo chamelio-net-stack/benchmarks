@@ -157,12 +157,16 @@ static size_t process_request(struct core *c, const uint8_t *req_buf,
     struct kvs_trace *req_trace;
     struct kvs_trace *res_trace;
     size_t trace_len;
+    size_t value_len;
 
     req = (protocol_binary_request_header *) req_buf;
     bl = ntohl(req->request.bodylen);
     req_trace = kvs_trace_find_msg(req_buf, rx_len);
     trace_len = req_trace != NULL ? sizeof(*req_trace) : 0;
     logical_bl = req_trace != NULL ? req_trace->orig_bodylen : bl;
+    if (trace_len != 0 && logical_bl + trace_len != bl) {
+        return 0;
+    }
     total_len = sizeof(*req) + bl;
     if (total_len != rx_len) {
         return 0;
@@ -191,10 +195,14 @@ static size_t process_request(struct core *c, const uint8_t *req_buf,
         kvs_trace_add(req_trace, KVS_TRACE_SERVER_HASH_LOOKUP_END,
             KVS_TRACE_WHERE_SERVER_APP, -1, it != NULL, 0);
 
-        tx_len = sizeof(*gres) + trace_len;
+        value_len = 0;
         if (it != NULL) {
-            tx_len += it->vallen;
+            value_len = it->vallen;
+            if (kvs_trace_find_trailer(item_value(it), value_len) != NULL) {
+                value_len -= sizeof(struct kvs_trace);
+            }
         }
+        tx_len = sizeof(*gres) + value_len + trace_len;
         if (tx_len > settings.max_msg_size) {
             if (it != NULL) {
                 item_unref(it);
@@ -209,7 +217,7 @@ static size_t process_request(struct core *c, const uint8_t *req_buf,
         res->response.datatype = 0;
         if (it != NULL) {
             res->response.status = htons(PROTOCOL_BINARY_RESPONSE_SUCCESS);
-            res->response.bodylen = htonl(4 + it->vallen + trace_len);
+            res->response.bodylen = htonl(4 + value_len + trace_len);
         } else {
             res->response.status = htons(PROTOCOL_BINARY_RESPONSE_KEY_ENOENT);
             res->response.bodylen = htonl(4 + trace_len);
@@ -219,9 +227,9 @@ static size_t process_request(struct core *c, const uint8_t *req_buf,
         gres->message.body.flags = htonl(0);
 
         if (it != NULL) {
-            memcpy(gres + 1, item_value(it), it->vallen);
+            memcpy(gres + 1, item_value(it), value_len);
             res_trace = (struct kvs_trace *) ((uint8_t *) (gres + 1) +
-                it->vallen);
+                value_len);
             item_unref(it);
         } else {
             res_trace = (struct kvs_trace *) (gres + 1);

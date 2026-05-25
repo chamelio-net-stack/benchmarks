@@ -93,6 +93,7 @@ struct core {
 } __attribute__((aligned(64)));
 
 static double tsc_per_us;
+static pthread_mutex_t trace_print_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static inline uint64_t get_nanos(void)
 {
@@ -540,6 +541,7 @@ static void print_trace(struct core *c, const struct kvs_trace *tr,
         return;
     }
 
+    pthread_mutex_lock(&trace_print_lock);
     base = tr->events[0].tsc;
     prev = base;
     printf("slow trace core=%"PRIu64" trace=%"PRIu32" latency=%"PRIu32"us events=%u\n",
@@ -559,6 +561,7 @@ static void print_trace(struct core *c, const struct kvs_trace *tr,
         prev = ev->tsc;
     }
     fflush(stdout);
+    pthread_mutex_unlock(&trace_print_lock);
 }
 
 static inline void account_response(struct core *c, enum workload_op op,

@@ -122,6 +122,26 @@ static inline struct kvs_trace *kvs_trace_find_msg(const void *buf, size_t len)
     return tr;
 }
 
+static inline struct kvs_trace *kvs_trace_find_trailer(const void *buf,
+    size_t len)
+{
+    struct kvs_trace *tr;
+
+    if (len < sizeof(*tr)) {
+        return NULL;
+    }
+
+    tr = (struct kvs_trace *) ((uint8_t *) buf + len - sizeof(*tr));
+    if (tr->magic != KVS_TRACE_MAGIC ||
+            tr->version != KVS_TRACE_VERSION ||
+            tr->capacity != KVS_TRACE_MAX_EVENTS)
+    {
+        return NULL;
+    }
+
+    return tr;
+}
+
 static inline bool kvs_trace_add(struct kvs_trace *tr, uint8_t type,
     uint8_t where, int sock, uint16_t arg0, uint16_t arg1)
 {
