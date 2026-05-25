@@ -60,6 +60,8 @@ struct settings {
 
     bool keybased;
     bool bypass_arp;
+    uint32_t trace_slow_us;
+    uint32_t trace_sample;
 };
 
 struct key {

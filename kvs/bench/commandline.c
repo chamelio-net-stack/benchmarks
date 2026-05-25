@@ -58,6 +58,8 @@ void print_usage(void)
         "  -S, --src-ip=IP       Source IPv4 address to bind [default 0.0.0.0].\n"
         "  -P, --src-port=PORT   Source port to bind         [default 0, -1 disables bind].\n"
         "  -r, --trace=FILE      Write operation trace to file.\n"
+        "      --trace-slow-us=US Print request-carried trace for slow responses.\n"
+        "      --trace-sample=N   Trace every Nth request when slow tracing is on [default 1].\n"
         "  -K, --keysteer        Key-based steering.\n"
         "  -B  --bypass-arp      Bypass ARP wait");
 }
@@ -82,6 +84,8 @@ void init_settings(struct settings *s)
     s->srcport = 0;
     s->keybased = false;
     s->bypass_arp = false;
+    s->trace_slow_us = 0;
+    s->trace_sample = 1;
 }
 
 int parse_settings(int argc, char *argv[], struct settings *s)
@@ -105,6 +109,8 @@ int parse_settings(int argc, char *argv[], struct settings *s)
             {"op-seed",     required_argument, NULL, 'o'},
             {"src-ip",      required_argument, NULL, 'S'},
             {"src-port",    required_argument, NULL, 'P'},
+            {"trace-slow-us", required_argument, NULL, 1002},
+            {"trace-sample", required_argument, NULL, 1003},
             {"keysteer",    no_argument,       NULL, 'K'},
             {"bypass-arp",  no_argument,       NULL, 'B'},
         };
@@ -142,6 +148,20 @@ int parse_settings(int argc, char *argv[], struct settings *s)
                 s->mpending = strtoul(optarg, &end, 10);
                 if (!*optarg || *end || s->mpending < 1) {
                     fprintf(stderr, "mpending needs to be a positive integer\n");
+                    return -1;
+                }
+                break;
+            case 1002:
+                s->trace_slow_us = strtoul(optarg, &end, 10);
+                if (!*optarg || *end) {
+                    fprintf(stderr, "trace-slow-us needs to be an integer\n");
+                    return -1;
+                }
+                break;
+            case 1003:
+                s->trace_sample = strtoul(optarg, &end, 10);
+                if (!*optarg || *end || s->trace_sample < 1) {
+                    fprintf(stderr, "trace-sample needs to be a positive integer\n");
                     return -1;
                 }
                 break;

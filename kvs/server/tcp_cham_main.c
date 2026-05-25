@@ -16,6 +16,7 @@
 #include <protocol_binary.h>
 
 #include "iokvs.h"
+#include "kvs_trace.h"
 
 #define MAX_EVENTS 128
 #define TCP_TX_BATCH 32
@@ -145,6 +146,7 @@ static size_t process_request(struct core *c, const uint8_t *req_buf,
     uint8_t extlen;
     uint8_t op;
     uint32_t bl;
+    uint32_t logical_bl;
     uint32_t vl;
     uint32_t h;
     size_t total_len;
@@ -152,9 +154,15 @@ static size_t process_request(struct core *c, const uint8_t *req_buf,
     void *k;
     void *v;
     struct item *it;
+    struct kvs_trace *req_trace;
+    struct kvs_trace *res_trace;
+    size_t trace_len;
 
     req = (protocol_binary_request_header *) req_buf;
     bl = ntohl(req->request.bodylen);
+    req_trace = kvs_trace_find_msg(req_buf, rx_len);
+    trace_len = req_trace != NULL ? sizeof(*req_trace) : 0;
+    logical_bl = req_trace != NULL ? req_trace->orig_bodylen : bl;
     total_len = sizeof(*req) + bl;
     if (total_len != rx_len) {
         return 0;
@@ -165,20 +173,25 @@ static size_t process_request(struct core *c, const uint8_t *req_buf,
 
     kl = ntohs(req->request.keylen);
     extlen = req->request.extlen;
-    if ((uint32_t) extlen + kl > bl) {
+    if ((uint32_t) extlen + kl > logical_bl) {
         return 0;
     }
-
     op = req->request.opcode;
+    kvs_trace_add(req_trace, KVS_TRACE_SERVER_REQUEST_PARSED,
+        KVS_TRACE_WHERE_SERVER_APP, -1, op, 0);
     res = (protocol_binary_response_header *) tx_buf;
     gres = (protocol_binary_response_get *) tx_buf;
 
     if (op == PROTOCOL_BINARY_CMD_GET) {
         k = (uint8_t *) (req + 1) + extlen;
+        kvs_trace_add(req_trace, KVS_TRACE_SERVER_HASH_LOOKUP_START,
+            KVS_TRACE_WHERE_SERVER_APP, -1, kl, 0);
         h = jenkins_hash(k, kl);
         it = hasht_get(k, kl, h);
+        kvs_trace_add(req_trace, KVS_TRACE_SERVER_HASH_LOOKUP_END,
+            KVS_TRACE_WHERE_SERVER_APP, -1, it != NULL, 0);
 
-        tx_len = sizeof(*gres);
+        tx_len = sizeof(*gres) + trace_len;
         if (it != NULL) {
             tx_len += it->vallen;
         }
@@ -196,10 +209,10 @@ static size_t process_request(struct core *c, const uint8_t *req_buf,
         res->response.datatype = 0;
         if (it != NULL) {
             res->response.status = htons(PROTOCOL_BINARY_RESPONSE_SUCCESS);
-            res->response.bodylen = htonl(4 + it->vallen);
+            res->response.bodylen = htonl(4 + it->vallen + trace_len);
         } else {
             res->response.status = htons(PROTOCOL_BINARY_RESPONSE_KEY_ENOENT);
-            res->response.bodylen = htonl(4);
+            res->response.bodylen = htonl(4 + trace_len);
         }
         res->response.opaque = req->request.opaque;
         res->response.cas = 0;
@@ -207,7 +220,18 @@ static size_t process_request(struct core *c, const uint8_t *req_buf,
 
         if (it != NULL) {
             memcpy(gres + 1, item_value(it), it->vallen);
+            res_trace = (struct kvs_trace *) ((uint8_t *) (gres + 1) +
+                it->vallen);
             item_unref(it);
+        } else {
+            res_trace = (struct kvs_trace *) (gres + 1);
+        }
+        if (req_trace != NULL) {
+            memcpy(res_trace, req_trace, sizeof(*res_trace));
+            res_trace->orig_bodylen = (uint16_t) (ntohl(res->response.bodylen) -
+                trace_len);
+            kvs_trace_add(res_trace, KVS_TRACE_SERVER_RESPONSE_GENERATED,
+                KVS_TRACE_WHERE_SERVER_APP, -1, res->response.status, 0);
         }
 
         return tx_len;
@@ -216,9 +240,13 @@ static size_t process_request(struct core *c, const uint8_t *req_buf,
     if (op == PROTOCOL_BINARY_CMD_SET) {
         k = (uint8_t *) (req + 1) + extlen;
         v = (uint8_t *) k + kl;
-        vl = bl - kl - extlen;
+        vl = logical_bl - kl - extlen;
 
+        kvs_trace_add(req_trace, KVS_TRACE_SERVER_SET_ALLOC_START,
+            KVS_TRACE_WHERE_SERVER_APP, -1, (uint16_t) vl, 0);
         it = ialloc_alloc(&c->ia, sizeof(struct item) + kl + vl, false);
+        kvs_trace_add(req_trace, KVS_TRACE_SERVER_SET_ALLOC_END,
+            KVS_TRACE_WHERE_SERVER_APP, -1, it != NULL, 0);
         if (it != NULL) {
             h = jenkins_hash(k, kl);
 
@@ -232,7 +260,7 @@ static size_t process_request(struct core *c, const uint8_t *req_buf,
             item_unref(it);
         }
 
-        tx_len = sizeof(protocol_binary_response_set);
+        tx_len = sizeof(protocol_binary_response_set) + trace_len;
         if (tx_len > settings.max_msg_size) {
             return 0;
         }
@@ -244,9 +272,16 @@ static size_t process_request(struct core *c, const uint8_t *req_buf,
         res->response.datatype = 0;
         res->response.status = htons(it != NULL ?
             PROTOCOL_BINARY_RESPONSE_SUCCESS : PROTOCOL_BINARY_RESPONSE_ENOMEM);
-        res->response.bodylen = htonl(0);
+        res->response.bodylen = htonl(trace_len);
         res->response.opaque = req->request.opaque;
         res->response.cas = 0;
+        if (req_trace != NULL) {
+            res_trace = (struct kvs_trace *) (res + 1);
+            memcpy(res_trace, req_trace, sizeof(*res_trace));
+            res_trace->orig_bodylen = 0;
+            kvs_trace_add(res_trace, KVS_TRACE_SERVER_RESPONSE_GENERATED,
+                KVS_TRACE_WHERE_SERVER_APP, -1, res->response.status, 0);
+        }
         return tx_len;
     }
 
@@ -286,9 +321,36 @@ static size_t clean_log(struct item_allocator *ia, bool idle)
     return n;
 }
 
+static void trace_messages(uint8_t *buf, size_t len, uint8_t type,
+    uint8_t where, int fd, uint16_t arg0, uint16_t arg1)
+{
+    size_t off = 0;
+
+    while (off + sizeof(protocol_binary_response_header) <= len) {
+        protocol_binary_response_header *res;
+        size_t msg_len;
+
+        res = (protocol_binary_response_header *) (buf + off);
+        if (res->response.magic != PROTOCOL_BINARY_RES) {
+            return;
+        }
+        msg_len = sizeof(*res) + ntohl(res->response.bodylen);
+        if (off + msg_len > len) {
+            return;
+        }
+        kvs_trace_add(kvs_trace_find_msg(buf + off, msg_len), type, where,
+            fd, arg0, arg1);
+        off += msg_len;
+    }
+}
+
 static int conn_tx(struct core *c, struct conn *con)
 {
     while (con->tx_off < con->tx_len) {
+        if (con->tx_off == 0) {
+            trace_messages(con->tx_buf, con->tx_len, KVS_TRACE_SERVER_BEFORE_SEND,
+                KVS_TRACE_WHERE_SERVER_APP, con->fd, (uint16_t) con->id, 0);
+        }
         ssize_t ret = tcp_sendto(c->ctx, con->fd, con->tx_buf + con->tx_off,
             con->tx_len - con->tx_off, NULL, 0);
 
@@ -347,8 +409,14 @@ static size_t conn_process_rx(struct core *c, struct conn *con)
         tx_len = process_request(c, con->rx_buf + parsed, reqlen,
             con->tx_buf + con->tx_len);
         if (tx_len != 0) {
+            struct kvs_trace *tr = kvs_trace_find_msg(con->tx_buf + con->tx_len,
+                tx_len);
             con->tx_len += tx_len;
+            kvs_trace_add(tr, KVS_TRACE_SERVER_CLEANUP_START,
+                KVS_TRACE_WHERE_SERVER_APP, -1, 0, 0);
             clean_log(&c->ia, false);
+            kvs_trace_add(tr, KVS_TRACE_SERVER_CLEANUP_END,
+                KVS_TRACE_WHERE_SERVER_APP, -1, 0, 0);
         }
         parsed += reqlen;
     }
