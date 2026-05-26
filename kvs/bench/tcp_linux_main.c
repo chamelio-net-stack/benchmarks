@@ -487,7 +487,7 @@ static inline void account_response(struct core *c, enum workload_op op,
     uint32_t now_us;
     uint32_t delta_us;
 
-    if (phase != BENCHMARK_RUNNING) {
+    if (phase == BENCHMARK_PRELOAD) {
         if (op != WL_OP_SET || err != 0) {
             fprintf(stderr, "[%"PRIu64"] preload response failed: op=%d err=%x\n",
                 c->id, (int) op, err);
