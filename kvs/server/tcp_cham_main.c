@@ -531,9 +531,6 @@ static void *processing_thread(void *data)
         }
 
         clean_log(&c->ia, idle);
-        if (ret == 0) {
-            sched_yield();
-        }
     }
 
     return NULL;
