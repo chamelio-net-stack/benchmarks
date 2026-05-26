@@ -537,6 +537,23 @@ static const char *trace_where_name(uint8_t where)
     }
 }
 
+static bool trace_where_is_client(uint8_t where)
+{
+    return where == KVS_TRACE_WHERE_CLIENT_APP ||
+        where == KVS_TRACE_WHERE_CLIENT_TCP;
+}
+
+static bool trace_where_is_server(uint8_t where)
+{
+    return where == KVS_TRACE_WHERE_SERVER_APP ||
+        where == KVS_TRACE_WHERE_SERVER_TCP;
+}
+
+static bool trace_where_is_other(uint8_t where)
+{
+    return !trace_where_is_client(where) && !trace_where_is_server(where);
+}
+
 static bool trace_matches_response(struct core *c, const struct kvs_trace *tr,
     uint32_t opaque)
 {
@@ -565,28 +582,32 @@ static void trace_account_match(struct core *c, const struct kvs_trace *tr,
     }
 }
 
-static void print_trace(struct core *c, const struct kvs_trace *tr,
-    uint32_t latency_us)
+static void print_trace_group(const struct kvs_trace *tr, const char *title,
+    bool (*include)(uint8_t))
 {
-    uint64_t base;
-    uint64_t prev;
+    uint64_t base = 0;
+    uint64_t prev = 0;
+    bool printed = false;
 
-    if (tr == NULL || tr->count == 0) {
-        return;
-    }
-
-    pthread_mutex_lock(&trace_print_lock);
-    base = tr->events[0].tsc;
-    prev = base;
-    printf("slow trace core=%"PRIu64" trace=%"PRIu64" opaque=%"PRIu32" latency=%"PRIu32"us events=%u\n",
-        c->id, tr->trace_id, tr->opaque, latency_us, tr->count);
-    printf("  %10s %10s  %-28s %-13s fd arg0 arg1\n", "+us", "prev-us",
-        "event", "where");
     for (uint8_t i = 0; i < tr->count; i++) {
         const struct kvs_trace_event *ev = &tr->events[i];
-        uint64_t from_base = ev->tsc >= base ? ev->tsc - base : 0;
-        uint64_t from_prev = ev->tsc >= prev ? ev->tsc - prev : 0;
+        uint64_t from_base;
+        uint64_t from_prev;
 
+        if (!include(ev->where)) {
+            continue;
+        }
+        if (!printed) {
+            base = ev->tsc;
+            prev = base;
+            printed = true;
+            printf("  %s\n", title);
+            printf("  %10s %10s  %-28s %-13s fd arg0 arg1\n",
+                "+us", "prev-us", "event", "where");
+        }
+
+        from_base = ev->tsc >= base ? ev->tsc - base : 0;
+        from_prev = ev->tsc >= prev ? ev->tsc - prev : 0;
         printf("  %10.1f %10.1f  %-28s %-13s %d %u %u\n",
             (double) from_base / tsc_per_us,
             (double) from_prev / tsc_per_us,
@@ -594,6 +615,23 @@ static void print_trace(struct core *c, const struct kvs_trace *tr,
             (int) ev->sock, ev->arg0, ev->arg1);
         prev = ev->tsc;
     }
+}
+
+static void print_trace(struct core *c, const struct kvs_trace *tr,
+    uint32_t latency_us)
+{
+    if (tr == NULL || tr->count == 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&trace_print_lock);
+    printf("slow trace core=%"PRIu64" trace=%"PRIu64" opaque=%"PRIu32" latency=%"PRIu32"us events=%u\n",
+        c->id, tr->trace_id, tr->opaque, latency_us, tr->count);
+    print_trace_group(tr, "client timeline (client clock)",
+        trace_where_is_client);
+    print_trace_group(tr, "server timeline (server clock)",
+        trace_where_is_server);
+    print_trace_group(tr, "other timeline", trace_where_is_other);
     fflush(stdout);
     pthread_mutex_unlock(&trace_print_lock);
 }

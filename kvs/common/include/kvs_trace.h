@@ -7,8 +7,10 @@
 
 #define KVS_TRACE_MAGIC 0x4b565354U
 #define KVS_TRACE_VERSION 2
-#define KVS_TRACE_MAX_EVENTS 22
-#define KVS_TRACE_V1_SIZE (16 + KVS_TRACE_MAX_EVENTS * sizeof(struct kvs_trace_event))
+#define KVS_TRACE_MAX_EVENTS 48
+#define KVS_TRACE_LEGACY_MAX_EVENTS 22
+#define KVS_TRACE_V1_SIZE (16 + KVS_TRACE_LEGACY_MAX_EVENTS * sizeof(struct kvs_trace_event))
+#define KVS_TRACE_V2_LEGACY_SIZE (24 + KVS_TRACE_LEGACY_MAX_EVENTS * sizeof(struct kvs_trace_event))
 
 enum kvs_trace_event_type {
     KVS_TRACE_CLIENT_REQ_GENERATED = 1,
@@ -77,7 +79,7 @@ struct kvs_trace_v1 {
     uint8_t version;
     uint8_t flags;
     uint16_t reserved;
-    struct kvs_trace_event events[KVS_TRACE_MAX_EVENTS];
+    struct kvs_trace_event events[KVS_TRACE_LEGACY_MAX_EVENTS];
 } __attribute__((packed));
 
 static inline uint64_t kvs_trace_rdtsc(void)
@@ -171,11 +173,24 @@ static inline size_t kvs_trace_trailer_size(const void *buf, size_t len)
         return 0;
     }
 
+    if (len >= KVS_TRACE_V2_LEGACY_SIZE) {
+        const struct kvs_trace *v2;
+
+        v2 = (const struct kvs_trace *) ((const uint8_t *) buf + len -
+            KVS_TRACE_V2_LEGACY_SIZE);
+        if (v2->magic == KVS_TRACE_MAGIC &&
+                v2->version == KVS_TRACE_VERSION &&
+                v2->capacity == KVS_TRACE_LEGACY_MAX_EVENTS)
+        {
+            return KVS_TRACE_V2_LEGACY_SIZE;
+        }
+    }
+
     v1 = (const struct kvs_trace_v1 *) ((const uint8_t *) buf + len -
         KVS_TRACE_V1_SIZE);
     if (v1->magic == KVS_TRACE_MAGIC &&
             v1->version == 1 &&
-            v1->capacity == KVS_TRACE_MAX_EVENTS)
+            v1->capacity == KVS_TRACE_LEGACY_MAX_EVENTS)
     {
         return KVS_TRACE_V1_SIZE;
     }
