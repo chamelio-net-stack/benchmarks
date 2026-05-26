@@ -335,8 +335,8 @@ static size_t clean_log(struct item_allocator *ia, bool idle)
     return n;
 }
 
-static void trace_messages(uint8_t *buf, size_t len, uint8_t type,
-    uint8_t where, int fd, uint16_t arg0, uint16_t arg1)
+static void trace_messages_after(uint8_t *buf, size_t len, size_t old_len,
+    uint8_t type, uint8_t where, int fd, uint16_t arg0, uint16_t arg1)
 {
     size_t off = 0;
 
@@ -345,17 +345,27 @@ static void trace_messages(uint8_t *buf, size_t len, uint8_t type,
         size_t msg_len;
 
         res = (protocol_binary_response_header *) (buf + off);
-        if (res->response.magic != PROTOCOL_BINARY_RES) {
+        if (res->response.magic != PROTOCOL_BINARY_RES &&
+                res->response.magic != PROTOCOL_BINARY_REQ)
+        {
             return;
         }
         msg_len = sizeof(*res) + ntohl(res->response.bodylen);
         if (off + msg_len > len) {
             return;
         }
-        kvs_trace_add(kvs_trace_find_msg(buf + off, msg_len), type, where,
-            fd, arg0, arg1);
+        if (off + msg_len > old_len) {
+            kvs_trace_add(kvs_trace_find_msg(buf + off, msg_len), type, where,
+                fd, arg0, arg1);
+        }
         off += msg_len;
     }
+}
+
+static void trace_messages(uint8_t *buf, size_t len, uint8_t type,
+    uint8_t where, int fd, uint16_t arg0, uint16_t arg1)
+{
+    trace_messages_after(buf, len, 0, type, where, fd, arg0, arg1);
 }
 
 static int conn_tx(struct core *c, struct conn *con)
@@ -383,6 +393,8 @@ static int conn_tx(struct core *c, struct conn *con)
         return -1;
     }
 
+    trace_messages(con->tx_buf, con->tx_len, KVS_TRACE_SERVER_AFTER_HANDOFF,
+        KVS_TRACE_WHERE_SERVER_APP, con->fd, (uint16_t) con->id, 0);
     con->tx_len = 0;
     con->tx_off = 0;
     conn_update_events(c, con, 0);
@@ -458,7 +470,12 @@ static int conn_rx(struct core *c, struct conn *con)
             settings.max_msg_size - con->rx_len, NULL, 0);
 
         if (ret > 0) {
+            size_t old_len = con->rx_len;
+
             con->rx_len += (size_t) ret;
+            trace_messages_after(con->rx_buf, con->rx_len, old_len,
+                KVS_TRACE_SERVER_AFTER_RECVFROM,
+                KVS_TRACE_WHERE_SERVER_APP, con->fd, (uint16_t) con->id, 0);
             continue;
         }
         if (ret == 0) {

@@ -521,6 +521,19 @@ static const char *trace_event_name(uint8_t type)
         case KVS_TRACE_TCP_DUP_PAYLOAD: return "tcp duplicate payload";
         case KVS_TRACE_TCP_FLOW_BLOCKED: return "tcp flow-control blocked";
         case KVS_TRACE_TCP_QUEUE_FULL: return "tcp queue full";
+        case KVS_TRACE_TCP_RX_ENQUEUED: return "tcp rx enqueued to app";
+        case KVS_TRACE_TCP_APP_RX_COPY_START: return "tcp app rx copy start";
+        case KVS_TRACE_TCP_APP_RX_COPIED: return "tcp app rx copied";
+        case KVS_TRACE_TCP_APP_TX_COPY_START: return "tcp app tx copy start";
+        case KVS_TRACE_TCP_APP_TX_COPIED: return "tcp app tx copied";
+        case KVS_TRACE_TCP_TX_BUMP_MARKED: return "tcp tx bump marked";
+        case KVS_TRACE_TCP_TX_BUMPS_FLUSHED: return "tcp tx bumps flushed";
+        case KVS_TRACE_TCP_SCHED_COPY_START: return "tcp sched copy start";
+        case KVS_TRACE_TCP_SCHED_COPY_END: return "tcp sched copy end";
+        case KVS_TRACE_TCP_SCHED_RESCHEDULED: return "tcp sched rescheduled";
+        case KVS_TRACE_TCP_RX_RING_COPY_START: return "tcp rx ring copy start";
+        case KVS_TRACE_TCP_RX_RING_COPIED: return "tcp rx ring copied";
+        case KVS_TRACE_SERVER_AFTER_RECVFROM: return "server tcp_recvfrom returned";
         default: return "unknown";
     }
 }
@@ -602,13 +615,13 @@ static void print_trace_group(const struct kvs_trace *tr, const char *title,
             prev = base;
             printed = true;
             printf("  %s\n", title);
-            printf("  %10s %10s  %-28s %-13s fd arg0 arg1\n",
-                "+us", "prev-us", "event", "where");
+            printf("  %12s %12s  %-28s %-13s fd arg0 arg1\n",
+                "since0-us", "gap-us", "event", "where");
         }
 
         from_base = ev->tsc >= base ? ev->tsc - base : 0;
         from_prev = ev->tsc >= prev ? ev->tsc - prev : 0;
-        printf("  %10.1f %10.1f  %-28s %-13s %d %u %u\n",
+        printf("  %12.1f %12.1f  %-28s %-13s %d %u %u\n",
             (double) from_base / tsc_per_us,
             (double) from_prev / tsc_per_us,
             trace_event_name(ev->type), trace_where_name(ev->where),
@@ -1089,13 +1102,6 @@ int main(int argc, char *argv[])
             hist_value(fracs_pos[0]), hist_value(fracs_pos[1]),
             hist_value(fracs_pos[2]), hist_value(fracs_pos[3]),
             hist_value(fracs_pos[4]), hist_value(fracs_pos[5]));
-        if (settings.trace_slow_us != 0) {
-            printf("  trace seen=%"PRIu64" match=%"PRIu64" under=%"PRIu64
-                   " rej_empty=%"PRIu64" rej_opaque=%"PRIu64
-                   " rej_core=%"PRIu64,
-                trace_seen_int, trace_match_int, trace_under_int,
-                trace_empty_int, trace_opaque_int, trace_core_int);
-        }
         printf("\n");
 
         fflush(stdout);
