@@ -630,9 +630,9 @@ static void *processing_thread(void *data)
         }
 
         clean_log(&c->ia, idle);
-        if (ret == 0) {
-            sched_yield();
-        }
+        // if (ret == 0) {
+        //     sched_yield();
+        // }
     }
 
     return NULL;
@@ -688,7 +688,7 @@ int main(int argc, char *argv[])
     }
 
     while (n_ready < settings.numcores) {
-        sched_yield();
+        // sched_yield();
     }
 
     printf("Starting Chamelio TCP KVS maintenance\n");
