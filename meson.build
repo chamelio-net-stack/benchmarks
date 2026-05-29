@@ -52,5 +52,5 @@ endif
 # endif
 
 subdir('rpc')
-# subdir('udp')
+subdir('udp')
 # subdir('kvs')
