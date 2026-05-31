@@ -1,6 +1,7 @@
 /* Usage:
  *   ./rpc_cham_server <bind_ip> <port> [--nworkers N][--service id1,id2,...]
  *  [--ncores N] [--buf-size] [--msize N] [--cores LIST]
+ *  [--svc-dist {fixed,uniform,exp,bimodal}] [--svc-time N]
  *
  * Example:
  *   ./rpc_cham_server 0.0.0.0 9000 --nworkers 2 --service 1,2,3,4
@@ -12,6 +13,9 @@
  *   --ncores Number of cores to use
  *   --buf-size Size of transmit buffer
  *   --cores Comma-separated core list (main, thread0, thread1, ...)
+ *   --svc-dist Service time distribution: fixed (default), uniform, exp, bimodal
+ *   --svc-time Mean/base service time in microseconds (default: 0)
+ *              bimodal: 90% requests take svc-time, 10% take 10x svc-time
  */
 
 #define _GNU_SOURCE
@@ -26,14 +30,28 @@
 #include <pthread.h>
 #include <assert.h>
 #include <sched.h>
+#include <math.h>
 #include "../utils/clock.h"
 #include "../utils/core.h"
 #include "services.h"
 
 #define MAX_WORKERS 16
 
-enum lb_mode { LB_MODE_EBPF = 0, LB_MODE_APP = 1 };
-static enum lb_mode lb_mode = LB_MODE_EBPF;
+enum lb_mode
+{
+LB_MODE_EBPF     = 0,
+LB_MODE_APP      = 1,
+LB_MODE_APP_JSQ  = 2,
+LB_MODE_EBPF_RR  = 3,
+};
+
+enum svc_dist
+{
+  SVC_FIXED   = 0,
+  SVC_UNIFORM = 1,
+  SVC_EXP     = 2,
+  SVC_BIMODAL = 3,
+};
 
 struct core
 {
@@ -50,6 +68,7 @@ struct core
   __u64 rxp_interval;
   __u64 txb_interval;
   __u64 txp_interval;
+  unsigned int rng_seed; /* per-core seed for thread-safe rand_r() */
   // struct sockaddr_in dst_addr;
 };
 
@@ -71,13 +90,66 @@ const char *src_ip;
 static int nworkers = 1;
 static int nservices;
 static __u8 *service_id;
+static enum lb_mode lb_mode = LB_MODE_EBPF;
+static enum svc_dist svc_dist = SVC_FIXED;
+static __u64 svc_time_ns = 0; /* mean/base service time in nanoseconds */
 
 static pthread_barrier_t start_barrier;
 static pthread_t *threads = NULL;
 static struct core *cores = NULL;
 struct sockaddr_in src_addr;
+static pthread_t dispatch_thread_handle;
 
 static struct rpc_server_lib *rpc_server;
+
+/* Busy-spin for ns nanoseconds using RDTSC. RDTSC is a single instruction
+ * (~5 cycles) vs clock_gettime(CLOCK_MONOTONIC_RAW) which can require a
+ * kernel entry — critical for accurate sub-100µs service times. */
+static inline void spin_ns(__u64 ns)
+{
+  __u64 cycles;
+  __u64 end;
+  if (ns == 0)
+    return;
+  cycles = (__u64)((double)ns * clock_tsc_per_us() / 1000.0);
+  end = util_rdtsc() + cycles;
+  while (util_rdtsc() < end)
+    __asm__ volatile("pause" ::: "memory");
+}
+
+/* Sample service time (ns) from the configured distribution.
+ * seed is per-core so threads never share RNG state. */
+static inline __u64 sample_svc_ns(unsigned int *seed)
+{
+  double u;
+
+  if (svc_time_ns == 0)
+    return 0;
+
+  switch (svc_dist)
+  {
+  case SVC_FIXED:
+    return svc_time_ns;
+
+  case SVC_UNIFORM:
+    /* Uniform(0, 2*mean) — preserves mean = svc_time_ns */
+    u = (double)rand_r(seed) / ((double)RAND_MAX + 1.0);
+    return (__u64)(2.0 * (double)svc_time_ns * u);
+
+  case SVC_EXP:
+    /* Exponential with mean = svc_time_ns via inverse CDF: -mean * ln(U) */
+    u = ((double)rand_r(seed) + 1.0) / ((double)RAND_MAX + 2.0); /* avoid ln(0) */
+    return (__u64)(-(double)svc_time_ns * log(u));
+
+  case SVC_BIMODAL:
+    /* 10% of requests are 10x slower (heavy tail) */
+    if ((rand_r(seed) % 10) == 0)
+      return 10 * svc_time_ns;
+    return svc_time_ns;
+  }
+
+  return svc_time_ns;
+}
 
 static inline int parse_core_list(const char *arg, int expected_len)
 {
@@ -255,11 +327,42 @@ static inline int parse_args(int argc, char **argv)
         lb_mode = LB_MODE_APP;
       else if (strcmp(argv[i], "ebpf") == 0)
         lb_mode = LB_MODE_EBPF;
+      else if (strcmp(argv[i], "app-jsq") == 0)
+        lb_mode = LB_MODE_APP_JSQ;
+      else if (strcmp(argv[i], "ebpf-rr") == 0)
+        lb_mode = LB_MODE_EBPF_RR;
       else
       {
-        fprintf(stderr, "--lb-mode must be 'ebpf' or 'app'\n");
+        fprintf(stderr, "--lb-mode must be 'ebpf', 'ebpf-rr', 'app', or 'app-jsq'\n");
         return -1;
       }
+    }
+    else if (strcmp(argv[i], "--svc-dist") == 0 && i + 1 < argc)
+    {
+      i++;
+      if (strcmp(argv[i], "fixed") == 0)
+        svc_dist = SVC_FIXED;
+      else if (strcmp(argv[i], "uniform") == 0)
+        svc_dist = SVC_UNIFORM;
+      else if (strcmp(argv[i], "exp") == 0)
+        svc_dist = SVC_EXP;
+      else if (strcmp(argv[i], "bimodal") == 0)
+        svc_dist = SVC_BIMODAL;
+      else
+      {
+        fprintf(stderr, "--svc-dist must be 'fixed', 'uniform', 'exp', or 'bimodal'\n");
+        return -1;
+      }
+    }
+    else if (strcmp(argv[i], "--svc-time") == 0 && i + 1 < argc)
+    {
+      double us = strtod(argv[++i], NULL);
+      if (us < 0.0)
+      {
+        fprintf(stderr, "--svc-time must be >= 0\n");
+        return -1;
+      }
+      svc_time_ns = (__u64)(us * 1000.0);
     }
     else
     {
@@ -388,6 +491,8 @@ static inline struct rpc_context_lib *core_init(struct core *c)
   c->rxp_interval = 0;
   c->txb_interval = 0;
   c->txp_interval = 0;
+  /* Seed per-core RNG differently so workers don't produce identical sequences */
+  c->rng_seed = (unsigned int)(now_ns() ^ ((unsigned int)c->id * 2654435761u));
   return c->rpc_ctx;
 }
 
@@ -439,8 +544,21 @@ static inline void dispatch_buf(struct core *c)
     }
     /* SERVICE_ECHO: no transformation; tsc at offset 0 is preserved */
 
+    /* Emulate service time by busy-spinning for the sampled duration.
+     * Applied after payload processing so compute itself isn't counted. */
+    spin_ns(sample_svc_ns(&c->rng_seed));
+
     offset += (int)msize;
   }
+}
+
+static void *dispatcher_thread(void *arg)
+{
+  struct rpc_server_lib *server = (struct rpc_server_lib *)arg;
+  pthread_barrier_wait(&start_barrier);
+  while (1)
+    rpc_app_dispatch(server);
+  return NULL;
 }
 
 static inline void *core_thread(void *arg)
@@ -572,6 +690,15 @@ static inline void create_rpc_serv()
     }
     fprintf(stderr, "App-layer JBSQ(1) pull enabled\n");
   }
+  else if (lb_mode == LB_MODE_APP_JSQ)
+  {
+    if (rpc_set_app_jsq(rpc_server) != 0)
+    {
+      fprintf(stderr, "Failed to enable app-layer JSQ mode\n");
+      abort();
+    }
+    fprintf(stderr, "App-layer JSQ dispatcher enabled\n");
+  }
 }
 
 static inline void start_cores()
@@ -586,6 +713,18 @@ static inline void start_cores()
     {
       errno = rc;
       perror("pthread_create");
+      abort();
+    }
+  }
+
+  if (lb_mode == LB_MODE_APP_JSQ)
+  {
+    rc = pthread_create(&dispatch_thread_handle, NULL,
+                        dispatcher_thread, rpc_server);
+    if (rc != 0)
+    {
+      errno = rc;
+      perror("pthread_create dispatcher");
       abort();
     }
   }
@@ -610,9 +749,10 @@ static inline void init_server()
     abort();
   }
 
-  /* Barrier for all cores + main (to synchronize start of sending) */
-  if (pthread_barrier_init(&start_barrier, NULL,
-                           (unsigned)ncores + 1) != 0)
+  /* Barrier for all cores + main + optional dispatcher thread */
+  unsigned barrier_count = (unsigned)ncores + 1 +
+                           (lb_mode == LB_MODE_APP_JSQ ? 1 : 0);
+  if (pthread_barrier_init(&start_barrier, NULL, barrier_count) != 0)
   {
     perror("pthread_barrier_init");
     abort();
@@ -643,6 +783,7 @@ int main(int argc, char **argv)
   if (ret != 0)
     abort();
 
+  calibrate_tsc();
   init_server();
   prepare_cores();
   create_rpc_serv();
@@ -654,10 +795,12 @@ int main(int argc, char **argv)
 
   start_cores();
 
-  printf("RPC server listening on %s:%d (msize=%zu) (bsize=%zu) (ncores=%d) \
-    (nworkers=%d) (service=%u)\n",
+  static const char *svc_dist_names[] = {"fixed", "uniform", "exp", "bimodal"};
+  printf("RPC server listening on %s:%d (msize=%zu) (bsize=%zu) (ncores=%d) "
+         "(nworkers=%d) (service=%u) (svc-dist=%s) (svc-time=%.2f us)\n",
          src_ip, src_port, msize, bsize, ncores,
-         nworkers, service_id[0]);
+         nworkers, service_id[0],
+         svc_dist_names[svc_dist], (double)svc_time_ns / 1000.0);
 
   fflush(stdout);
   pthread_barrier_wait(&start_barrier);
