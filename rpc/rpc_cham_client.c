@@ -64,6 +64,8 @@ int ncores = 1;
 const char *rem_ip;
 int rem_port;
 int service = SERVICE_ECHO;
+/* Percentage of requests to send as SERVICE_COMPUTE (0 = all echo, 10 = 10% compute) */
+static int mix_pct = 0;
 
 /* Global time and stats variables */
 __u64 t_start_ns, t_end_ns;
@@ -277,7 +279,8 @@ static inline int parse_args(int argc, char **argv)
   {
     fprintf(stderr, "Usage: %s <src_ip> <src_port> <rem_ip> <rem_port> [--msize N]"
                     " [--duration S] [--rate R] [--ncores N]"
-                    " [--service N (1=echo 2=compute)]\n",
+                    " [--service N (1=echo 2=compute)]"
+                    " [--mix N (N%% sent as compute, rest as echo)]\n",
             argv[0]);
     return -1;
   }
@@ -322,6 +325,15 @@ static inline int parse_args(int argc, char **argv)
       {
         fprintf(stderr, "Unknown service %d (valid: %d=echo  %d=compute)\n",
                 service, SERVICE_ECHO, SERVICE_COMPUTE);
+        return -1;
+      }
+    }
+    else if (strcmp(argv[i], "--mix") == 0 && i + 1 < argc)
+    {
+      mix_pct = atoi(argv[++i]);
+      if (mix_pct < 0 || mix_pct > 100)
+      {
+        fprintf(stderr, "--mix must be between 0 and 100\n");
         return -1;
       }
     }
@@ -437,7 +449,13 @@ static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
 
   while (c->tokens >= (double)msize)
   {
-    if (service == SERVICE_COMPUTE)
+    /* Per-request service selection: mix_pct% COMPUTE, rest ECHO */
+    int req_svc = service;
+    if (mix_pct > 0)
+      req_svc = ((int)(xorshift64(&c->prng_state) % 100) < mix_pct)
+                ? SERVICE_COMPUTE : SERVICE_ECHO;
+
+    if (req_svc == SERVICE_COMPUTE)
     {
       creq = (struct compute_req *)c->txbuf;
       creq->tsc = util_rdtsc();
@@ -453,7 +471,7 @@ static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
     }
 
     ntx = rpc_call(c->client, ntohl(c->dst_addr.sin_addr.s_addr),
-                   ntohs(c->dst_addr.sin_port), service, c->txbuf, msize);
+                   ntohs(c->dst_addr.sin_port), req_svc, c->txbuf, msize);
 
     if (ntx < 0)
       break;

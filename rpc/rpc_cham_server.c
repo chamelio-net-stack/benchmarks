@@ -43,6 +43,7 @@ LB_MODE_EBPF     = 0,
 LB_MODE_APP      = 1,
 LB_MODE_APP_JSQ  = 2,
 LB_MODE_EBPF_RR  = 3,
+LB_MODE_EBPF_LWL = 4,
 };
 
 enum svc_dist
@@ -63,7 +64,8 @@ struct core
   int ntx;
 
   __u8 *buf;
-  __u32 *rids; /* per-slot RID returned by rpc_handle_call() */
+  __u32 *rids;   /* per-slot RID returned by rpc_handle_call() */
+  __u8  *svc_ids; /* per-slot service ID, used by LWL completion */
   __u64 rxb_interval;
   __u64 rxp_interval;
   __u64 txb_interval;
@@ -94,6 +96,16 @@ static enum lb_mode lb_mode = LB_MODE_EBPF;
 static enum svc_dist svc_dist = SVC_FIXED;
 static __u64 svc_time_ns = 0; /* mean/base service time in nanoseconds */
 
+/* LWL cost table: cost_table[service_id] = cost units; defaults below */
+static __u32 cost_table[8] = {0, 1, 10, 0, 0, 0, 0, 0};
+/*                                  ^  ^
+ *                       SERVICE_ECHO=1  SERVICE_COMPUTE=10  */
+
+/* Per-service spin time in ns. In LWL mode derived from cost_table so that
+ * the worker's actual busy time matches the router's cost model. In all other
+ * modes every entry equals svc_time_ns. Set by derive_svc_times(). */
+static __u64 svc_time_ns_table[8] = {0};
+
 static pthread_barrier_t start_barrier;
 static pthread_t *threads = NULL;
 static struct core *cores = NULL;
@@ -117,38 +129,56 @@ static inline void spin_ns(__u64 ns)
     __asm__ volatile("pause" ::: "memory");
 }
 
-/* Sample service time (ns) from the configured distribution.
- * seed is per-core so threads never share RNG state. */
-static inline __u64 sample_svc_ns(unsigned int *seed)
+/* Sample service time (ns) from the configured distribution using base_ns
+ * as the mean/base value. seed is per-core so threads never share RNG state. */
+static inline __u64 sample_svc_ns(__u64 base_ns, unsigned int *seed)
 {
   double u;
 
-  if (svc_time_ns == 0)
+  if (base_ns == 0)
     return 0;
 
   switch (svc_dist)
   {
   case SVC_FIXED:
-    return svc_time_ns;
+    return base_ns;
 
   case SVC_UNIFORM:
-    /* Uniform(0, 2*mean) — preserves mean = svc_time_ns */
+    /* Uniform(0, 2*mean) — preserves mean = base_ns */
     u = (double)rand_r(seed) / ((double)RAND_MAX + 1.0);
-    return (__u64)(2.0 * (double)svc_time_ns * u);
+    return (__u64)(2.0 * (double)base_ns * u);
 
   case SVC_EXP:
-    /* Exponential with mean = svc_time_ns via inverse CDF: -mean * ln(U) */
+    /* Exponential with mean = base_ns via inverse CDF: -mean * ln(U) */
     u = ((double)rand_r(seed) + 1.0) / ((double)RAND_MAX + 2.0); /* avoid ln(0) */
-    return (__u64)(-(double)svc_time_ns * log(u));
+    return (__u64)(-(double)base_ns * log(u));
 
   case SVC_BIMODAL:
     /* 10% of requests are 10x slower (heavy tail) */
     if ((rand_r(seed) % 10) == 0)
-      return 10 * svc_time_ns;
-    return svc_time_ns;
+      return 10 * base_ns;
+    return base_ns;
   }
 
-  return svc_time_ns;
+  return base_ns;
+}
+
+/* Populate svc_time_ns_table from cost_table in LWL mode so the worker's
+ * actual spin time is proportional to the router's cost model.
+ * In all other modes every service gets the same svc_time_ns. */
+static void derive_svc_times(void)
+{
+  int i;
+  if (lb_mode == LB_MODE_EBPF_LWL)
+  {
+    for (i = 0; i < 8; i++)
+      svc_time_ns_table[i] = svc_time_ns * cost_table[i];
+  }
+  else
+  {
+    for (i = 0; i < 8; i++)
+      svc_time_ns_table[i] = svc_time_ns;
+  }
 }
 
 static inline int parse_core_list(const char *arg, int expected_len)
@@ -331,9 +361,11 @@ static inline int parse_args(int argc, char **argv)
         lb_mode = LB_MODE_APP_JSQ;
       else if (strcmp(argv[i], "ebpf-rr") == 0)
         lb_mode = LB_MODE_EBPF_RR;
+      else if (strcmp(argv[i], "ebpf-lwl") == 0)
+        lb_mode = LB_MODE_EBPF_LWL;
       else
       {
-        fprintf(stderr, "--lb-mode must be 'ebpf', 'ebpf-rr', 'app', or 'app-jsq'\n");
+        fprintf(stderr, "--lb-mode must be 'ebpf', 'ebpf-rr', 'ebpf-lwl', 'app', or 'app-jsq'\n");
         return -1;
       }
     }
@@ -363,6 +395,25 @@ static inline int parse_args(int argc, char **argv)
         return -1;
       }
       svc_time_ns = (__u64)(us * 1000.0);
+    }
+    else if (strcmp(argv[i], "--svc-cost") == 0 && i + 1 < argc)
+    {
+      /* format: id:cost,id:cost  e.g. 1:1,2:10 */
+      char *tmp = strdup(argv[++i]), *tok, *saveptr2;
+      if (!tmp) { perror("strdup svc-cost"); return -1; }
+      for (tok = strtok_r(tmp, ",", &saveptr2); tok;
+           tok = strtok_r(NULL, ",", &saveptr2))
+      {
+        unsigned id, cost;
+        if (sscanf(tok, "%u:%u", &id, &cost) != 2 || id >= 8)
+        {
+          fprintf(stderr, "--svc-cost: bad token '%s', use id:cost\n", tok);
+          free(tmp);
+          return -1;
+        }
+        cost_table[id] = cost;
+      }
+      free(tmp);
     }
     else
     {
@@ -453,7 +504,10 @@ static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
       break;
 
     c->ntx += ntx;
-    rpc_call_complete(c->worker);
+    if (lb_mode == LB_MODE_EBPF_LWL)
+      rpc_call_complete_svc(c->worker, c->svc_ids[c->ntx / msize - 1]);
+    else
+      rpc_call_complete(c->worker);
     __sync_fetch_and_add(&c->txp_interval, 1);
     __sync_fetch_and_add(&c->txb_interval, msize);
   }
@@ -544,9 +598,12 @@ static inline void dispatch_buf(struct core *c)
     }
     /* SERVICE_ECHO: no transformation; tsc at offset 0 is preserved */
 
-    /* Emulate service time by busy-spinning for the sampled duration.
-     * Applied after payload processing so compute itself isn't counted. */
-    spin_ns(sample_svc_ns(&c->rng_seed));
+    /* Record which service this slot carries so core_tx can subtract
+     * the right cost from work_remaining at completion (LWL mode). */
+    __u8 svc_id = (slot[8] == SERVICE_COMPUTE) ? SERVICE_COMPUTE : SERVICE_ECHO;
+    c->svc_ids[offset / (int)msize] = svc_id;
+
+    spin_ns(sample_svc_ns(svc_time_ns_table[svc_id], &c->rng_seed));
 
     offset += (int)msize;
   }
@@ -625,6 +682,14 @@ static inline void create_rpc_serv()
       abort();
     }
     memset(cores[i].rids, 0, (bsize / msize) * sizeof(__u32));
+
+    cores[i].svc_ids = (__u8 *)malloc((bsize / msize) * sizeof(__u8));
+    if (cores[i].svc_ids == NULL)
+    {
+      perror("malloc core svc_ids");
+      abort();
+    }
+    memset(cores[i].svc_ids, 0, (bsize / msize) * sizeof(__u8));
 
     cores[i].rpc_ctx = rpc_ctx_new();
     if (cores[i].rpc_ctx == NULL)
@@ -708,6 +773,16 @@ static inline void create_rpc_serv()
     }
     fprintf(stderr, "eBPF round-robin enabled\n");
   }
+  else if (lb_mode == LB_MODE_EBPF_LWL)
+  {
+    if (rpc_set_ebpf_lwl(rpc_server, cost_table, 8) != 0)
+    {
+      fprintf(stderr, "Failed to enable eBPF LWL mode\n");
+      abort();
+    }
+    fprintf(stderr, "eBPF LWL enabled (costs: echo=%u compute=%u)\n",
+            cost_table[SERVICE_ECHO], cost_table[SERVICE_COMPUTE]);
+  }
 }
 
 static inline void start_cores()
@@ -787,6 +862,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "Failed to parse args\n");
     abort();
   }
+  derive_svc_times();
 
   ret = rpc_connect_slow();
   if (ret != 0)
