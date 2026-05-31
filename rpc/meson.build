@@ -13,5 +13,6 @@ rpc_cham_server = executable(
     rpc_core_src,
     rpc_clock_src,
     dependencies: cham_deps,
+    link_args: ['-lm'],
 )
 alias_target('rpc_cham', [rpc_cham_client, rpc_cham_server])
