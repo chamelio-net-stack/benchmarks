@@ -699,6 +699,15 @@ static inline void create_rpc_serv()
     }
     fprintf(stderr, "App-layer JSQ dispatcher enabled\n");
   }
+  else if (lb_mode == LB_MODE_EBPF_RR)
+  {
+    if (rpc_set_ebpf_rr(rpc_server) != 0)
+    {
+      fprintf(stderr, "Failed to enable eBPF round-robin mode\n");
+      abort();
+    }
+    fprintf(stderr, "eBPF round-robin enabled\n");
+  }
 }
 
 static inline void start_cores()
