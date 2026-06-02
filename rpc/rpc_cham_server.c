@@ -169,16 +169,16 @@ static inline __u64 sample_svc_ns(__u64 base_ns, unsigned int *seed)
 static void derive_svc_times(void)
 {
   int i;
-  if (lb_mode == LB_MODE_EBPF_LWL)
-  {
-    for (i = 0; i < 8; i++)
-      svc_time_ns_table[i] = svc_time_ns * cost_table[i];
-  }
-  else
-  {
-    for (i = 0; i < 8; i++)
-      svc_time_ns_table[i] = svc_time_ns;
-  }
+  // if (lb_mode == LB_MODE_EBPF_LWL)
+  // {
+  for (i = 0; i < 8; i++)
+    svc_time_ns_table[i] = svc_time_ns * cost_table[i];
+  // }
+//   else
+//   {
+//     for (i = 0; i < 8; i++)
+//       svc_time_ns_table[i] = svc_time_ns;
+//   }
 }
 
 static inline int parse_core_list(const char *arg, int expected_len)
@@ -396,6 +396,7 @@ static inline int parse_args(int argc, char **argv)
       }
       svc_time_ns = (__u64)(us * 1000.0);
     }
+    //this flag is to change the ratio btw fixed and compute: 1:10 for now
     else if (strcmp(argv[i], "--svc-cost") == 0 && i + 1 < argc)
     {
       /* format: id:cost,id:cost  e.g. 1:1,2:10 */
