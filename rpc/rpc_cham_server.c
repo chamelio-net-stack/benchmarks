@@ -163,22 +163,13 @@ static inline __u64 sample_svc_ns(__u64 base_ns, unsigned int *seed)
   return base_ns;
 }
 
-/* Populate svc_time_ns_table from cost_table in LWL mode so the worker's
- * actual spin time is proportional to the router's cost model.
- * In all other modes every service gets the same svc_time_ns. */
+/* Populate svc_time_ns_table from cost_table so that service execution time
+ * is proportional to cost, giving all LB policies the same bimodal workload. */
 static void derive_svc_times(void)
 {
   int i;
-  // if (lb_mode == LB_MODE_EBPF_LWL)
-  // {
   for (i = 0; i < 8; i++)
     svc_time_ns_table[i] = svc_time_ns * cost_table[i];
-  // }
-//   else
-//   {
-//     for (i = 0; i < 8; i++)
-//       svc_time_ns_table[i] = svc_time_ns;
-//   }
 }
 
 static inline int parse_core_list(const char *arg, int expected_len)
@@ -502,7 +493,7 @@ static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
                      c->rids[c->ntx / msize], c->buf + c->ntx, msize);
 
     if (ntx <= 0)
-      break;
+      return;
 
     c->ntx += ntx;
     if (lb_mode == LB_MODE_EBPF_LWL)
@@ -636,8 +627,11 @@ static inline void *core_thread(void *arg)
   while (1)
   {
     rpc_poll_calls(rpc_ctx);
-    core_rx(rpc_ctx, c);
-    dispatch_buf(c);
+    if (c->nrx == 0)
+    {
+      core_rx(rpc_ctx, c);
+      dispatch_buf(c);
+    }
     rpc_poll_calls(rpc_ctx);
     core_tx(rpc_ctx, c);
   }
