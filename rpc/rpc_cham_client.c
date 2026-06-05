@@ -468,6 +468,7 @@ static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
     {
       ph = (struct payload_hdr *)c->txbuf;
       ph->tsc = util_rdtsc();
+      c->txbuf[8] = 0;
     }
 
     ntx = rpc_call(c->client, ntohl(c->dst_addr.sin_addr.s_addr),
