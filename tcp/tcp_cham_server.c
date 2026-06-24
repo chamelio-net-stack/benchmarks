@@ -111,6 +111,10 @@ static inline int parse_args(int argc, char **argv)
     {
       bsize = (size_t)strtoul(argv[++i], NULL, 10);
     }
+    else if (strcmp(argv[i], "--debug") == 0)
+    {
+      tcp_set_debug(1);
+    }
     else
     {
       fprintf(stderr, "Unknown arg: %s\n", argv[i]);

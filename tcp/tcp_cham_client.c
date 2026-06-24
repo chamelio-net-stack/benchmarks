@@ -195,6 +195,10 @@ static inline int parse_args(int argc, char **argv)
     {
       burst_per_std = strtod(argv[++i], NULL);
     }
+    else if (strcmp(argv[i], "--debug") == 0)
+    {
+      tcp_set_debug(1);
+    }
     else
     {
       fprintf(stderr, "Unknown arg: %s\n", argv[i]);
