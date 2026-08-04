@@ -32,6 +32,9 @@
 
 #define MAX_WORKERS 16
 
+enum lb_mode { LB_MODE_EBPF = 0, LB_MODE_APP = 1 };
+static enum lb_mode lb_mode = LB_MODE_EBPF;
+
 struct core
 {
   int id;
@@ -244,6 +247,19 @@ static inline int parse_args(int argc, char **argv)
     else if (strcmp(argv[i], "--cores") == 0 && i + 1 < argc)
     {
       cores_arg = argv[++i];
+    }
+    else if (strcmp(argv[i], "--lb-mode") == 0 && i + 1 < argc)
+    {
+      i++;
+      if (strcmp(argv[i], "app") == 0)
+        lb_mode = LB_MODE_APP;
+      else if (strcmp(argv[i], "ebpf") == 0)
+        lb_mode = LB_MODE_EBPF;
+      else
+      {
+        fprintf(stderr, "--lb-mode must be 'ebpf' or 'app'\n");
+        return -1;
+      }
     }
     else
     {
@@ -546,6 +562,16 @@ static inline void create_rpc_serv()
       abort();
     }
   }
+
+  if (lb_mode == LB_MODE_APP)
+  {
+    if (rpc_set_app_lb(rpc_server) != 0)
+    {
+      fprintf(stderr, "Failed to enable app-layer LB mode\n");
+      abort();
+    }
+    fprintf(stderr, "App-layer JBSQ(1) pull enabled\n");
+  }
 }
 
 static inline void start_cores()
@@ -644,16 +670,18 @@ int main(int argc, char **argv)
   t_last_report_ns = t_start_ns;
   t_next_report_ns = t_start_ns + 1000000000ULL;
 
-  /* Per-second reporting loop in main thread */
-  while (1)
   {
-    now = now_ns();
-    if (now >= t_next_report_ns)
-      print_stats(now);
+    /*  Per-second reporting loop in main thread */
+    while (1)
+    {
+      now = now_ns();
+      if (now >= t_next_report_ns)
+        print_stats(now);
 
-    /* Sleep a bit to avoid busy wait */
-    struct timespec ts = {.tv_sec = 0, .tv_nsec = 2000000};
-    nanosleep(&ts, NULL);
+      /* Sleep a bit to avoid busy waiting */
+      struct timespec ts = {.tv_sec = 0, .tv_nsec = 2000000};
+      nanosleep(&ts, NULL);
+    }
   }
 
   /* Join all cores */
