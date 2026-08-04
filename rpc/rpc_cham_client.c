@@ -26,6 +26,9 @@
 #include <unistd.h>
 #include <pthread.h>
 #include "services.h"
+#include "../utils/hist.h"
+#include "../utils/core.h"
+#include "../utils/clock.h"
 
 struct payload_hdr
 {
@@ -61,6 +64,9 @@ socklen_t src_len;
 int duration = 30;
 double rate = 10.0;
 int ncores = 1;
+static char *cores_arg = NULL;
+static int *core_list = NULL;
+static int core_list_len = 0;
 const char *rem_ip;
 int rem_port;
 int service = SERVICE_ECHO;
@@ -77,8 +83,8 @@ __u64 txb_tp_interval_total, txp_tp_interval_total;
 static double tsc_per_us = 0.0;
 
 /* Total received samples across all cores */
-static __u64 total_rx = 0;
-static __u64 *rtt_hist = NULL;
+// static __u64 total_rx = 0;
+static struct hist_state rtt_hist = {0};
 
 /* Clamp histogram at 1 second */
 #define MAX_RTT_US 1000000u
@@ -87,7 +93,85 @@ static pthread_barrier_t start_barrier;
 static pthread_t *threads = NULL;
 static struct core *cores = NULL;
 
-static inline __u64 now_ns(void)
+static inline int parse_core_list(const char *arg, int expected_len)
+{
+  int count = 1;
+  const char *p = arg;
+  char *tmp, *tok, *end;
+  int idx = 0;
+
+  if (arg == NULL || *arg == '\0')
+    return -1;
+
+  while (*p)
+  {
+    if (*p == ',')
+      count++;
+    p++;
+  }
+
+  if (expected_len > 0 && count != expected_len)
+  {
+    fprintf(stderr, "cores list must have %d entries (main + %d threads)\n",
+        expected_len, expected_len - 1);
+    return -1;
+  }
+
+  core_list = (int *) calloc((size_t) count, sizeof(int));
+  if (!core_list)
+  {
+    perror("calloc core_list");
+    return -1;
+  }
+
+  tmp = strdup(arg);
+  if (!tmp)
+  {
+    perror("strdup cores");
+    free(core_list);
+    core_list = NULL;
+    return -1;
+  }
+
+  for (tok = strtok(tmp, ","); tok != NULL; tok = strtok(NULL, ","))
+  {
+    while (*tok == ' ' || *tok == '\t')
+      tok++;
+    if (*tok == '\0')
+    {
+      fprintf(stderr, "empty core id in list\n");
+      free(core_list);
+      core_list = NULL;
+      free(tmp);
+      return -1;
+    }
+    errno = 0;
+    core_list[idx] = (int) strtol(tok, &end, 10);
+    if (errno != 0 || end == tok || (*end != '\0' && *end != ' ' && *end != '\t'))
+    {
+      fprintf(stderr, "invalid core id: %s\n", tok);
+      free(core_list);
+      core_list = NULL;
+      free(tmp);
+      return -1;
+    }
+    if (core_list[idx] < 0 || core_list[idx] >= CPU_SETSIZE)
+    {
+      fprintf(stderr, "core id out of range: %d\n", core_list[idx]);
+      free(core_list);
+      core_list = NULL;
+      free(tmp);
+      return -1;
+    }
+    idx++;
+  }
+
+  free(tmp);
+  core_list_len = count;
+  return 0;
+}
+
+/*static inline __u64 now_ns(void)
 {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
@@ -215,7 +299,7 @@ static inline bool hist_percentiles(__u64 *p50, __u64 *p99, __u64 *p999)
   *p99 = v99;
   *p999 = v999;
   return 1;
-}
+}*/
 
 static inline void print_stats(__u64 now)
 {
@@ -251,7 +335,7 @@ static inline void print_stats(__u64 now)
   rps_tp = (double)txp_tp_interval_total / interval_s;
   mbps_tp = ((double)txb_tp_interval_total * 8.0 / 1e6) / interval_s;
 
-  hist_percentiles(&p50, &p99, &p999);
+  hist_percentiles(&rtt_hist, &p50, &p99, &p999);
 
   printf("[ %3lus ] load=%lld rps | load=%.2f Mb/s | tp=%lld rps | tp=%.2f Mb/s | ",
          (unsigned long)((t_next_report_ns - t_start_ns) / 1000000000ULL),
@@ -318,6 +402,10 @@ static inline int parse_args(int argc, char **argv)
     {
       ncores = atoi(argv[++i]);
     }
+    else if ((strcmp(argv[i], "--cores") == 0) && i + 1 < argc)
+    {
+      cores_arg = argv[++i];
+    }
     else if ((strcmp(argv[i], "--service") == 0) && i + 1 < argc)
     {
       service = atoi(argv[++i]);
@@ -361,10 +449,17 @@ static inline int parse_args(int argc, char **argv)
 
   if (ncores <= 0)
     ncores = 1;
+
+  if (cores_arg != NULL)
+  {
+    if (parse_core_list(cores_arg, ncores + 1) != 0)
+      return -1;
+  }
+
   return 0;
 }
 
-static inline int init_hist(void)
+/*static inline int init_hist(void)
 {
   rtt_hist = (__u64 *)calloc((size_t)MAX_RTT_US + 1, sizeof(__u64));
   if (!rtt_hist)
@@ -373,7 +468,7 @@ static inline int init_hist(void)
     return -1;
   }
   return 0;
-}
+}*/
 
 static inline void init_client()
 {
@@ -502,7 +597,7 @@ static inline void core_rx(struct rpc_context_lib *rpc_ctx, struct core *c)
     c->total_rx_pkts += 1;
     __sync_fetch_and_add(&c->txp_tp_interval, 1);
     __sync_fetch_and_add(&c->txb_tp_interval, nrx);
-    hist_add(rtt_us);
+    hist_add(&rtt_hist, rtt_us);
   }
 }
 
@@ -537,19 +632,6 @@ static inline struct rpc_context_lib *core_init(struct core *c)
     fprintf(stderr, "core %d: failed to create RPC client\n", c->id);
     pthread_exit((void *)(intptr_t)-1);
   }
-  // fprintf(stderr, "client: bind_success=%d tx_len=%u rx_len=%u tx_buf=%p rx_buf=%p core=%u\n",
-  //         c->client->bind_success,
-  //         c->client->tx_len,
-  //         c->client->rx_len,
-  //         c->client->tx_buf,
-  //         c->client->rx_buf,
-  //         c->client->core);
-
-  // fprintf(stderr, "client core=%u rx_ip=%u rx_port=%u tx_ip=%u\n",
-  //         c->client->core,
-  //         c->client->rx_ip,
-  //         c->client->rx_port,
-  //         c->client->tx_ip);
 
   /* Resolve ARP before the timed run */
   if (c->id == 0)
@@ -695,7 +777,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "Failed to parse args\n");
     abort();
   }
-  ret = init_hist();
+  ret = init_hist(&rtt_hist, MAX_RTT_US);
   if (ret != 0)
   {
     fprintf(stderr, "Failed to init hist\n");
@@ -709,6 +791,11 @@ int main(int argc, char **argv)
     exit(EXIT_FAILURE);
   }
   init_client();
+  if (core_list_len > 0)
+  {
+    if (pin_thread_to_core(core_list[0]) != 0)
+      return EXIT_FAILURE;
+  }
   prepare_cores();
   start_cores();
 
@@ -747,7 +834,7 @@ int main(int argc, char **argv)
 
   /* Final summary */
   __u64 p50 = 0, p99 = 0, p999 = 0;
-  hist_percentiles(&p50, &p99, &p999);
+  hist_percentiles(&rtt_hist, &p50, &p99, &p999);
 
   __u64 totalp_tx = 0, totalp_rx = 0;
   for (int i = 0; i < ncores; i++)
@@ -773,15 +860,14 @@ int main(int argc, char **argv)
   /* Cleanup */
   for (i = 0; i < ncores; i++)
   {
-    if (cores[i].txbuf)
-      free(cores[i].txbuf);
-    if (cores[i].rxbuf)
-      free(cores[i].rxbuf);
+    if (cores[i].txbuf) free(cores[i].txbuf);
+    if (cores[i].rxbuf) free(cores[i].rxbuf);
   }
 
   free(cores);
   free(threads);
-  free(rtt_hist);
+  free(core_list);
+  hist_cleanup(&rtt_hist);
   pthread_barrier_destroy(&start_barrier);
 
   return 0;
