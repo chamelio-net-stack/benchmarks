@@ -52,6 +52,7 @@ struct core
   double rate;
   double tokens;
   __u64 last_tsc;
+  // TODO: a revoir
   __u64 prng_state; /* xorshift64 state for operand generation */
 };
 
@@ -641,7 +642,7 @@ static inline struct rpc_context_lib *core_init(struct core *c)
       ph = (struct payload_hdr *)c->txbuf;
       ph->tsc = util_rdtsc();
       ret = rpc_call(c->client, ntohl(c->dst_addr.sin_addr.s_addr),
-                     ntohs(c->dst_addr.sin_port), 1, c->txbuf, msize);
+                     ntohs(c->dst_addr.sin_port), service, c->txbuf, msize);
       if (ret < 0)
       {
         fprintf(stderr, "failed to send RPC ARP warm-up packet\n");
