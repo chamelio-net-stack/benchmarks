@@ -360,7 +360,7 @@ static inline void print_stats(__u64 now)
 // TODO: add arg for cores to use (main, thread0, thread1, etc.)
 static inline int parse_args(int argc, char **argv)
 {
-  if (argc < 3)
+  if (argc < 5)
   {
     fprintf(stderr, "Usage: %s <src_ip> <src_port> <rem_ip> <rem_port> [--msize N]"
                     " [--duration S] [--rate R] [--ncores N]"
@@ -641,6 +641,7 @@ static inline struct rpc_context_lib *core_init(struct core *c)
     {
       ph = (struct payload_hdr *)c->txbuf;
       ph->tsc = util_rdtsc();
+      
       ret = rpc_call(c->client, ntohl(c->dst_addr.sin_addr.s_addr),
                      ntohs(c->dst_addr.sin_port), service, c->txbuf, msize);
       if (ret < 0)
