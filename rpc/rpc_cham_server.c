@@ -36,6 +36,7 @@
 #include "services.h"
 
 #define MAX_WORKERS 16
+#define MAX_SERVICE_NUMBER 8
 
 enum lb_mode
 {
@@ -97,14 +98,11 @@ static enum svc_dist svc_dist = SVC_FIXED;
 static __u64 svc_time_ns = 0; /* mean/base service time in nanoseconds */
 
 /* LWL cost table: cost_table[service_id] = cost units; defaults below */
-static __u32 cost_table[8] = {0, 1, 10, 0, 0, 0, 0, 0};
-/*                                  ^  ^
- *                       SERVICE_ECHO=1  SERVICE_COMPUTE=10  */
+static __u32 cost_table[MAX_SERVICE_NUMBER] = {0, 1, 10, 0, 0, 0, 0, 0};
 
-/* Per-service spin time in ns. In LWL mode derived from cost_table so that
- * the worker's actual busy time matches the router's cost model. In all other
- * modes every entry equals svc_time_ns. Set by derive_svc_times(). */
-static __u64 svc_time_ns_table[8] = {0};
+
+/* Per-service spin time in ns */
+static __u64 svc_time_ns_table[MAX_SERVICE_NUMBER] = {0};
 
 static pthread_barrier_t start_barrier;
 static pthread_t *threads = NULL;
@@ -114,9 +112,7 @@ static pthread_t dispatch_thread_handle;
 
 static struct rpc_server_lib *rpc_server;
 
-/* Busy-spin for ns nanoseconds using RDTSC. RDTSC is a single instruction
- * (~5 cycles) vs clock_gettime(CLOCK_MONOTONIC_RAW) which can require a
- * kernel entry — critical for accurate sub-100µs service times. */
+/* Busy-spin for ns nanoseconds using RDTSC */
 static inline void spin_ns(__u64 ns)
 {
   __u64 cycles;
@@ -586,7 +582,7 @@ static inline void dispatch_buf(struct core *c)
       }
 
       memcpy(slot, &resp, sizeof(resp));
-      /* remaining bytes in the slot are padding — left untouched */
+      /* remaining bytes in the slot are padding */
     }
     /* SERVICE_ECHO: no transformation; tsc at offset 0 is preserved */
 
