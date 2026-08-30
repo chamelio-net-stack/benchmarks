@@ -1,5 +1,6 @@
 /* Usage:
- *   ./rpc_cham_server <bind_ip> <port> [--nworkers N][--service id1,id2,...]
+ *   ./rpc_cham_server <bind_ip> <port> [--nworkers N]
+ *  [--nlong-workers N] [--service id1,id2,...]
  *  [--ncores N] [--buf-size] [--msize N] [--cores LIST]
  *  [--svc-dist {fixed,uniform,exp,bimodal}] [--svc-time N]
  *
@@ -8,6 +9,7 @@
  *   --ncores 2 --buf-size 4096 --msize 64
  *
  *   --nworkers Number of worker threads to create (default: 1)
+ *   --nlong-workers Number of workers reserved for long requests (default: 0)
  *   --service Comma-separated list of service IDs to register (default: none)
  *   --msize Size of expected message
  *   --ncores Number of cores to use
@@ -40,18 +42,18 @@
 
 enum lb_mode
 {
-LB_MODE_EBPF     = 0,
-LB_MODE_APP      = 1,
-LB_MODE_APP_JSQ  = 2,
-LB_MODE_EBPF_RR  = 3,
-LB_MODE_EBPF_LWL = 4,
+  LB_MODE_EBPF = 0,
+  LB_MODE_APP = 1,
+  LB_MODE_APP_JSQ = 2,
+  LB_MODE_EBPF_RR = 3,
+  LB_MODE_EBPF_LWL = 4,
 };
 
 enum svc_dist
 {
-  SVC_FIXED   = 0,
+  SVC_FIXED = 0,
   SVC_UNIFORM = 1,
-  SVC_EXP     = 2,
+  SVC_EXP = 2,
   SVC_BIMODAL = 3,
 };
 
@@ -66,7 +68,7 @@ struct core
 
   __u8 *buf;
   __u32 *rids;   /* per-slot RID returned by rpc_handle_call() */
-  __u8  *svc_ids; /* per-slot service ID, used by LWL completion */
+  __u8 *svc_ids; /* per-slot service ID, used by LWL completion */
   __u64 rxb_interval;
   __u64 rxp_interval;
   __u64 txb_interval;
@@ -91,6 +93,7 @@ __u64 t_last_report_ns, t_next_report_ns;
 int src_port;
 const char *src_ip;
 static int nworkers = 1;
+static int nlong_workers = 0;
 static int nservices;
 static __u8 *service_id;
 static enum lb_mode lb_mode = LB_MODE_EBPF;
@@ -99,7 +102,6 @@ static __u64 svc_time_ns = 0; /* mean/base service time in nanoseconds */
 
 /* LWL cost table: cost_table[service_id] = cost units; defaults below */
 static __u32 cost_table[MAX_SERVICE_NUMBER] = {0, 1, 10, 0, 0, 0, 0, 0};
-
 
 /* Per-service spin time in ns */
 static __u64 svc_time_ns_table[MAX_SERVICE_NUMBER] = {0};
@@ -254,6 +256,7 @@ static inline int parse_args(int argc, char **argv)
   if (argc < 3)
   {
     fprintf(stderr, "Usage: %s <bind_ip> <port> [--nworkers N]"
+                    " [--nlong-workers N]"
                     " [--service id1,id2,...] [--ncores N] [--buf-size]"
                     " [--msize N] [--cores LIST]\n",
             argv[0]);
@@ -273,9 +276,18 @@ static inline int parse_args(int argc, char **argv)
       nworkers = atoi(argv[++i]);
       if (nworkers <= 0)
         nworkers = 1;
-      if (nworkers >= MAX_WORKERS)
+      if (nworkers > MAX_WORKERS)
       {
         fprintf(stderr, "nworkers should not be more than %d\n", MAX_WORKERS);
+        return -1;
+      }
+    }
+    else if (strcmp(argv[i], "--nlong-workers") == 0 && i + 1 < argc)
+    {
+      nlong_workers = atoi(argv[++i]);
+      if (nlong_workers < 0)
+      {
+        fprintf(stderr, "nlong-workers must not be negative\n");
         return -1;
       }
     }
@@ -383,12 +395,16 @@ static inline int parse_args(int argc, char **argv)
       }
       svc_time_ns = (__u64)(us * 1000.0);
     }
-    //this flag is to change the ratio btw fixed and compute: 1:10 for now
+    // this flag is to change the ratio btw fixed and compute: 1:10 for now
     else if (strcmp(argv[i], "--svc-cost") == 0 && i + 1 < argc)
     {
       /* format: id:cost,id:cost  e.g. 1:1,2:10 */
       char *tmp = strdup(argv[++i]), *tok, *saveptr2;
-      if (!tmp) { perror("strdup svc-cost"); return -1; }
+      if (!tmp)
+      {
+        perror("strdup svc-cost");
+        return -1;
+      }
       for (tok = strtok_r(tmp, ",", &saveptr2); tok;
            tok = strtok_r(NULL, ",", &saveptr2))
       {
@@ -420,6 +436,13 @@ static inline int parse_args(int argc, char **argv)
   {
     fprintf(stderr, "rpc benchmark requires --nworkers to match --ncores "
                     "so each worker has one thread/core\n");
+    return -1;
+  }
+
+  if (nlong_workers > nworkers)
+  {
+    fprintf(stderr, "nlong-workers (%d) must not exceed nworkers (%d)\n",
+            nlong_workers, nworkers);
     return -1;
   }
 
@@ -722,11 +745,33 @@ static inline void create_rpc_serv()
       fprintf(stderr, "Failed to register service %u\n", service_id[i]);
       abort();
     }
+    switch (service_id[i])
+    {
+    case SERVICE_ECHO:
+      ret = rpc_set_service_class(rpc_server, SERVICE_ECHO, RPC_REQ_CLASS_SHORT);
+      break;
+    case SERVICE_COMPUTE:
+      ret = rpc_set_service_class(rpc_server, SERVICE_COMPUTE, RPC_REQ_CLASS_LONG);
+      break;
+    default:
+      fprintf(stderr,
+              "No request class configured for service %u\n",
+              service_id[i]);
+      abort();
+    }
+    if (ret != 0)
+    {
+      fprintf(stderr, "Failed to set service class for service %u\n",
+              service_id[i]);
+      abort();
+    }
   }
   fprintf(stdout, "RPC server created & service %u registered.\n", service_id[0]);
 
   for (i = 0; i < ncores; i++)
   {
+    __u8 worker_type;
+
     cores[i].rpc_server = rpc_server;
     fprintf(stderr, "  thread %d creating RPC worker...\n", i);
     cores[i].worker = rpc_new_worker(rpc_server, cores[i].rpc_ctx);
@@ -735,6 +780,17 @@ static inline void create_rpc_serv()
       fprintf(stderr, "thread %d: failed to create RPC worker\n", i);
       abort();
     }
+
+    worker_type = (i >= nworkers - nlong_workers) ? WORKER_TYPE_LONG
+                                                  : WORKER_TYPE_SHORT;
+    
+    if (rpc_set_worker_type(cores[i].worker, worker_type) != 0)
+    {
+      fprintf(stderr, "thread %d: failed to set RPC worker type\n", i);
+      abort();
+    }
+    fprintf(stderr, "  thread %d worker type: %s\n", i,
+            worker_type == WORKER_TYPE_LONG ? "long" : "short");
   }
 
   if (lb_mode == LB_MODE_APP)
