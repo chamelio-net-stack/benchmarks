@@ -80,9 +80,6 @@ __u64 t_last_report_ns, t_next_report_ns;
 __u64 txb_load_interval_total, txp_load_interval_total;
 __u64 txb_tp_interval_total, txp_tp_interval_total;
 
-/* Cycles per microsecond */
-static double tsc_per_us = 0.0;
-
 /* Total received samples across all cores */
 // static __u64 total_rx = 0;
 static struct hist_state rtt_hist = {0};
@@ -114,11 +111,11 @@ static inline int parse_core_list(const char *arg, int expected_len)
   if (expected_len > 0 && count != expected_len)
   {
     fprintf(stderr, "cores list must have %d entries (main + %d threads)\n",
-        expected_len, expected_len - 1);
+            expected_len, expected_len - 1);
     return -1;
   }
 
-  core_list = (int *) calloc((size_t) count, sizeof(int));
+  core_list = (int *)calloc((size_t)count, sizeof(int));
   if (!core_list)
   {
     perror("calloc core_list");
@@ -147,7 +144,7 @@ static inline int parse_core_list(const char *arg, int expected_len)
       return -1;
     }
     errno = 0;
-    core_list[idx] = (int) strtol(tok, &end, 10);
+    core_list[idx] = (int)strtol(tok, &end, 10);
     if (errno != 0 || end == tok || (*end != '\0' && *end != ' ' && *end != '\t'))
     {
       fprintf(stderr, "invalid core id: %s\n", tok);
@@ -171,136 +168,6 @@ static inline int parse_core_list(const char *arg, int expected_len)
   core_list_len = count;
   return 0;
 }
-
-/*static inline __u64 now_ns(void)
-{
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-  return (__u64)ts.tv_sec * 1000000000ULL + (__u64)ts.tv_nsec;
-}
-
-static inline void hist_add(__u64 rtt_us)
-{
-  if (rtt_us > MAX_RTT_US)
-    rtt_us = MAX_RTT_US;
-
-  __sync_fetch_and_add(&rtt_hist[rtt_us], 1);
-  __sync_fetch_and_add(&total_rx, 1);
-}
-
-static inline __u64 util_rdtsc(void)
-{
-  __u32 eax, edx;
-  asm volatile("rdtsc" : "=a"(eax), "=d"(edx));
-  return ((__u64)edx << 32) | eax;
-}
-
-static inline __u64 us_since_tsc(__u64 tsc_then)
-{
-  __u64 tsc_now = util_rdtsc();
-  double delta = (double)(tsc_now - tsc_then);
-  assert(delta >= 0);
-  double us = delta / tsc_per_us;
-  assert(us >= 0);
-
-  return (__u64)us;
-}
-
-static inline void calibrate_tsc(void)
-{
-  struct timespec ts_before, ts_after;
-  __u64 t0, t1;
-  __u64 us_before, us_after;
-  __u64 dt_cycles, dt_us;
-
-  if (tsc_per_us != 0.0)
-    return;
-
-  if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts_before) != 0)
-  {
-    perror("calibrate_tsc: clock_gettime before");
-    exit(EXIT_FAILURE);
-  }
-
-  t0 = util_rdtsc();
-  usleep(10000);
-  t1 = util_rdtsc();
-
-  if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts_after) != 0)
-  {
-    perror("calibrate_tsc: clock_gettime after");
-    exit(EXIT_FAILURE);
-  }
-
-  dt_cycles = t1 - t0;
-  us_before = (__u64)ts_before.tv_sec * 1000000ULL + (__u64)(ts_before.tv_nsec / 1000ULL);
-  us_after = (__u64)ts_after.tv_sec * 1000000ULL + (__u64)(ts_after.tv_nsec / 1000ULL);
-  dt_us = us_after - us_before;
-
-  if (dt_us == 0)
-    dt_us = 1;
-
-  tsc_per_us = (double)dt_cycles / (double)dt_us;
-  if (tsc_per_us <= 0.0)
-  {
-    fprintf(stderr, "calibrate_tsc: invalid tsc_per_us: %f\n", tsc_per_us);
-    exit(EXIT_FAILURE);
-  }
-}
-
-static inline bool hist_percentiles(__u64 *p50, __u64 *p99, __u64 *p999)
-{
-  __u32 i;
-  __u64 samples, N, c;
-  __u64 t50, t99, t999;
-  __u64 acc = 0;
-  __u64 v50 = 0, v99 = 0, v999 = 0;
-  __u8 got50 = 0, got99 = 0, got999 = 0;
-
-  samples = __sync_fetch_and_add(&total_rx, 0);
-  if (samples == 0)
-    return 0;
-
-  N = samples;
-  t50 = (N * 50 + 100 - 1) / 100;
-  t99 = (N * 99 + 100 - 1) / 100;
-  t999 = (N * 999 + 1000 - 1) / 1000;
-
-  for (i = 0; i <= MAX_RTT_US; i++)
-  {
-    c = __sync_fetch_and_add(&rtt_hist[i], 0);
-    if (c == 0)
-      continue;
-
-    acc += c;
-
-    if (!got50 && acc >= t50)
-    {
-      v50 = i;
-      got50 = 1;
-    }
-
-    if (!got99 && acc >= t99)
-    {
-      v99 = i;
-      got99 = 1;
-    }
-
-    if (!got999 && acc >= t999)
-    {
-      v999 = i;
-      got999 = 1;
-    }
-
-    if (got50 && got99 && got999)
-      break;
-  }
-
-  *p50 = v50;
-  *p99 = v99;
-  *p999 = v999;
-  return 1;
-}*/
 
 static inline void print_stats(__u64 now)
 {
@@ -549,7 +416,8 @@ static inline void core_tx(struct rpc_context_lib *rpc_ctx, struct core *c)
     int req_svc = service;
     if (mix_pct > 0)
       req_svc = ((int)(xorshift64(&c->prng_state) % 100) < mix_pct)
-                ? SERVICE_COMPUTE : SERVICE_ECHO;
+                    ? SERVICE_COMPUTE
+                    : SERVICE_ECHO;
 
     if (req_svc == SERVICE_COMPUTE)
     {
@@ -641,7 +509,7 @@ static inline struct rpc_context_lib *core_init(struct core *c)
     {
       ph = (struct payload_hdr *)c->txbuf;
       ph->tsc = util_rdtsc();
-      
+
       ret = rpc_call(c->client, ntohl(c->dst_addr.sin_addr.s_addr),
                      ntohs(c->dst_addr.sin_port), service, c->txbuf, msize);
       if (ret < 0)
@@ -682,7 +550,7 @@ static inline struct rpc_context_lib *core_init(struct core *c)
     /* Drain any warmup responses still in the rx buffer */
     while (rpc_response(c->client, c->rxbuf, msize) >= 0)
     {
-        /* no-op */
+      /* no-op */
     }
   }
 
@@ -707,6 +575,11 @@ static inline void *core_thread(void *arg)
   double bytes_per_us, delta_cycles, delta_us, max_tokens;
 
   c = (struct core *)arg;
+  if (core_list_len > 0)
+  {
+    if (pin_thread_to_core(core_list[c->id + 1]) != 0)
+      pthread_exit((void *)(intptr_t)-1);
+  }
   rpc_ctx = core_init(c);
 
   /* Synchronize start with all other cores and main */
@@ -727,7 +600,7 @@ static inline void *core_thread(void *arg)
     /* Update token bucket using TSC */
     tsc_now = util_rdtsc();
     delta_cycles = (double)(tsc_now - c->last_tsc);
-    delta_us = delta_cycles / tsc_per_us;
+    delta_us = delta_cycles / clock_tsc_per_us();
     assert(delta_us >= 0);
     bytes_per_us = (c->rate / 8.0);
     c->tokens += delta_us * bytes_per_us;
@@ -779,6 +652,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "Failed to parse args\n");
     abort();
   }
+
   ret = init_hist(&rtt_hist, MAX_RTT_US);
   if (ret != 0)
   {
@@ -862,8 +736,10 @@ int main(int argc, char **argv)
   /* Cleanup */
   for (i = 0; i < ncores; i++)
   {
-    if (cores[i].txbuf) free(cores[i].txbuf);
-    if (cores[i].rxbuf) free(cores[i].rxbuf);
+    if (cores[i].txbuf)
+      free(cores[i].txbuf);
+    if (cores[i].rxbuf)
+      free(cores[i].rxbuf);
   }
 
   free(cores);
