@@ -28,6 +28,9 @@
 #include <linux/types.h>
 #include "../utils/clock.h"
 #include "../utils/hist.h"
+#ifdef ETRAN
+#include "etran_compat.h"
+#endif
 
 struct payload_hdr {
   __u64 tsc;
@@ -46,6 +49,11 @@ struct conn {
   double tokens;
   __u64 last_tsc;
   int next;
+#ifdef ETRAN
+  unsigned int inflight;
+  unsigned int peak_inflight;
+  __u64 limit_hits;
+#endif
 };
 
 /* Per-core context */
@@ -79,6 +87,9 @@ int ncores = 1;
 int nconns = 1;
 int mpending = 0;
 int cwait = 0;
+#ifdef ETRAN
+unsigned int max_inflight = 64;
+#endif
 const char *rem_ip;
 int rem_port;
 const char *src_ip;
@@ -106,7 +117,11 @@ static inline int parse_args(int argc, char **argv)
     fprintf(stderr,
         "Usage: %s <src_ip> <src_port> <rem_ip> <rem_port> [--msize N]"
         " [--duration S] [--rate R] [--ncores N]"
-        " [--nconns N] [--mpending N] [--cwait S]\n",
+        " [--nconns N] [--mpending N] [--cwait S]"
+#ifdef ETRAN
+        " [--max-inflight N]"
+#endif
+        "\n",
         argv[0]);
     return -1;
   }
@@ -159,6 +174,19 @@ static inline int parse_args(int argc, char **argv)
     {
       cwait = atoi(argv[++i]);
     }
+#ifdef ETRAN
+    else if (strcmp(argv[i], "--max-inflight") == 0 && i + 1 < argc)
+    {
+      char *end;
+      unsigned long value = strtoul(argv[++i], &end, 10);
+      if (*end || value == 0 || value > 2048)
+      {
+        fprintf(stderr, "max-inflight must be between 1 and 2048\n");
+        return -1;
+      }
+      max_inflight = value;
+    }
+#endif
     else
     {
       fprintf(stderr, "Unknown arg: %s\n", argv[i]);
@@ -302,7 +330,11 @@ static inline void core_init(struct core *c)
   c->ready_head = -1;
   c->ready_tail = -1;
   
+#ifdef ETRAN
+  nevs = 128;
+#else
   nevs = nconns * 4;
+#endif
   evs = calloc(nevs, sizeof(struct epoll_event));
   if (evs == NULL)
   {
@@ -388,6 +420,14 @@ static inline int conn_tx(struct core *c, struct conn *con)
   {
     assert(con->tx_remain != 0);
     
+#ifdef ETRAN
+    /* Finish partial requests, but wait for replies before starting more. */
+    if (con->tx_remain == msize && con->inflight >= max_inflight)
+    {
+      con->limit_hits++;
+      return 0;
+    }
+#endif
     if (con->tx_remain == msize) 
     {
       ph = (struct payload_hdr *) con->txbuf;
@@ -402,6 +442,14 @@ static inline int conn_tx(struct core *c, struct conn *con)
     if (ntx <= 0)
       return -1;
       
+#ifdef ETRAN
+    if (con->tx_remain == msize)
+    {
+      con->inflight++;
+      if (con->inflight > con->peak_inflight)
+        con->peak_inflight = con->inflight;
+    }
+#endif
     con->tx_remain -= ntx;
     con->tokens -= ntx;
     __sync_fetch_and_add(&c->txb_load_interval, ntx);
@@ -484,6 +532,10 @@ static inline void conn_rx(struct core *c, struct conn *con)
       ph = (struct payload_hdr *) con->rxbuf;
       rtt_us = us_since_tsc(ph->tsc);
       c->total_rx_pkts++;
+#ifdef ETRAN
+      assert(con->inflight > 0);
+      con->inflight--;
+#endif
       con->rx_remain = msize;
       __sync_fetch_and_add(&c->txp_tp_interval, 1);
       hist_add(&rtt_hist, rtt_us);
@@ -695,7 +747,11 @@ static inline void prepare_cores()
     cores[i].id = i;
     memset(&cores[i].dst_addr, 0, sizeof(cores[i].dst_addr));
     cores[i].dst_addr.sin_family = AF_INET;
-    cores[i].dst_addr.sin_port   = htons((__u16) rem_port);
+#ifdef ETRAN
+    cores[i].dst_addr.sin_port = htons((__u16) (rem_port + i));
+#else
+    cores[i].dst_addr.sin_port = htons((__u16) rem_port);
+#endif
     if (inet_pton(AF_INET, rem_ip, &cores[i].dst_addr.sin_addr) != 1)
     {
       fprintf(stderr, "Invalid rem_ip\n");
@@ -836,6 +892,20 @@ int main(int argc, char **argv)
       (unsigned long long) p99,
       (unsigned long long) p999);
 
+#ifdef ETRAN
+  unsigned int peak_inflight = 0;
+  __u64 limit_hits = 0;
+  for (int i = 0; i < ncores; i++)
+    for (int j = 0; j < nconns; j++)
+    {
+      struct conn *con = &cores[i].conns[j];
+      if (con->peak_inflight > peak_inflight)
+        peak_inflight = con->peak_inflight;
+      limit_hits += con->limit_hits;
+    }
+  printf("Outstanding requests: limit=%u peak=%u limited_send_attempts=%llu\n",
+      max_inflight, peak_inflight, (unsigned long long) limit_hits);
+#endif
   /* Cleanup */
   free(cores);
   free(threads);

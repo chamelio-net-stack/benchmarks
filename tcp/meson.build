@@ -17,6 +17,24 @@ tcp_linux_server = executable(
 )
 alias_target('tcp_linux', [tcp_linux_client, tcp_linux_server])
 
+tcp_etran_client = executable(
+  'tcp_etran_client',
+  'tcp_linux_client.c',
+  tcp_clock_src,
+  tcp_hist_src,
+  # eTRAN interposes fcntl, but not Meson's large-file fcntl64 alias.
+  c_args: ['-DETRAN', '-U_FILE_OFFSET_BITS'],
+  dependencies: [threads_dep],
+)
+tcp_etran_server = executable(
+  'tcp_etran_server',
+  'tcp_linux_server.c',
+  tcp_clock_src,
+  c_args: ['-DETRAN', '-U_FILE_OFFSET_BITS'],
+  dependencies: [threads_dep],
+)
+alias_target('tcp_etran', [tcp_etran_client, tcp_etran_server])
+
 if cham_tcp_enabled
   tcp_cham_client = executable(
     'tcp_cham_client',

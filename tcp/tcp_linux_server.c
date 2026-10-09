@@ -24,6 +24,9 @@
 #include <fcntl.h>
 #include <linux/types.h>
 #include "../utils/clock.h"
+#ifdef ETRAN
+#include "etran_compat.h"
+#endif
 
 struct conn {
   int id;
@@ -182,6 +185,8 @@ static void set_nonblock(int fd)
   }
 }
 
+#ifndef ETRAN
+/* eTRAN sends each write directly and does not implement TCP_NODELAY. */
 static void set_nonagle(int fd)
 {
   int ret;
@@ -194,6 +199,7 @@ static void set_nonagle(int fd)
   }
   
 }
+#endif
 
 static inline void core_init(struct core *c)
 {
@@ -201,6 +207,10 @@ static inline void core_init(struct core *c)
   int ret, i, opt = 1;
   struct conn *con;
   struct epoll_event ev;
+#ifdef ETRAN
+  struct sockaddr_in listen_addr = src_addr;
+  listen_addr.sin_port = htons((__u16) (port + c->id));
+#endif
   
   /* Cores that are not core 0 wait here so that ARP can complete */
   if (c->id != 0)
@@ -230,7 +240,11 @@ static inline void core_init(struct core *c)
   }
   
   set_nonblock(c->listen_fd);
-  ret = bind(c->listen_fd, (struct sockaddr *)&src_addr, sizeof(src_addr)); 
+#ifdef ETRAN
+  ret = bind(c->listen_fd, (struct sockaddr *)&listen_addr, sizeof(listen_addr));
+#else
+  ret = bind(c->listen_fd, (struct sockaddr *)&src_addr, sizeof(src_addr));
+#endif
   if (ret < 0)
   {
     perror("bind");
@@ -403,7 +417,9 @@ static inline void conn_accept(struct core *c, struct epoll_event *ev)
   }
   
   set_nonblock(con->fd);
+#ifndef ETRAN
   set_nonagle(con->fd);
+#endif
   
   /* Add conn to epoll */
   ev->data.ptr = con;
