@@ -1,9 +1,11 @@
 /* Usage:
- *   ./tcp_linux_server <bind_ip> <port> [--msize N] [--ncores N] [--buf-size N]
+ *   ./tcp_linux_server <bind_ip> <ports> [--msize N] [--ncores N] [--buf-size N]
  *
  * Example:
  *   ./tcp_linux_server 0.0.0.0 9000 --msize 64 --ncores 2 --buf-size 4096
  * 
+ *   --reuse-port (default): cycle ports over workers; ports <= cores.
+ *   --no-reuse-port: exactly one distinct port per worker.
  *   --msize Size of expected message
  *   --ncores Number of cores to use
  *   --buf-size Size of transmit buffer
@@ -24,9 +26,7 @@
 #include <fcntl.h>
 #include <linux/types.h>
 #include "../utils/clock.h"
-#ifdef ETRAN
-#include "etran_compat.h"
-#endif
+#include "../utils/ports.h"
 
 struct conn {
   int id;
@@ -41,6 +41,7 @@ struct conn {
 struct core {
   int id;
   int listen_fd;
+  struct sockaddr_in listen_addr;
   int ep_fd;
   struct epoll_event *evs;
   int nconns;
@@ -49,8 +50,6 @@ struct core {
   __u64 rxp_interval;
   __u64 txb_interval;
   __u64 txp_interval;
-  struct sockaddr_in dst_addr;
-  socklen_t dst_len;
 };
 
 /* Constants */
@@ -68,7 +67,10 @@ __u64 txb_interval_total, txp_interval_total;
 __u64 t_start_ns;
 __u64 t_last_report_ns, t_next_report_ns;
 
-int port;
+uint16_t *ports;
+size_t port_count;
+const char *port_text;
+int reuse_port = 1;
 const char *server_ip;
 static pthread_barrier_t start_barrier;
 static pthread_t *threads = NULL;
@@ -81,22 +83,33 @@ static inline int parse_args(int argc, char **argv)
 
   if (argc < 3)
   {
-    fprintf(stderr, "Usage: %s <bind_ip> <port>" 
-        " [--msize N] [--ncores N] [--buf-size]\n", argv[0]);
+    fprintf(stderr, "Usage: %s <bind_ip> <ports>" 
+        " [--msize N] [--ncores N] [--buf-size N]"
+        " [--reuse-port | --no-reuse-port]\n", argv[0]);
     return -1;
   }
 
   server_ip = argv[1];
-  port = atoi(argv[2]);
-  if (port <= 0 || port > 65535)
+  port_text = argv[2];
+  if (parse_ports(port_text, &ports, &port_count) != 0)
   {
-    fprintf(stderr, "Invalid port\n");
+    fprintf(stderr, "Invalid listening port list\n");
     return -1;
   }
+  int reuse_mode = -1;
 
   for (i = 3; i < argc; i++)
   {
-    if (strcmp(argv[i], "--msize") == 0 && i + 1 < argc)
+    if (!strcmp(argv[i], "--reuse-port") || !strcmp(argv[i], "--no-reuse-port"))
+    {
+      int mode = !strcmp(argv[i], "--reuse-port");
+      if (reuse_mode != -1 && reuse_mode != mode) {
+        fprintf(stderr, "Conflicting reuse-port flags\n");
+        return -1;
+      }
+      reuse_mode = reuse_port = mode;
+    }
+    else if (strcmp(argv[i], "--msize") == 0 && i + 1 < argc)
     {
       msize = (size_t)strtoul(argv[++i], NULL, 10);
     }
@@ -119,6 +132,11 @@ static inline int parse_args(int argc, char **argv)
     }
   }
 
+  if (ncores <= 0 || port_count > (size_t) ncores ||
+      (!reuse_port && port_count != (size_t) ncores)) {
+    fprintf(stderr, "invalid port count\n");
+    return -1;
+  }
   return 0;
 }
 
@@ -137,7 +155,9 @@ static inline void print_stats(__u64 now)
     pkts_rx  += __sync_fetch_and_add(&cores[i].rxp_interval, 0);
     bytes_tx += __sync_fetch_and_add(&cores[i].txb_interval, 0);
     pkts_tx  += __sync_fetch_and_add(&cores[i].txp_interval, 0);
-    fprintf(stderr, "core=%d bytes_rx=%.2f Mb/s bytes_tx=%.2f Mb/s\n", i, (double) cores[i].rxb_interval * 8.0 / 1e6, (double) cores[i].txb_interval * 8.0 / 1e6);
+    fprintf(stderr, "core=%d bytes_rx=%.2f Mb/s bytes_tx=%.2f Mb/s\n", i, 
+        (double) cores[i].rxb_interval * 8.0 / 1e6, 
+	(double) cores[i].txb_interval * 8.0 / 1e6);
     __sync_fetch_and_and(&cores[i].rxb_interval, 0);
     __sync_fetch_and_and(&cores[i].rxp_interval, 0);
     __sync_fetch_and_and(&cores[i].txb_interval, 0);
@@ -171,22 +191,15 @@ static inline void print_stats(__u64 now)
 
 static void set_nonblock(int fd)
 {
-  int fl = fcntl(fd, F_GETFL, 0);
-  if (fl < 0)
-  {
-    perror("fcntl(F_GETFL)");
-    exit(EXIT_FAILURE);
-  }
-  
-  if (fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) 
+  if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0)
   {
     perror("fcntl(F_SETFL O_NONBLOCK)");
     exit(EXIT_FAILURE);
   }
 }
 
+/* eTran sends immediately and does not implement TCP_NODELAY. */
 #ifndef ETRAN
-/* eTRAN sends each write directly and does not implement TCP_NODELAY. */
 static void set_nonagle(int fd)
 {
   int ret;
@@ -199,6 +212,7 @@ static void set_nonagle(int fd)
   }
   
 }
+
 #endif
 
 static inline void core_init(struct core *c)
@@ -207,10 +221,6 @@ static inline void core_init(struct core *c)
   int ret, i, opt = 1;
   struct conn *con;
   struct epoll_event ev;
-#ifdef ETRAN
-  struct sockaddr_in listen_addr = src_addr;
-  listen_addr.sin_port = htons((__u16) (port + c->id));
-#endif
   
   /* Cores that are not core 0 wait here so that ARP can complete */
   if (c->id != 0)
@@ -225,13 +235,18 @@ static inline void core_init(struct core *c)
     abort();
   }
   
-  ret = setsockopt(c->listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-  if (ret < 0) 
+  if (reuse_port)
   {
-    perror("setsockopt SO_REUSEADDR");
-    abort();
+    ret = setsockopt(c->listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+    if (ret < 0)
+    {
+      perror("setsockopt SO_REUSEPORT");
+      abort();
+    }
   }
   
+#ifndef ETRAN
+  /* eTran treats SO_REUSEADDR as SO_REUSEPORT; use only the explicit mode. */
   ret = setsockopt(c->listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
   if (ret < 0) 
   {
@@ -239,12 +254,10 @@ static inline void core_init(struct core *c)
     abort();
   }
   
-  set_nonblock(c->listen_fd);
-#ifdef ETRAN
-  ret = bind(c->listen_fd, (struct sockaddr *)&listen_addr, sizeof(listen_addr));
-#else
-  ret = bind(c->listen_fd, (struct sockaddr *)&src_addr, sizeof(src_addr));
 #endif
+
+  set_nonblock(c->listen_fd);
+  ret = bind(c->listen_fd, (struct sockaddr *)&c->listen_addr, sizeof(c->listen_addr)); 
   if (ret < 0)
   {
     perror("bind");
@@ -259,7 +272,7 @@ static inline void core_init(struct core *c)
   }
   
   /* Prepare epoll */
-  c->ep_fd = epoll_create(mconns);
+  c->ep_fd = epoll_create1(0);
   if (c->ep_fd < 0)
   {
     perror("epoll create failed\n");
@@ -305,7 +318,6 @@ static inline void core_init(struct core *c)
     con->rx_remain = msize;
   }
 
-  c->dst_len = sizeof(c->dst_addr);
   c->rxb_interval = 0;
   c->rxp_interval = 0;
   c->txb_interval = 0;
@@ -319,8 +331,7 @@ static inline void conn_rx(struct core *c, struct conn *con)
   while (con->nrx < bsize)
   {
     assert(con->rx_remain != 0);
-    nrx = recvfrom(con->fd, con->buf + con->nrx, con->rx_remain, 
-        0, (struct sockaddr *) &c->dst_addr, &c->dst_len);
+    nrx = read(con->fd, con->buf + con->nrx, con->rx_remain);
     assert(nrx <= 0 || (nrx <= msize && nrx <= con->rx_remain));
 
     if (nrx <= 0)
@@ -349,8 +360,7 @@ static inline void conn_tx(struct core *c,
     if (tx_len > con->tx_remain)
       tx_len = con->tx_remain;
 
-    ntx = sendto(con->fd, con->buf + con->ntx, tx_len, 0,
-        (struct sockaddr *) &c->dst_addr, c->dst_len);
+    ntx = write(con->fd, con->buf + con->ntx, tx_len);
     assert(ntx <= 0 || (ntx <= msize && ntx <= tx_len));
           
     if (ntx <= 0)
@@ -510,13 +520,9 @@ static inline void prepare_cores()
   {
     memset(&cores[i], 0, sizeof(struct core));
     cores[i].id = i;
-    memset(&cores[i].dst_addr, 0, sizeof(cores[i].dst_addr));
+    cores[i].listen_addr = src_addr;
+    cores[i].listen_addr.sin_port = htons(ports[i % port_count]);
 
-    if (inet_pton(AF_INET, server_ip, &src_addr.sin_addr) != 1)
-    {
-      fprintf(stderr, "Invalid server_ip\n");
-      abort();
-    }
   }
 }
 
@@ -541,7 +547,6 @@ static inline void init_server()
 {
   memset(&src_addr, 0, sizeof(src_addr));
   src_addr.sin_family = AF_INET;
-  src_addr.sin_port   = htons((__u16)port);
   if (inet_pton(AF_INET, server_ip, &src_addr.sin_addr) != 1)
   {
     fprintf(stderr, "Invalid bind_ip\n");
@@ -581,7 +586,8 @@ int main(int argc, char **argv)
   if (ret != 0)
   {
     fprintf(stderr, "failed to parse args\n");
-    abort();
+    free(ports);
+    return EXIT_FAILURE;
   }
     
   init_server();
@@ -593,8 +599,8 @@ int main(int argc, char **argv)
   fflush(stdout);
   pthread_barrier_wait(&start_barrier);
 
-  printf("TCP echo server listening on %s:%d (msize=%zu) (bsize=%zu) (ncores=%d)\n", 
-      server_ip, port, msize, bsize, ncores);
+  printf("TCP echo server listening on %s:%s (msize=%zu) (bsize=%zu) (ncores=%d)\n", 
+      server_ip, port_text, msize, bsize, ncores);
   fflush(stdout);
   
   /* Establish timebase and reporting windows */

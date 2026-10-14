@@ -1,3 +1,4 @@
+tcp_ports_src = files('../utils/ports.c')
 tcp_clock_src = files('../utils/clock.c')
 tcp_hist_src = files('../utils/hist.c')
 tcp_core_src = files('../utils/core.c')
@@ -5,6 +6,7 @@ tcp_core_src = files('../utils/core.c')
 tcp_linux_client = executable(
   'tcp_linux_client',
   'tcp_linux_client.c',
+  tcp_ports_src,
   tcp_clock_src,
   tcp_hist_src,
   dependencies: [threads_dep],
@@ -12,28 +14,11 @@ tcp_linux_client = executable(
 tcp_linux_server = executable(
   'tcp_linux_server',
   'tcp_linux_server.c',
+  tcp_ports_src,
   tcp_clock_src,
   dependencies: [threads_dep],
 )
 alias_target('tcp_linux', [tcp_linux_client, tcp_linux_server])
-
-tcp_etran_client = executable(
-  'tcp_etran_client',
-  'tcp_linux_client.c',
-  tcp_clock_src,
-  tcp_hist_src,
-  # eTRAN interposes fcntl, but not Meson's large-file fcntl64 alias.
-  c_args: ['-DETRAN', '-U_FILE_OFFSET_BITS'],
-  dependencies: [threads_dep],
-)
-tcp_etran_server = executable(
-  'tcp_etran_server',
-  'tcp_linux_server.c',
-  tcp_clock_src,
-  c_args: ['-DETRAN', '-U_FILE_OFFSET_BITS'],
-  dependencies: [threads_dep],
-)
-alias_target('tcp_etran', [tcp_etran_client, tcp_etran_server])
 
 if cham_tcp_enabled
   tcp_cham_client = executable(
@@ -53,3 +38,17 @@ if cham_tcp_enabled
   )
   alias_target('tcp_cham', [tcp_cham_client, tcp_cham_server])
 endif
+
+tcp_etran_client = executable(
+  'tcp_etran_client', 'tcp_linux_client.c',
+  tcp_ports_src, tcp_clock_src, tcp_hist_src,
+  dependencies: [threads_dep],
+  c_args: ['-DETRAN', '-U_FILE_OFFSET_BITS'],
+)
+tcp_etran_server = executable(
+  'tcp_etran_server', 'tcp_linux_server.c',
+  tcp_ports_src, tcp_clock_src,
+  dependencies: [threads_dep],
+  c_args: ['-DETRAN', '-U_FILE_OFFSET_BITS'],
+)
+alias_target('tcp_etran', [tcp_etran_client, tcp_etran_server])

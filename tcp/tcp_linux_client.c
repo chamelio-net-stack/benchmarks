@@ -2,7 +2,7 @@
  * latency percentiles (p50, p99, p99.9) in microseconds.
  *
  * Usage:
- *   ./tcp_linux_client <src_ip> <src_port> <rem_ip> <rem_port>
+ *   ./tcp_linux_client <src_ip> <src_port> <rem_ip> <rem_ports>
  *     [--msize N] [--duration S] [--rate R] [--ncores N]
  *
  *   --msize Total TCP payload bytes.
@@ -28,9 +28,7 @@
 #include <linux/types.h>
 #include "../utils/clock.h"
 #include "../utils/hist.h"
-#ifdef ETRAN
-#include "etran_compat.h"
-#endif
+#include "../utils/ports.h"
 
 struct payload_hdr {
   __u64 tsc;
@@ -40,6 +38,7 @@ struct payload_hdr {
 struct conn {
   int id;
   int fd;
+  struct sockaddr_in dst_addr;
   int ready;
   __u8 connected;
   int tx_remain;
@@ -49,11 +48,6 @@ struct conn {
   double tokens;
   __u64 last_tsc;
   int next;
-#ifdef ETRAN
-  unsigned int inflight;
-  unsigned int peak_inflight;
-  __u64 limit_hits;
-#endif
 };
 
 /* Per-core context */
@@ -63,7 +57,6 @@ struct core {
   int nrx_evs;
   struct epoll_event *rx_evs;
   struct sockaddr_in dst_addr;
-  socklen_t dst_len;
   __u64 txb_load_interval;
   __u64 txp_load_interval;
   __u64 txb_tp_interval;
@@ -87,11 +80,9 @@ int ncores = 1;
 int nconns = 1;
 int mpending = 0;
 int cwait = 0;
-#ifdef ETRAN
-unsigned int max_inflight = 64;
-#endif
 const char *rem_ip;
-int rem_port;
+uint16_t *rem_ports;
+size_t rem_port_count;
 const char *src_ip;
 int src_port;
 struct sockaddr_in src_addr;
@@ -112,16 +103,12 @@ static struct hist_state rtt_hist = { 0 };
 
 static inline int parse_args(int argc, char **argv)
 {
-  if (argc < 3)
+  if (argc < 5)
   {
     fprintf(stderr,
-        "Usage: %s <src_ip> <src_port> <rem_ip> <rem_port> [--msize N]"
+        "Usage: %s <src_ip> <src_port> <rem_ip> <rem_ports> [--msize N]"
         " [--duration S] [--rate R] [--ncores N]"
-        " [--nconns N] [--mpending N] [--cwait S]"
-#ifdef ETRAN
-        " [--max-inflight N]"
-#endif
-        "\n",
+        " [--nconns N] [--mpending N] [--cwait S]\n",
         argv[0]);
     return -1;
   }
@@ -135,10 +122,9 @@ static inline int parse_args(int argc, char **argv)
   }
   
   rem_ip = argv[3];
-  rem_port = atoi(argv[4]);
-  if (rem_port <= 0 || rem_port > 65535)
+  if (parse_ports(argv[4], &rem_ports, &rem_port_count) != 0)
   {
-    fprintf(stderr, "Invalid rem_port\n");
+    fprintf(stderr, "Invalid destination port list\n");
     return -1;
   }
 
@@ -174,19 +160,6 @@ static inline int parse_args(int argc, char **argv)
     {
       cwait = atoi(argv[++i]);
     }
-#ifdef ETRAN
-    else if (strcmp(argv[i], "--max-inflight") == 0 && i + 1 < argc)
-    {
-      char *end;
-      unsigned long value = strtoul(argv[++i], &end, 10);
-      if (*end || value == 0 || value > 2048)
-      {
-        fprintf(stderr, "max-inflight must be between 1 and 2048\n");
-        return -1;
-      }
-      max_inflight = value;
-    }
-#endif
     else
     {
       fprintf(stderr, "Unknown arg: %s\n", argv[i]);
@@ -269,14 +242,7 @@ static inline void print_stats(__u64 now)
 
 static void set_nonblock(int fd)
 {
-  int fl = fcntl(fd, F_GETFL, 0);
-  if (fl < 0)
-  {
-    perror("fcntl(F_GETFL)");
-    exit(EXIT_FAILURE);
-  }
-  
-  if (fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) 
+  if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0)
   {
     perror("fcntl(F_SETFL O_NONBLOCK)");
     exit(EXIT_FAILURE);
@@ -330,11 +296,7 @@ static inline void core_init(struct core *c)
   c->ready_head = -1;
   c->ready_tail = -1;
   
-#ifdef ETRAN
-  nevs = 128;
-#else
   nevs = nconns * 4;
-#endif
   evs = calloc(nevs, sizeof(struct epoll_event));
   if (evs == NULL)
   {
@@ -356,6 +318,9 @@ static inline void core_init(struct core *c)
   
     con = &conns[i];
     con->id = i;
+    con->dst_addr = c->dst_addr;
+    con->dst_addr.sin_port = htons(rem_ports[
+        ((size_t)c->id * nconns + i) % rem_port_count]);
     con->txbuf = (__u8 *) malloc(msize);
     con->rxbuf = (__u8 *) malloc(msize);
     if (con->txbuf == NULL || con->rxbuf == NULL)
@@ -377,7 +342,7 @@ static inline void core_init(struct core *c)
     conn_rearm(c, con);
   }
   
-  if ((c->ep = epoll_create(2 * nconns)) < 0)
+  if ((c->ep = epoll_create1(0)) < 0)
   {
     perror("epoll create failed\n");
     abort();
@@ -420,36 +385,19 @@ static inline int conn_tx(struct core *c, struct conn *con)
   {
     assert(con->tx_remain != 0);
     
-#ifdef ETRAN
-    /* Finish partial requests, but wait for replies before starting more. */
-    if (con->tx_remain == msize && con->inflight >= max_inflight)
-    {
-      con->limit_hits++;
-      return 0;
-    }
-#endif
-    if (con->tx_remain == msize) 
+    if (con->tx_remain == msize)
     {
       ph = (struct payload_hdr *) con->txbuf;
       ph->tsc = util_rdtsc();
     }
     
     pos = msize - con->tx_remain;
-    ntx = sendto(con->fd, con->txbuf + pos, con->tx_remain, 0,
-      (struct sockaddr *) &c->dst_addr, c->dst_len);
+    ntx = write(con->fd, con->txbuf + pos, con->tx_remain);
     assert(ntx <= 0 || (ntx <= con->tx_remain && ntx <= msize));
     
     if (ntx <= 0)
       return -1;
       
-#ifdef ETRAN
-    if (con->tx_remain == msize)
-    {
-      con->inflight++;
-      if (con->inflight > con->peak_inflight)
-        con->peak_inflight = con->inflight;
-    }
-#endif
     con->tx_remain -= ntx;
     con->tokens -= ntx;
     __sync_fetch_and_add(&c->txb_load_interval, ntx);
@@ -519,7 +467,7 @@ static inline void conn_rx(struct core *c, struct conn *con)
   {
     assert(con->rx_remain != 0);
     pos = msize - con->rx_remain;
-    nrx = recvfrom(con->fd, con->rxbuf + pos, con->rx_remain, 0, NULL, 0);
+    nrx = read(con->fd, con->rxbuf + pos, con->rx_remain);
     assert(nrx <= 0 || (nrx <= msize && nrx <= con->rx_remain));
     
     if (nrx <= 0)
@@ -532,10 +480,6 @@ static inline void conn_rx(struct core *c, struct conn *con)
       ph = (struct payload_hdr *) con->rxbuf;
       rtt_us = us_since_tsc(ph->tsc);
       c->total_rx_pkts++;
-#ifdef ETRAN
-      assert(con->inflight > 0);
-      con->inflight--;
-#endif
       con->rx_remain = msize;
       __sync_fetch_and_add(&c->txp_tp_interval, 1);
       hist_add(&rtt_hist, rtt_us);
@@ -597,15 +541,14 @@ static void open_conn(struct core *c, struct conn *con)
   int ret;
   struct epoll_event ev;
   
-  ret = connect(con->fd, (struct sockaddr *) &c->dst_addr, c->dst_len);
+  ret = connect(con->fd, (struct sockaddr *) &con->dst_addr, sizeof(con->dst_addr));
   if (ret == 0)
   {
-    /* Connected succesfully */
+    /* Immediate success never increments the pending count. */
     con->connected = 1;
     c->nconnected++;
-    c->npending--;
     ev.data.ptr = con;
-    ev.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
+    ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
     if (epoll_ctl(c->ep, EPOLL_CTL_ADD, con->fd, &ev) < 0)
     {
       perror("adding to epoll failed\n");
@@ -625,7 +568,7 @@ static void open_conn(struct core *c, struct conn *con)
     /* Connection is still pending */
     c->npending++;
     ev.data.ptr = con;
-    ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
+    ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP;
     if (epoll_ctl(c->ep, EPOLL_CTL_ADD, con->fd, &ev) < 0)
     {
       perror("adding to epoll failed\n");
@@ -747,17 +690,11 @@ static inline void prepare_cores()
     cores[i].id = i;
     memset(&cores[i].dst_addr, 0, sizeof(cores[i].dst_addr));
     cores[i].dst_addr.sin_family = AF_INET;
-#ifdef ETRAN
-    cores[i].dst_addr.sin_port = htons((__u16) (rem_port + i));
-#else
-    cores[i].dst_addr.sin_port = htons((__u16) rem_port);
-#endif
     if (inet_pton(AF_INET, rem_ip, &cores[i].dst_addr.sin_addr) != 1)
     {
       fprintf(stderr, "Invalid rem_ip\n");
       abort();
     }
-    cores[i].dst_len = sizeof(cores[i].dst_addr);
   }
 }
 
@@ -819,6 +756,7 @@ int main(int argc, char **argv)
   if (ret != 0)
   {
     fprintf(stderr, "failed to parse args\n");
+    free(rem_ports);
     return EXIT_FAILURE;
   }
 
@@ -826,6 +764,7 @@ int main(int argc, char **argv)
   if (ret != 0)
   {
     fprintf(stderr, "failed to init hist\n");
+    free(rem_ports);
     return EXIT_FAILURE;
   }
   
@@ -892,21 +831,8 @@ int main(int argc, char **argv)
       (unsigned long long) p99,
       (unsigned long long) p999);
 
-#ifdef ETRAN
-  unsigned int peak_inflight = 0;
-  __u64 limit_hits = 0;
-  for (int i = 0; i < ncores; i++)
-    for (int j = 0; j < nconns; j++)
-    {
-      struct conn *con = &cores[i].conns[j];
-      if (con->peak_inflight > peak_inflight)
-        peak_inflight = con->peak_inflight;
-      limit_hits += con->limit_hits;
-    }
-  printf("Outstanding requests: limit=%u peak=%u limited_send_attempts=%llu\n",
-      max_inflight, peak_inflight, (unsigned long long) limit_hits);
-#endif
   /* Cleanup */
+  free(rem_ports);
   free(cores);
   free(threads);
   hist_cleanup(&rtt_hist);
