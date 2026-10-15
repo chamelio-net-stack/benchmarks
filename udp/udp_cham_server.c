@@ -6,6 +6,8 @@
  * 
  *   --msize Size of expected message
  *   --ncores Number of cores to use
+ *   --op-delay N TSC ticks of arithmetic per request (default: 0)
+ *   --op-delay-avx WIDTH Use 256-bit AVX2 or 512-bit AVX-512F arithmetic
  *   --buf-size Size of transmit buffer
  *   --cores Comma-separated core list (main, thread0, thread1, ...)
  */
@@ -23,10 +25,12 @@
 #include <assert.h>
 #include <sched.h>
 #include "../utils/clock.h"
+#include "../utils/op_delay.h"
 #include "../utils/core.h"
 
 struct core {
   int id;
+  struct op_delay_state delay_state;
   int fd;
   struct udp_wait *wait;
   struct udp_wait_event event;
@@ -40,6 +44,8 @@ struct core {
   __u64 txp_interval;
   struct sockaddr_in dst_addr;
 };
+
+static struct op_delay_config delay_config;
 
 /* Default arg values */
 size_t msize = 64;
@@ -170,7 +176,8 @@ static inline int parse_args(int argc, char **argv)
   if (argc < 3)
   {
     fprintf(stderr, "Usage: %s <bind_ip> <port>" 
-        " [--msize N] [--ncores N] [--buf-size N] [--cores LIST]\n", argv[0]);
+        " [--msize N] [--ncores N] [--buf-size N] [--cores LIST]"
+        " [--op-delay N] [--op-delay-avx 256|512]\n", argv[0]);
     return -1;
   }
 
@@ -184,6 +191,12 @@ static inline int parse_args(int argc, char **argv)
 
   for (i = 3; i < argc; i++)
   {
+    int delay_arg = op_delay_parse_arg(&delay_config, argc, argv, &i);
+    if (delay_arg < 0)
+      return -1;
+    if (delay_arg > 0)
+      continue;
+
     if (strcmp(argv[i], "--msize") == 0 && i + 1 < argc)
     {
       msize = (size_t)strtoul(argv[++i], NULL, 10);
@@ -213,7 +226,7 @@ static inline int parse_args(int argc, char **argv)
       return -1;
   }
 
-  return 0;
+  return op_delay_validate(&delay_config);
 }
 
 static inline void print_stats(__u64 now)
@@ -335,6 +348,9 @@ static inline void core_rx(struct udp_context_lib *udp_ctx, struct core *c)
     if (nrx <= 0)
       break;
     
+    if (delay_config.cycles > 0)
+      op_delay_run(&delay_config, &c->delay_state);
+
     c->nrx += nrx;
     __sync_fetch_and_add(&c->rxp_interval, 1);
     __sync_fetch_and_add(&c->rxb_interval, msize);
@@ -419,6 +435,7 @@ static inline void prepare_cores()
   {
     memset(&cores[i], 0, sizeof(struct core));
     cores[i].id = i;
+    op_delay_init(&cores[i].delay_state);
     memset(&cores[i].dst_addr, 0, sizeof(cores[i].dst_addr));
 
     if (inet_pton(AF_INET, src_ip, &src_addr.sin_addr) != 1)

@@ -6,12 +6,15 @@
  * 
  *   --msize Size of expected message
  *   --ncores Number of cores to use
+ *   --op-delay N TSC ticks of arithmetic per request (default: 0)
+ *   --op-delay-avx WIDTH Use 256-bit AVX2 or 512-bit AVX-512F arithmetic
  *   --buf-size Size of transmit buffer
  */
 
 #define _GNU_SOURCE
 #include <tcp_lib.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
 #include <string.h>
@@ -24,6 +27,7 @@
 #include <fcntl.h>
 #include <linux/types.h>
 #include "../utils/clock.h"
+#include "../utils/op_delay.h"
 
 struct conn {
   int id;
@@ -32,11 +36,13 @@ struct conn {
   int rx_remain;
   int nrx;
   int ntx;
+  int nready; /* Bytes in complete requests whose operation delay has finished. */
   __u8 *buf;
 };
 
 struct core {
   int id;
+  struct op_delay_state delay_state;
   int listen_fd;
   int ep_fd;
   struct tcp_context_lib *tcp_ctx;
@@ -55,6 +61,8 @@ struct core {
 /* Constants */
 __u32 listen_backlog = 512;
 __u32 max_events = 128;
+
+static struct op_delay_config delay_config;
 
 /* Default arg values */
 size_t msize = 64;
@@ -81,7 +89,8 @@ static inline int parse_args(int argc, char **argv)
   if (argc < 3)
   {
     fprintf(stderr, "Usage: %s <bind_ip> <port>" 
-        " [--msize N] [--ncores N] [--buf-size]\n", argv[0]);
+        " [--msize N] [--ncores N] [--buf-size N]"
+        " [--op-delay N] [--op-delay-avx 256|512]\n", argv[0]);
     return -1;
   }
 
@@ -95,6 +104,12 @@ static inline int parse_args(int argc, char **argv)
 
   for (i = 3; i < argc; i++)
   {
+    int delay_arg = op_delay_parse_arg(&delay_config, argc, argv, &i);
+    if (delay_arg < 0)
+      return -1;
+    if (delay_arg > 0)
+      continue;
+
     if (strcmp(argv[i], "--msize") == 0 && i + 1 < argc)
     {
       msize = (size_t)strtoul(argv[++i], NULL, 10);
@@ -118,7 +133,14 @@ static inline int parse_args(int argc, char **argv)
     }
   }
 
-  return 0;
+  if (delay_config.cycles > 0 &&
+      (msize == 0 || msize > INT_MAX || bsize < msize || bsize > INT_MAX))
+  {
+    fprintf(stderr, "op-delay requires 0 < msize <= buf-size <= INT_MAX\n");
+    return -1;
+  }
+
+  return op_delay_validate(&delay_config);
 }
 
 static inline void print_stats(__u64 now)
@@ -259,6 +281,7 @@ static inline void core_init(struct core *c)
     con->id = i;
     con->nrx = 0;
     con->ntx = 0;
+    con->nready = 0;
     con->tx_remain = msize;
     con->rx_remain = msize;
   }
@@ -272,12 +295,15 @@ static inline void core_init(struct core *c)
 
 static inline void conn_rx(struct core *c, struct conn *con)
 {
-  int nrx;
+  int nrx, rx_len;
   
   while (con->nrx < bsize)
   {
     assert(con->rx_remain != 0);
-    nrx = tcp_recvfrom(c->tcp_ctx, con->fd, con->buf + con->nrx, con->rx_remain, 
+    rx_len = con->rx_remain;
+    if (delay_config.cycles > 0 && rx_len > (int) bsize - con->nrx)
+      rx_len = (int) bsize - con->nrx;
+    nrx = tcp_recvfrom(c->tcp_ctx, con->fd, con->buf + con->nrx, rx_len,
         (struct sockaddr *) &c->dst_addr, c->dst_len);
     assert(nrx <= 0 || (nrx <= msize && nrx <= con->rx_remain));
       
@@ -289,6 +315,11 @@ static inline void conn_rx(struct core *c, struct conn *con)
     __sync_fetch_and_add(&c->rxb_interval, nrx);
     if (con->rx_remain == 0)
     {
+      if (delay_config.cycles > 0)
+      {
+        op_delay_run(&delay_config, &c->delay_state);
+        con->nready = con->nrx;
+      }
       con->rx_remain = msize;
       __sync_fetch_and_add(&c->rxp_interval, 1);
     }
@@ -298,11 +329,12 @@ static inline void conn_rx(struct core *c, struct conn *con)
 static inline void conn_tx(struct core *c, struct conn *con)
 {
   int ntx, ret, tx_len;
+  int tx_end = delay_config.cycles > 0 ? con->nready : con->nrx;
 
-  while (con->ntx < con->nrx)
+  while (con->ntx < tx_end)
   {
     assert(con->tx_remain != 0);
-    tx_len = con->nrx - con->ntx;
+    tx_len = tx_end - con->ntx;
     if (tx_len > con->tx_remain)
       tx_len = con->tx_remain;
 
@@ -341,8 +373,19 @@ static inline void conn_tx(struct core *c, struct conn *con)
     abort();
   }
   
+  if (delay_config.cycles > 0)
+  {
+    /* Keep the incomplete trailing request; only the ready prefix was sent. */
+    con->nrx -= con->ntx;
+    if (con->nrx > 0 && con->ntx > 0)
+      memmove(con->buf, con->buf + con->ntx, con->nrx);
+    con->nready = 0;
+  }
+  else
+  {
+    con->nrx = 0;
+  }
   con->ntx = 0;
-  con->nrx = 0;
 }
 
 static inline void conn_accept(struct core *c)
@@ -374,7 +417,8 @@ static inline void conn_accept(struct core *c)
   
   con->id = c->nconns;
   con->nrx = 0;
-  con->ntx = 0;  
+  con->ntx = 0;
+  con->nready = 0;
   c->nconns++;
 }
 
@@ -450,6 +494,7 @@ static inline void prepare_cores()
   {
     memset(&cores[i], 0, sizeof(struct core));
     cores[i].id = i;
+    op_delay_init(&cores[i].delay_state);
     memset(&cores[i].dst_addr, 0, sizeof(cores[i].dst_addr));
 
     if (inet_pton(AF_INET, server_ip, &src_addr.sin_addr) != 1)
