@@ -8,8 +8,8 @@
  *   --no-reuse-port: exactly one distinct port per worker.
  *   --msize Size of expected message
  *   --ncores Number of cores to use
- *   --op-delay N TSC ticks of arithmetic per request (default: 0)
- *   --op-delay-avx WIDTH Use 256-bit AVX2 or 512-bit AVX-512F arithmetic
+ *   --op-iters N arithmetic iterations per request (default: 0)
+ *   --op-iters-avx WIDTH Use 256-bit AVX2 or 512-bit AVX-512F arithmetic
  *   --buf-size Size of transmit buffer
  */
 
@@ -29,7 +29,7 @@
 #include <fcntl.h>
 #include <linux/types.h>
 #include "../utils/clock.h"
-#include "../utils/op_delay.h"
+#include "../utils/op_iters.h"
 #include "../utils/ports.h"
 
 struct conn {
@@ -39,13 +39,13 @@ struct conn {
   int rx_remain;
   int nrx;
   int ntx;
-  int nready; /* Bytes in complete requests whose operation delay has finished. */
+  int nready; /* Bytes in complete requests whose operation iterations have finished. */
   __u8 *buf;
 };
 
 struct core {
   int id;
-  struct op_delay_state delay_state;
+  struct op_iters_state iters_state;
   int listen_fd;
   struct sockaddr_in listen_addr;
   int ep_fd;
@@ -62,7 +62,7 @@ struct core {
 __u32 listen_backlog = 512;
 __u32 max_events = 128;
 
-static struct op_delay_config delay_config;
+static struct op_iters_config iters_config;
 
 /* Default arg values */
 size_t msize = 64;
@@ -94,7 +94,7 @@ static inline int parse_args(int argc, char **argv)
     fprintf(stderr, "Usage: %s <bind_ip> <ports>" 
         " [--msize N] [--ncores N] [--buf-size N]"
         " [--reuse-port | --no-reuse-port]"
-        " [--op-delay N] [--op-delay-avx 256|512]\n", argv[0]);
+        " [--op-iters N] [--op-iters-avx 256|512]\n", argv[0]);
     return -1;
   }
 
@@ -109,10 +109,10 @@ static inline int parse_args(int argc, char **argv)
 
   for (i = 3; i < argc; i++)
   {
-    int delay_arg = op_delay_parse_arg(&delay_config, argc, argv, &i);
-    if (delay_arg < 0)
+    int iters_arg = op_iters_parse_arg(&iters_config, argc, argv, &i);
+    if (iters_arg < 0)
       return -1;
-    if (delay_arg > 0)
+    if (iters_arg > 0)
       continue;
 
     if (!strcmp(argv[i], "--reuse-port") || !strcmp(argv[i], "--no-reuse-port"))
@@ -152,14 +152,14 @@ static inline int parse_args(int argc, char **argv)
     fprintf(stderr, "invalid port count\n");
     return -1;
   }
-  if (delay_config.cycles > 0 &&
+  if (iters_config.iterations > 0 &&
       (msize == 0 || msize > INT_MAX || bsize < msize || bsize > INT_MAX))
   {
-    fprintf(stderr, "op-delay requires 0 < msize <= buf-size <= INT_MAX\n");
+    fprintf(stderr, "op-iters requires 0 < msize <= buf-size <= INT_MAX\n");
     return -1;
   }
 
-  return op_delay_validate(&delay_config);
+  return op_iters_validate(&iters_config);
 }
 
 static inline void print_stats(__u64 now)
@@ -355,7 +355,7 @@ static inline void conn_rx(struct core *c, struct conn *con)
   {
     assert(con->rx_remain != 0);
     rx_len = con->rx_remain;
-    if (delay_config.cycles > 0 && rx_len > (int) bsize - con->nrx)
+    if (iters_config.iterations > 0 && rx_len > (int) bsize - con->nrx)
       rx_len = (int) bsize - con->nrx;
     nrx = read(con->fd, con->buf + con->nrx, rx_len);
     assert(nrx <= 0 || (nrx <= msize && nrx <= con->rx_remain));
@@ -368,9 +368,9 @@ static inline void conn_rx(struct core *c, struct conn *con)
     __sync_fetch_and_add(&c->rxb_interval, nrx);
     if (con->rx_remain == 0)
     {
-      if (delay_config.cycles > 0)
+      if (iters_config.iterations > 0)
       {
-        op_delay_run(&delay_config, &c->delay_state);
+        op_iters_run(&iters_config, &c->iters_state);
         con->nready = con->nrx;
       }
       con->rx_remain = msize;
@@ -383,7 +383,7 @@ static inline void conn_tx(struct core *c,
     struct conn *con, struct epoll_event *ev)
 {
   int ntx, ret, tx_len;
-  int tx_end = delay_config.cycles > 0 ? con->nready : con->nrx;
+  int tx_end = iters_config.iterations > 0 ? con->nready : con->nrx;
 
   while (con->ntx < tx_end)
   {
@@ -428,7 +428,7 @@ static inline void conn_tx(struct core *c,
     abort();
   }
   
-  if (delay_config.cycles > 0)
+  if (iters_config.iterations > 0)
   {
     /* Keep the incomplete trailing request; only the ready prefix was sent. */
     con->nrx -= con->ntx;
@@ -564,7 +564,7 @@ static inline void prepare_cores()
   {
     memset(&cores[i], 0, sizeof(struct core));
     cores[i].id = i;
-    op_delay_init(&cores[i].delay_state);
+    op_iters_init(&cores[i].iters_state);
     cores[i].listen_addr = src_addr;
     cores[i].listen_addr.sin_port = htons(ports[i % port_count]);
 

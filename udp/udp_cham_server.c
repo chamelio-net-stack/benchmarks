@@ -6,8 +6,8 @@
  * 
  *   --msize Size of expected message
  *   --ncores Number of cores to use
- *   --op-delay N TSC ticks of arithmetic per request (default: 0)
- *   --op-delay-avx WIDTH Use 256-bit AVX2 or 512-bit AVX-512F arithmetic
+ *   --op-iters N arithmetic iterations per request (default: 0)
+ *   --op-iters-avx WIDTH Use 256-bit AVX2 or 512-bit AVX-512F arithmetic
  *   --buf-size Size of transmit buffer
  *   --cores Comma-separated core list (main, thread0, thread1, ...)
  */
@@ -25,12 +25,12 @@
 #include <assert.h>
 #include <sched.h>
 #include "../utils/clock.h"
-#include "../utils/op_delay.h"
+#include "../utils/op_iters.h"
 #include "../utils/core.h"
 
 struct core {
   int id;
-  struct op_delay_state delay_state;
+  struct op_iters_state iters_state;
   int fd;
   struct udp_wait *wait;
   struct udp_wait_event event;
@@ -45,7 +45,7 @@ struct core {
   struct sockaddr_in dst_addr;
 };
 
-static struct op_delay_config delay_config;
+static struct op_iters_config iters_config;
 
 /* Default arg values */
 size_t msize = 64;
@@ -177,7 +177,7 @@ static inline int parse_args(int argc, char **argv)
   {
     fprintf(stderr, "Usage: %s <bind_ip> <port>" 
         " [--msize N] [--ncores N] [--buf-size N] [--cores LIST]"
-        " [--op-delay N] [--op-delay-avx 256|512]\n", argv[0]);
+        " [--op-iters N] [--op-iters-avx 256|512]\n", argv[0]);
     return -1;
   }
 
@@ -191,10 +191,10 @@ static inline int parse_args(int argc, char **argv)
 
   for (i = 3; i < argc; i++)
   {
-    int delay_arg = op_delay_parse_arg(&delay_config, argc, argv, &i);
-    if (delay_arg < 0)
+    int iters_arg = op_iters_parse_arg(&iters_config, argc, argv, &i);
+    if (iters_arg < 0)
       return -1;
-    if (delay_arg > 0)
+    if (iters_arg > 0)
       continue;
 
     if (strcmp(argv[i], "--msize") == 0 && i + 1 < argc)
@@ -226,7 +226,7 @@ static inline int parse_args(int argc, char **argv)
       return -1;
   }
 
-  return op_delay_validate(&delay_config);
+  return op_iters_validate(&iters_config);
 }
 
 static inline void print_stats(__u64 now)
@@ -348,8 +348,8 @@ static inline void core_rx(struct udp_context_lib *udp_ctx, struct core *c)
     if (nrx <= 0)
       break;
     
-    if (delay_config.cycles > 0)
-      op_delay_run(&delay_config, &c->delay_state);
+    if (iters_config.iterations > 0)
+      op_iters_run(&iters_config, &c->iters_state);
 
     c->nrx += nrx;
     __sync_fetch_and_add(&c->rxp_interval, 1);
@@ -435,7 +435,7 @@ static inline void prepare_cores()
   {
     memset(&cores[i], 0, sizeof(struct core));
     cores[i].id = i;
-    op_delay_init(&cores[i].delay_state);
+    op_iters_init(&cores[i].iters_state);
     memset(&cores[i].dst_addr, 0, sizeof(cores[i].dst_addr));
 
     if (inet_pton(AF_INET, src_ip, &src_addr.sin_addr) != 1)

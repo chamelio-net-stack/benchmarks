@@ -22,76 +22,50 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef UTILS_OP_DELAY_H_
-#define UTILS_OP_DELAY_H_
+#ifndef UTILS_OP_ITERS_H_
+#define UTILS_OP_ITERS_H_
 
 #include <immintrin.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
-struct op_delay_config
+struct op_iters_config
 {
-  uint32_t cycles;
+  uint32_t iterations;
   unsigned int avx_width;
 };
 
 /* Plain arrays avoid imposing vector alignment on calloc'ed core structs. */
-struct op_delay_state
+struct op_iters_state
 {
   uint32_t opaque;
   uint32_t lanes[16];
 };
 
-static inline uint64_t op_delay_rdtsc(void)
+static inline uint32_t op_iters_scalar(uint32_t iterations, uint32_t opaque)
 {
-  uint32_t eax, edx;
-  asm volatile ("rdtsc" : "=a" (eax), "=d" (edx));
-  return ((uint64_t) edx << 32) | eax;
-}
-
-/* From benchmarks/common/microbench.h: same arithmetic and TSC deadline. */
-static inline uint32_t kill_cycles(uint32_t cyc, uint32_t opaque)
-{
-  uint64_t start = op_delay_rdtsc();
-  uint64_t end = start + cyc;
-
-  if (end >= start)
+  for (uint32_t i = 0; i < iterations; i++)
   {
-    while (op_delay_rdtsc() < end)
-    {
-      opaque = opaque * 42 + 37;
-      opaque ^= 0x12345678;
-      opaque = opaque * 42 + 37;
-      opaque ^= 0x87654321;
-    }
-  }
-  else
-  {
-    while (op_delay_rdtsc() >= start || op_delay_rdtsc() < end)
-    {
-      opaque = opaque * 42 + 37;
-      opaque ^= 0x12345678;
-      opaque = opaque * 42 + 37;
-      opaque ^= 0x87654321;
-    }
+    opaque = opaque * 42 + 37;
+    opaque ^= 0x12345678;
+    opaque = opaque * 42 + 37;
+    opaque ^= 0x87654321;
+    asm volatile ("" : "+r" (opaque));
   }
   return opaque;
 }
 
 static __attribute__((target("avx2"), noinline))
-void kill_cycles_avx256(uint32_t cyc, struct op_delay_state *state)
+void op_iters_avx256(uint32_t iterations, struct op_iters_state *state)
 {
   __m256i opaque = _mm256_loadu_si256((const __m256i_u *) state->lanes);
   const __m256i mul = _mm256_set1_epi32(42);
   const __m256i add = _mm256_set1_epi32(37);
   const __m256i xor1 = _mm256_set1_epi32(0x12345678);
   const __m256i xor2 = _mm256_set1_epi32((int32_t) UINT32_C(0x87654321));
-  uint64_t start = op_delay_rdtsc();
-  uint64_t end = start + cyc;
 
-  while (end >= start ? op_delay_rdtsc() < end :
-      (op_delay_rdtsc() >= start || op_delay_rdtsc() < end))
+  for (uint32_t i = 0; i < iterations; i++)
   {
     opaque = _mm256_add_epi32(_mm256_mullo_epi32(opaque, mul), add);
     opaque = _mm256_xor_si256(opaque, xor1);
@@ -104,18 +78,15 @@ void kill_cycles_avx256(uint32_t cyc, struct op_delay_state *state)
 }
 
 static __attribute__((target("avx512f"), noinline))
-void kill_cycles_avx512(uint32_t cyc, struct op_delay_state *state)
+void op_iters_avx512(uint32_t iterations, struct op_iters_state *state)
 {
   __m512i opaque = _mm512_loadu_si512((const void *) state->lanes);
   const __m512i mul = _mm512_set1_epi32(42);
   const __m512i add = _mm512_set1_epi32(37);
   const __m512i xor1 = _mm512_set1_epi32(0x12345678);
   const __m512i xor2 = _mm512_set1_epi32((int32_t) UINT32_C(0x87654321));
-  uint64_t start = op_delay_rdtsc();
-  uint64_t end = start + cyc;
 
-  while (end >= start ? op_delay_rdtsc() < end :
-      (op_delay_rdtsc() >= start || op_delay_rdtsc() < end))
+  for (uint32_t i = 0; i < iterations; i++)
   {
     opaque = _mm512_add_epi32(_mm512_mullo_epi32(opaque, mul), add);
     opaque = _mm512_xor_si512(opaque, xor1);
@@ -126,41 +97,53 @@ void kill_cycles_avx512(uint32_t cyc, struct op_delay_state *state)
   _mm512_storeu_si512((void *) state->lanes, opaque);
 }
 
-static inline void op_delay_init(struct op_delay_state *state)
+static inline void op_iters_init(struct op_iters_state *state)
 {
   state->opaque = 0;
   for (unsigned int i = 0; i < 16; i++)
+  {
     state->lanes[i] = i;
+  }
 }
 
-static inline void op_delay_run(const struct op_delay_config *config,
-    struct op_delay_state *state)
+static inline void op_iters_run(const struct op_iters_config *config,
+    struct op_iters_state *state)
 {
-  if (config->cycles == 0)
+  if (config->iterations == 0)
+  {
     return;
+  }
 
   if (config->avx_width == 256)
-    kill_cycles_avx256(config->cycles, state);
+  {
+    op_iters_avx256(config->iterations, state);
+  }
   else if (config->avx_width == 512)
-    kill_cycles_avx512(config->cycles, state);
+  {
+    op_iters_avx512(config->iterations, state);
+  }
   else
-    state->opaque = kill_cycles(config->cycles, state->opaque);
+  {
+    state->opaque = op_iters_scalar(config->iterations, state->opaque);
+  }
 
   /* Make the persistent result observable without touching echo payloads. */
   asm volatile ("" : : "m" (*state) : "memory");
 }
 
 /* Return 1 for a consumed option, 0 for another option, -1 on invalid input. */
-static inline int op_delay_parse_arg(struct op_delay_config *config,
+static inline int op_iters_parse_arg(struct op_iters_config *config,
     int argc, char **argv, int *index)
 {
   const char *option = argv[*index];
   const char *value;
-  uint32_t cycles = 0;
+  uint32_t iterations = 0;
 
-  if (strcmp(option, "--op-delay") != 0 &&
-      strcmp(option, "--op-delay-avx") != 0)
+  if (strcmp(option, "--op-iters") != 0 &&
+      strcmp(option, "--op-iters-avx") != 0)
+  {
     return 0;
+  }
 
   if (*index + 1 >= argc)
   {
@@ -168,49 +151,58 @@ static inline int op_delay_parse_arg(struct op_delay_config *config,
     return -1;
   }
   value = argv[++*index];
-  if (strcmp(option, "--op-delay-avx") == 0)
+  if (strcmp(option, "--op-iters-avx") == 0)
   {
     if (strcmp(value, "256") == 0)
+    {
       config->avx_width = 256;
+    }
     else if (strcmp(value, "512") == 0)
+    {
       config->avx_width = 512;
+    }
     else
     {
-      fprintf(stderr, "--op-delay-avx must be 256 or 512\n");
+      fprintf(stderr, "--op-iters-avx must be 256 or 512\n");
       return -1;
     }
     return 1;
   }
 
   if (*value == '\0')
-    goto invalid_cycles;
+  {
+    goto invalid_iterations;
+  }
   for (const char *p = value; *p != '\0'; p++)
   {
     if (*p < '0' || *p > '9' ||
-        cycles > (UINT32_MAX - (uint32_t) (*p - '0')) / 10)
-      goto invalid_cycles;
-    cycles = cycles * 10 + (uint32_t) (*p - '0');
+        iterations > (UINT32_MAX - (uint32_t) (*p - '0')) / 10)
+    {
+      goto invalid_iterations;
+    }
+    iterations = iterations * 10 + (uint32_t) (*p - '0');
   }
-  config->cycles = cycles;
+  config->iterations = iterations;
   return 1;
 
-invalid_cycles:
-  fprintf(stderr, "--op-delay must be a decimal integer from 0 to 4294967295\n");
+invalid_iterations:
+  fprintf(stderr,
+      "--op-iters must be a decimal integer from 0 to 4294967295\n");
   return -1;
 }
 
-static inline int op_delay_validate(const struct op_delay_config *config)
+static inline int op_iters_validate(const struct op_iters_config *config)
 {
   __builtin_cpu_init();
   /* These checks include OS support for the required extended registers. */
   if ((config->avx_width == 256 && !__builtin_cpu_supports("avx2")) ||
       (config->avx_width == 512 && !__builtin_cpu_supports("avx512f")))
   {
-    fprintf(stderr, "--op-delay-avx %u is unsupported by this CPU/OS\n",
+    fprintf(stderr, "--op-iters-avx %u is unsupported by this CPU/OS\n",
         config->avx_width);
     return -1;
   }
   return 0;
 }
 
-#endif /* UTILS_OP_DELAY_H_ */
+#endif /* UTILS_OP_ITERS_H_ */
