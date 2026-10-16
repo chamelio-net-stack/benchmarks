@@ -39,70 +39,87 @@ struct op_iters_config
 /* Plain arrays avoid imposing vector alignment on calloc'ed core structs. */
 struct op_iters_state
 {
-  uint32_t opaque;
-  uint32_t lanes[16];
+  uint32_t lanes[4][16];
 };
 
-static inline uint32_t op_iters_scalar(uint32_t iterations, uint32_t opaque)
+static inline void op_iters_scalar(uint32_t iterations, struct op_iters_state *state)
 {
+  uint32_t a = state->lanes[0][0];
+  uint32_t b = state->lanes[1][0];
+  uint32_t c = state->lanes[2][0];
+  uint32_t d = state->lanes[3][0];
+
   for (uint32_t i = 0; i < iterations; i++)
   {
-    opaque = opaque * 42 + 37;
-    opaque ^= 0x12345678;
-    opaque = opaque * 42 + 37;
-    opaque ^= 0x87654321;
-    asm volatile ("" : "+r" (opaque));
+    a = a * 1664525u + 1013904223u;
+    b = b * 1664525u + 1013904223u;
+    c = c * 1664525u + 1013904223u;
+    d = d * 1664525u + 1013904223u;
+    /* Keep all four chains live across every iteration without memory traffic. */
+    asm volatile ("" : "+r" (a), "+r" (b), "+r" (c), "+r" (d));
   }
-  return opaque;
+  state->lanes[0][0] = a;
+  state->lanes[1][0] = b;
+  state->lanes[2][0] = c;
+  state->lanes[3][0] = d;
 }
 
 static __attribute__((target("avx2"), noinline))
 void op_iters_avx256(uint32_t iterations, struct op_iters_state *state)
 {
-  __m256i opaque = _mm256_loadu_si256((const __m256i_u *) state->lanes);
-  const __m256i mul = _mm256_set1_epi32(42);
-  const __m256i add = _mm256_set1_epi32(37);
-  const __m256i xor1 = _mm256_set1_epi32(0x12345678);
-  const __m256i xor2 = _mm256_set1_epi32((int32_t) UINT32_C(0x87654321));
+  __m256i a = _mm256_loadu_si256((const __m256i_u *) state->lanes[0]);
+  __m256i b = _mm256_loadu_si256((const __m256i_u *) state->lanes[1]);
+  __m256i c = _mm256_loadu_si256((const __m256i_u *) state->lanes[2]);
+  __m256i d = _mm256_loadu_si256((const __m256i_u *) state->lanes[3]);
+  const __m256i mul = _mm256_set1_epi32(1664525);
+  const __m256i add = _mm256_set1_epi32(1013904223);
 
   for (uint32_t i = 0; i < iterations; i++)
   {
-    opaque = _mm256_add_epi32(_mm256_mullo_epi32(opaque, mul), add);
-    opaque = _mm256_xor_si256(opaque, xor1);
-    opaque = _mm256_add_epi32(_mm256_mullo_epi32(opaque, mul), add);
-    opaque = _mm256_xor_si256(opaque, xor2);
-    /* Keep every lane live and require a vector result on every iteration. */
-    asm volatile ("" : "+x" (opaque));
+    a = _mm256_add_epi32(_mm256_mullo_epi32(a, mul), add);
+    b = _mm256_add_epi32(_mm256_mullo_epi32(b, mul), add);
+    c = _mm256_add_epi32(_mm256_mullo_epi32(c, mul), add);
+    d = _mm256_add_epi32(_mm256_mullo_epi32(d, mul), add);
+    asm volatile ("" : "+x" (a), "+x" (b), "+x" (c), "+x" (d));
   }
-  _mm256_storeu_si256((__m256i_u *) state->lanes, opaque);
+  _mm256_storeu_si256((__m256i_u *) state->lanes[0], a);
+  _mm256_storeu_si256((__m256i_u *) state->lanes[1], b);
+  _mm256_storeu_si256((__m256i_u *) state->lanes[2], c);
+  _mm256_storeu_si256((__m256i_u *) state->lanes[3], d);
 }
 
 static __attribute__((target("avx512f"), noinline))
 void op_iters_avx512(uint32_t iterations, struct op_iters_state *state)
 {
-  __m512i opaque = _mm512_loadu_si512((const void *) state->lanes);
-  const __m512i mul = _mm512_set1_epi32(42);
-  const __m512i add = _mm512_set1_epi32(37);
-  const __m512i xor1 = _mm512_set1_epi32(0x12345678);
-  const __m512i xor2 = _mm512_set1_epi32((int32_t) UINT32_C(0x87654321));
+  __m512i a = _mm512_loadu_si512((const void *) state->lanes[0]);
+  __m512i b = _mm512_loadu_si512((const void *) state->lanes[1]);
+  __m512i c = _mm512_loadu_si512((const void *) state->lanes[2]);
+  __m512i d = _mm512_loadu_si512((const void *) state->lanes[3]);
+  const __m512i mul = _mm512_set1_epi32(1664525);
+  const __m512i add = _mm512_set1_epi32(1013904223);
 
   for (uint32_t i = 0; i < iterations; i++)
   {
-    opaque = _mm512_add_epi32(_mm512_mullo_epi32(opaque, mul), add);
-    opaque = _mm512_xor_si512(opaque, xor1);
-    opaque = _mm512_add_epi32(_mm512_mullo_epi32(opaque, mul), add);
-    opaque = _mm512_xor_si512(opaque, xor2);
-    asm volatile ("" : "+v" (opaque));
+    a = _mm512_add_epi32(_mm512_mullo_epi32(a, mul), add);
+    b = _mm512_add_epi32(_mm512_mullo_epi32(b, mul), add);
+    c = _mm512_add_epi32(_mm512_mullo_epi32(c, mul), add);
+    d = _mm512_add_epi32(_mm512_mullo_epi32(d, mul), add);
+    asm volatile ("" : "+v" (a), "+v" (b), "+v" (c), "+v" (d));
   }
-  _mm512_storeu_si512((void *) state->lanes, opaque);
+  _mm512_storeu_si512((void *) state->lanes[0], a);
+  _mm512_storeu_si512((void *) state->lanes[1], b);
+  _mm512_storeu_si512((void *) state->lanes[2], c);
+  _mm512_storeu_si512((void *) state->lanes[3], d);
 }
 
 static inline void op_iters_init(struct op_iters_state *state)
 {
-  state->opaque = 0;
-  for (unsigned int i = 0; i < 16; i++)
+  for (unsigned int chain = 0; chain < 4; chain++)
   {
-    state->lanes[i] = i;
+    for (unsigned int lane = 0; lane < 16; lane++)
+    {
+      state->lanes[chain][lane] = chain + lane + 1;
+    }
   }
 }
 
@@ -124,7 +141,7 @@ static inline void op_iters_run(const struct op_iters_config *config,
   }
   else
   {
-    state->opaque = op_iters_scalar(config->iterations, state->opaque);
+    op_iters_scalar(config->iterations, state);
   }
 
   /* Make the persistent result observable without touching echo payloads. */
