@@ -11,6 +11,7 @@ if cham_homa_dep.found()
     'homa_cham_client.c',
     homa_common,
     '../utils/clock.c',
+    '../utils/hist.c',
     dependencies: [cham_homa_dep, threads_dep],
   )
   alias_target('homa_cham', [homa_cham_client, homa_cham_server])

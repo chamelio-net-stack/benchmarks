@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +10,7 @@
 #include "../utils/core.h"
 
 static int parse_number(const char *text, unsigned int *value);
+static int parse_rate(const char *text, double *value);
 static int parse_address(struct sockaddr_in *addr, char *ip, char *port);
 
 int homa_cham_parse(struct homa_cham_config *config, int argc, char **argv,
@@ -20,7 +22,9 @@ int homa_cham_parse(struct homa_cham_config *config, int argc, char **argv,
 
   memset(config, 0, sizeof(*config));
   config->msize = 64;
-  config->requests = 1;
+  config->duration = 30;
+  config->mpending = HOMA_CHAM_DEFAULT_PENDING;
+  config->rate = 10.0;
   config->core = -1;
 
   if (argc < first ||
@@ -30,22 +34,49 @@ int homa_cham_parse(struct homa_cham_config *config, int argc, char **argv,
   if (client && parse_address(&config->remote, argv[3], argv[4]) != 0)
     goto failed;
 
-  for (i = first; i < argc; i += 2)
+  for (i = first; i < argc; i++)
   {
-    if (i + 1 == argc || parse_number(argv[i + 1], &value) != 0)
+    if (client && strcmp(argv[i], "--validate") == 0)
+    {
+      config->validate = 1;
+      continue;
+    }
+
+    if (i + 1 == argc)
       goto failed;
 
-    if (strcmp(argv[i], "--msize") == 0 && value <= 1000000)
-      config->msize = value;
-    else if (strcmp(argv[i], "--ncores") == 0 && value == 1)
+    if (client && strcmp(argv[i], "--rate") == 0)
+    {
+      if (parse_rate(argv[++i], &config->rate) != 0)
+        goto failed;
       continue;
+    }
+
+    if (parse_number(argv[i + 1], &value) != 0)
+      goto failed;
+
+    if (strcmp(argv[i], "--msize") == 0 && value <= HOMA_CHAM_MAX_MESSAGE)
+      config->msize = value;
+    else if (strcmp(argv[i], "--ncores") == 0)
+    {
+      if (value != 1)
+        goto failed;
+    }
     else if (strcmp(argv[i], "--cores") == 0 && value <= INT_MAX)
       config->core = value;
-    else if (client && strcmp(argv[i], "--requests") == 0 && value > 0)
-      config->requests = value;
+    else if (client && strcmp(argv[i], "--duration") == 0 && value > 0)
+      config->duration = value;
+    else if (client && strcmp(argv[i], "--mpending") == 0 &&
+        value > 0 && value <= HOMA_CHAM_MAX_PENDING)
+      config->mpending = value;
     else
       goto failed;
+
+    i++;
   }
+
+  if (client && config->msize == 0)
+    goto failed;
 
   return 0;
 
@@ -53,7 +84,8 @@ failed:
   fprintf(stderr, "Usage: %s <bind_ip> <port>%s"
       " [--msize 0..1000000] [--ncores 1] [--cores CPU]%s\n", argv[0],
       client ? " <rem_ip> <rem_port>" : "",
-      client ? " [--requests N]" : "");
+      client ? " [--duration S] [--rate Mb/s]"
+      " [--mpending 1..128] [--validate]" : "");
   return -1;
 }
 
@@ -108,4 +140,21 @@ static int parse_address(struct sockaddr_in *addr, char *ip, char *port)
   addr->sin_family = AF_INET;
   addr->sin_port = htons(value);
   return inet_pton(AF_INET, ip, &addr->sin_addr) == 1 ? 0 : -1;
+}
+
+static int parse_rate(const char *text, double *value)
+{
+  char *end;
+  double parsed;
+
+  errno = 0;
+  parsed = strtod(text, &end);
+  if (errno != 0 || *text == '\0' || *end != '\0')
+    return -1;
+
+  if (!isfinite(parsed) || parsed <= 0.0)
+    return -1;
+
+  *value = parsed;
+  return 0;
 }
