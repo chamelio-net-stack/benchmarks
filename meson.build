@@ -22,6 +22,7 @@ demi_lib = cc.find_library(
 
 cham_udp_dep = dependency('cham_udp', required: false)
 cham_tcp_dep = dependency('cham_tcp', required: false)
+cham_homa_dep = dependency('cham_homa', required: false)
 
 demi_enabled = dpdk_dep.found() and demi_lib.found()
 cham_enabled = dpdk_dep.found() and cham_udp_dep.found()
@@ -62,4 +63,5 @@ endif
 
 subdir('tcp')
 subdir('udp')
+subdir('homa')
 subdir('kvs')
