@@ -50,7 +50,7 @@ static int finish_request(struct client *client, struct homa_event *event);
 static int is_reply_valid(struct client *client, struct homa_event *event);
 static void print_interval(struct client *client, __u64 now);
 static void print_summary(struct client *client);
-static void print_latency(struct hist_state *hist);
+static void print_latency(struct hist_state *hist, const char *unit);
 
 int main(int argc, char **argv)
 {
@@ -354,11 +354,11 @@ static void print_interval(struct client *client, __u64 now)
   double payload_mbits = client->config.msize * 8.0 / 1000000.0;
 
   printf("[ %3llus ] load=%llu rps | load=%.2f Mb/s | "
-      "tp=%llu rps | tp=%.2f Mb/s | RTT (us): ",
+      "tp=%llu rps | tp=%.2f Mb/s | ",
       (unsigned long long) ((now - client->start_ns) / NS_PER_SECOND),
       (unsigned long long) load, load * payload_mbits,
       (unsigned long long) throughput, throughput * payload_mbits);
-  print_latency(&client->hist);
+  print_latency(&client->hist, " us");
   fflush(stdout);
   client->interval_sent = 0;
   client->interval_received = 0;
@@ -380,11 +380,8 @@ static void print_summary(struct client *client)
   payload_mbits = client->config.msize * 8.0 / 1000000.0;
 
   printf("Cores               : 1\n");
-  printf("Load interval (s)   : %.3f\n", seconds);
   printf("TX requests         : %llu\n", (unsigned long long) client->sent);
   printf("RX replies          : %llu\n", (unsigned long long) client->received);
-  printf("Measured replies    : %llu\n",
-      (unsigned long long) client->window_received);
   printf("RPC errors          : %llu\n", (unsigned long long) client->errors);
   printf("Unfinished RPCs     : %u\n", client->active);
   printf("Avg Load            : %llu rps %.2f Mb/s\n",
@@ -392,21 +389,21 @@ static void print_summary(struct client *client)
   printf("Avg Throughput      : %llu rps %.2f Mb/s\n",
       (unsigned long long) throughput, throughput * payload_mbits);
   printf("RTT percentiles (us): ");
-  print_latency(&client->hist);
+  print_latency(&client->hist, "");
   fflush(stdout);
 }
 
-static void print_latency(struct hist_state *hist)
+static void print_latency(struct hist_state *hist, const char *unit)
 {
   __u64 p50, p99, p999;
 
   if (!hist_percentiles(hist, &p50, &p99, &p999))
   {
-    printf("p50=-  p99=-  p99.9=-\n");
+    printf("p50=-%s  p99=-%s  p99.9=-%s\n", unit, unit, unit);
     return;
   }
 
-  printf("p50=%llu  p99=%llu  p99.9=%llu\n",
-      (unsigned long long) p50, (unsigned long long) p99,
-      (unsigned long long) p999);
+  printf("p50=%llu%s  p99=%llu%s  p99.9=%llu%s\n",
+      (unsigned long long) p50, unit, (unsigned long long) p99, unit,
+      (unsigned long long) p999, unit);
 }
