@@ -1,7 +1,10 @@
+#define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
+#include <sched.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +12,7 @@
 #include "homa_cham.h"
 #include "../utils/core.h"
 
+static int parse_cores(struct homa_cham_config *config, const char *list);
 static int parse_number(const char *text, unsigned int *value);
 static int parse_rate(const char *text, double *value);
 static int parse_address(struct sockaddr_in *addr, char *ip, char *port);
@@ -19,6 +23,7 @@ int homa_cham_parse(struct homa_cham_config *config, int argc, char **argv,
   unsigned int value;
   int first = client ? 5 : 3;
   int i;
+  const char *cores = NULL;
 
   memset(config, 0, sizeof(*config));
   config->msize = 64;
@@ -26,6 +31,7 @@ int homa_cham_parse(struct homa_cham_config *config, int argc, char **argv,
   config->mpending = HOMA_CHAM_DEFAULT_PENDING;
   config->rate = 10.0;
   config->core = -1;
+  config->ncores = 1;
 
   if (argc < first ||
       parse_address(&config->local, argv[1], argv[2]) != 0)
@@ -45,6 +51,12 @@ int homa_cham_parse(struct homa_cham_config *config, int argc, char **argv,
     if (i + 1 == argc)
       goto failed;
 
+    if (strcmp(argv[i], "--cores") == 0)
+    {
+      cores = argv[++i];
+      continue;
+    }
+
     if (client && strcmp(argv[i], "--rate") == 0)
     {
       if (parse_rate(argv[++i], &config->rate) != 0)
@@ -59,11 +71,10 @@ int homa_cham_parse(struct homa_cham_config *config, int argc, char **argv,
       config->msize = value;
     else if (strcmp(argv[i], "--ncores") == 0)
     {
-      if (value != 1)
+      if (value == 0 || value > HOMA_CHAM_MAX_CORES)
         goto failed;
+      config->ncores = value;
     }
-    else if (strcmp(argv[i], "--cores") == 0 && value <= INT_MAX)
-      config->core = value;
     else if (client && strcmp(argv[i], "--duration") == 0 && value > 0)
       config->duration = value;
     else if (client && strcmp(argv[i], "--mpending") == 0 &&
@@ -78,11 +89,25 @@ int homa_cham_parse(struct homa_cham_config *config, int argc, char **argv,
   if (client && config->msize == 0)
     goto failed;
 
+  unsigned int local_port = ntohs(config->local.sin_port);
+  unsigned int remote_port = ntohs(config->remote.sin_port);
+  int local_valid = local_port == 0 ||
+      local_port + config->ncores - 1 <= UINT16_MAX;
+  int remote_valid = !client || (remote_port != 0 &&
+      remote_port + config->ncores - 1 <= UINT16_MAX);
+  int server_valid = client || config->ncores == 1 || local_port != 0;
+
+  if (!local_valid || !remote_valid || !server_valid)
+    goto failed;
+
+  if (parse_cores(config, cores) != 0)
+    return -1;
+
   return 0;
 
 failed:
   fprintf(stderr, "Usage: %s <bind_ip> <port>%s"
-      " [--msize 0..1000000] [--ncores 1] [--cores CPU]%s\n", argv[0],
+      " [--msize 0..1000000] [--ncores N] [--cores CPU,...]%s\n", argv[0],
       client ? " <rem_ip> <rem_port>" : "",
       client ? " [--duration S] [--rate Mb/s]"
       " [--mpending 1..128] [--validate]" : "");
@@ -156,5 +181,40 @@ static int parse_rate(const char *text, double *value)
     return -1;
 
   *value = parsed;
+  return 0;
+}
+
+static int parse_cores(struct homa_cham_config *config, const char *list)
+{
+  unsigned int count = 0, cpu, i;
+  char *copy, *next, *token;
+
+  for (i = 0; i < config->ncores; i++)
+    config->cores[i] = -1;
+
+  if (list == NULL)
+    return 0;
+
+  copy = strdup(list);
+  if (copy == NULL)
+    return -1;
+
+  next = copy;
+  while ((token = strsep(&next, ",")) != NULL)
+  {
+    if (count == config->ncores || parse_number(token, &cpu) != 0 ||
+        cpu >= CPU_SETSIZE)
+      break;
+
+    config->cores[count++] = cpu;
+  }
+  free(copy);
+
+  if (token != NULL || count != config->ncores)
+  {
+    fprintf(stderr, "--cores requires one CPU per worker\n");
+    return -1;
+  }
+
   return 0;
 }

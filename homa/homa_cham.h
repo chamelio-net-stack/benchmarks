@@ -5,13 +5,16 @@
 
 /* Maximum outstanding client RPCs supported by the single context. */
 #define HOMA_CHAM_MAX_PENDING 128
+/* Maximum benchmark workers. */
+#define HOMA_CHAM_MAX_CORES 8
 /* Default outstanding RPC limit. */
 #define HOMA_CHAM_DEFAULT_PENDING 16
 /* Maximum message payload size. */
 #define HOMA_CHAM_MAX_MESSAGE 1000000
 
-/* Arguments shared by the single-threaded echo client and server. */
-struct homa_cham_config {
+/* Arguments shared by the echo client and server. */
+struct homa_cham_config
+{
   /* Local endpoint. */
   struct sockaddr_in local;
   /* Remote endpoint, used by the client. */
@@ -22,11 +25,15 @@ struct homa_cham_config {
   unsigned int duration;
   /* Maximum outstanding client RPCs. */
   unsigned int mpending;
-  /* Target request payload rate in megabits per second. */
+  /* Target request payload rate per endpoint in megabits per second. */
   double rate;
   /* Check all echoed payload bytes. */
   int validate;
-  /* Optional CPU for the application, or -1. */
+  /* Number of endpoints and application workers. */
+  unsigned int ncores;
+  /* Optional worker CPUs; -1 inherits process affinity. */
+  int cores[HOMA_CHAM_MAX_CORES];
+  /* Optional CPU for this worker; -1 leaves affinity unchanged. */
   int core;
 };
 

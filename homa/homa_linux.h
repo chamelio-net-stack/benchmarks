@@ -7,12 +7,13 @@
 
 /* Maximum outstanding client RPCs supported by the single context. */
 #define HOMA_LINUX_MAX_PENDING 128
+#define HOMA_LINUX_MAX_CORES 8
 /* Default outstanding RPC limit. */
 #define HOMA_LINUX_DEFAULT_PENDING 16
 /* Maximum message payload size. */
 #define HOMA_LINUX_MAX_MESSAGE 1000000
 
-/* Arguments shared by the single-threaded echo client and server. */
+/* Arguments shared by the echo client and server. */
 struct homa_linux_config
 {
   /* Local endpoint. */
@@ -25,11 +26,15 @@ struct homa_linux_config
   unsigned int duration;
   /* Maximum outstanding client RPCs. */
   unsigned int mpending;
-  /* Target request payload rate in megabits per second. */
+  /* Target request payload rate per endpoint in megabits per second. */
   double rate;
   /* Check all echoed payload bytes. */
   int validate;
-  /* Optional CPU for the application, or -1. */
+  /* Number of workers */
+  unsigned int ncores;
+  /* Optional worker CPUs; -1 inherits process affinity. */
+  int cores[HOMA_LINUX_MAX_CORES];
+  /* Optional CPU for this worker; -1 leaves affinity unchanged. */
   int core;
 };
 

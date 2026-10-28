@@ -2,8 +2,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "homa_linux.h"
+#include "homa_workers.h"
 #include "../utils/clock.h"
 #include "../utils/hist.h"
 
@@ -24,7 +26,6 @@ struct client
   struct homa_linux_config config;
   struct homa_linux *ctx;
   struct pending_rpc pending[HOMA_LINUX_MAX_PENDING];
-  struct hist_state hist;
   unsigned char *payload;
   int fd;
   unsigned int active;
@@ -43,6 +44,14 @@ struct client
   double tokens;
 };
 
+/* Main owns reporting; workers share only the histogram and startup gate. */
+static struct hist_state rtt_hist;
+static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t state_changed = PTHREAD_COND_INITIALIZER;
+static unsigned int ready_workers, done_workers;
+static int released, abort_start;
+static __u64 measurement_start_ns;
+
 static int run_client(struct client *client);
 static void start_measurement(struct client *client, __u64 now);
 static void update_tokens(struct client *client, __u64 now);
@@ -56,61 +65,48 @@ static void print_interval(struct client *client, __u64 now);
 static void print_summary(struct client *client);
 static void print_latency(struct hist_state *hist, const char *unit);
 
-int main(int argc, char **argv)
+static int client_worker(void *arg)
 {
-  struct client client = { 0 };
+  struct client *client = arg;
   int ret;
 
-  if (homa_linux_parse(&client.config, argc, argv, 1) != 0)
-    return 1;
-
-  client.payload = calloc(client.config.msize ? client.config.msize : 1, 1);
-  if (client.payload == NULL)
+  client->payload = calloc(client->config.msize ? client->config.msize : 1, 1);
+  if (client->payload == NULL)
   {
     perror("Homa client payload");
     return 1;
   }
 
-  client.fd = homa_linux_init(&client.config, &client.ctx);
-  if (client.fd < 0)
+  client->fd = homa_linux_init(&client->config, &client->ctx);
+  if (client->fd < 0)
   {
     perror("Homa client initialization");
-    free(client.payload);
+    free(client->payload);
     return 1;
   }
 
-  if (init_hist(&client.hist, MAX_RTT_US) != 0)
-  {
-    homa_linux_free(client.ctx);
-    free(client.payload);
-    return 1;
-  }
+  ret = run_client(client);
 
-  calibrate_tsc();
-  printf("Homa benchmark: msize=%u, rate=%.2f Mb/s, mpending=%u\n",
-      client.config.msize, client.config.rate, client.config.mpending);
-  printf("One startup echo is excluded from measurements.\n");
-  printf("Rates count request/reply payload bytes in one direction.\n");
-  printf("RTTs include drained replies; throughput uses the load interval.\n");
-  printf("RTT histogram cap: %u us\n", MAX_RTT_US);
-  printf("Payload validation: %s\n",
-      client.config.validate ? "enabled" : "disabled");
-  fflush(stdout);
-
-  ret = run_client(&client);
-  if (client.start_ns != 0)
-    print_summary(&client);
-
-  if (homa_linux_close(client.ctx, client.fd) != 0)
+  if (homa_linux_close(client->ctx, client->fd) != 0)
   {
     perror("homa_linux_close");
     ret = -1;
   }
 
-  homa_linux_free(client.ctx);
-  hist_cleanup(&client.hist);
-  free(client.payload);
+  homa_linux_free(client->ctx);
+  free(client->payload);
   return ret == 0 ? 0 : 1;
+}
+
+static void *client_thread(void *arg)
+{
+  int ret = client_worker(arg);
+
+  pthread_mutex_lock(&state_lock);
+  done_workers++;
+  pthread_cond_broadcast(&state_changed);
+  pthread_mutex_unlock(&state_lock);
+  return (void *) (intptr_t) ret;
 }
 
 static int run_client(struct client *client)
@@ -123,7 +119,18 @@ static int run_client(struct client *client)
   {
     now = now_ns();
     if (client->start_ns == 0 && client->received == 1)
-      start_measurement(client, now);
+    {
+      pthread_mutex_lock(&state_lock);
+      ready_workers++;
+      pthread_cond_broadcast(&state_changed);
+      while (!released)
+        pthread_cond_wait(&state_changed, &state_lock);
+      pthread_mutex_unlock(&state_lock);
+      if (abort_start)
+        return -1;
+      start_measurement(client, measurement_start_ns);
+      now = now_ns();
+    }
 
     if (client->start_ns != 0 && now >= client->end_ns)
     {
@@ -149,11 +156,7 @@ static int run_client(struct client *client)
     }
 
     if (client->start_ns != 0)
-    {
       update_tokens(client, now);
-      if (now >= client->next_report_ns && now < client->end_ns)
-        print_interval(client, now);
-    }
 
     if (send_requests(client) != 0)
       return -1;
@@ -212,6 +215,8 @@ static int is_send_allowed(struct client *client, __u64 now)
 
 static int send_requests(struct client *client)
 {
+  struct homa_startup startup = { htonl(HOMA_STARTUP_MAGIC),
+      htonl(client->config.ncores) };
   struct pending_rpc *rpc;
   unsigned int i, j;
 
@@ -231,8 +236,10 @@ static int send_requests(struct client *client)
     }
 
     rpc->tsc = util_rdtsc();
-    if (homa_linux_request(client->ctx, client->fd, client->payload,
-        client->config.msize, (const struct sockaddr *) &client->config.remote,
+    if (homa_linux_request(client->ctx, client->fd,
+        client->start_ns == 0 ? (void *) &startup : client->payload,
+        client->start_ns == 0 ? sizeof(startup) : client->config.msize,
+        (const struct sockaddr *) &client->config.remote,
         sizeof(client->config.remote), &rpc->id) != 0)
     {
       if (errno == EAGAIN || errno == ENOBUFS)
@@ -248,7 +255,7 @@ static int send_requests(struct client *client)
     if (client->start_ns != 0)
     {
       client->tokens -= client->config.msize;
-      client->interval_sent++;
+      __atomic_fetch_add(&client->interval_sent, 1, __ATOMIC_RELAXED);
     }
   }
 
@@ -294,7 +301,7 @@ static int finish_request(struct client *client, struct homa_linux_event *event)
 
   now = now_ns();
   rtt_us = client->start_ns != 0 ? us_since_tsc(rpc->tsc) : 0;
-  if (client->config.validate)
+  if (client->config.validate && client->start_ns != 0)
   {
     for (j = 0; j < client->config.msize; j++)
     {
@@ -325,11 +332,11 @@ static int finish_request(struct client *client, struct homa_linux_event *event)
   client->received++;
   if (client->start_ns != 0)
   {
-    hist_add(&client->hist, rtt_us);
+    hist_add(&rtt_hist, rtt_us);
     if (now < client->end_ns)
     {
       client->window_received++;
-      client->interval_received++;
+      __atomic_fetch_add(&client->interval_received, 1, __ATOMIC_RELAXED);
     }
   }
 
@@ -345,6 +352,19 @@ static int is_reply_valid(struct client *client, struct homa_linux_event *event)
   int same_port = event->peer.sin_port == client->config.remote.sin_port;
   int length_valid = event->len == client->config.msize;
   int success = event->status == 0;
+
+  if (client->start_ns == 0)
+  {
+    struct homa_startup startup;
+
+    if (event->len != sizeof(startup))
+      return 0;
+    memcpy(&startup, event->data, sizeof(startup));
+    length_valid = ntohl(startup.magic) == HOMA_STARTUP_MAGIC &&
+        ntohl(startup.ncores) == client->config.ncores;
+    if (!length_valid)
+      fprintf(stderr, "Client/server worker counts must match\n");
+  }
 
   return response && same_socket && same_address && same_port &&
       length_valid && success;
@@ -362,8 +382,10 @@ static void print_interval(struct client *client, __u64 now)
       (unsigned long long) ((now - client->start_ns) / NS_PER_SECOND),
       (unsigned long long) load, load * payload_mbits,
       (unsigned long long) throughput, throughput * payload_mbits);
-  print_latency(&client->hist, " us");
+
+  print_latency(&rtt_hist, " us");
   fflush(stdout);
+
   client->interval_sent = 0;
   client->interval_received = 0;
   client->last_report_ns = now;
@@ -378,12 +400,13 @@ static void print_summary(struct client *client)
 
   if (stop_ns > client->end_ns)
     stop_ns = client->end_ns;
+
   seconds = (double) (stop_ns - client->start_ns) / NS_PER_SECOND;
   load = client->sent / seconds;
   throughput = client->window_received / seconds;
   payload_mbits = client->config.msize * 8.0 / 1000000.0;
 
-  printf("Cores               : 1\n");
+  printf("Cores               : %u\n", client->config.ncores);
   printf("TX requests         : %llu\n", (unsigned long long) client->sent);
   printf("RX replies          : %llu\n", (unsigned long long) client->received);
   printf("RPC errors          : %llu\n", (unsigned long long) client->errors);
@@ -393,7 +416,7 @@ static void print_summary(struct client *client)
   printf("Avg Throughput      : %llu rps %.2f Mb/s\n",
       (unsigned long long) throughput, throughput * payload_mbits);
   printf("RTT percentiles (us): ");
-  print_latency(&client->hist, "");
+  print_latency(&rtt_hist, "");
   fflush(stdout);
 }
 
@@ -410,4 +433,117 @@ static void print_latency(struct hist_state *hist, const char *unit)
   printf("p50=%llu%s  p99=%llu%s  p99.9=%llu%s\n",
       (unsigned long long) p50, unit, (unsigned long long) p99, unit,
       (unsigned long long) p999, unit);
+}
+
+static void collect_interval(struct client *total, struct client *clients)
+{
+  unsigned int i;
+
+  for (i = 0; i < total->config.ncores; i++)
+  {
+    total->interval_sent += __atomic_exchange_n(&clients[i].interval_sent,
+        0, __ATOMIC_RELAXED);
+    total->interval_received += __atomic_exchange_n(&clients[i].interval_received,
+        0, __ATOMIC_RELAXED);
+  }
+}
+
+int main(int argc, char **argv)
+{
+  struct homa_linux_config config;
+  struct client clients[HOMA_LINUX_MAX_CORES] = { 0 }, total = { 0 };
+  pthread_t threads[HOMA_LINUX_MAX_CORES];
+  struct timespec pause = { .tv_sec = 0, .tv_nsec = 2000000 };
+  unsigned int i, started = 0, done;
+  int ret = 0, error;
+  void *result;
+  __u64 now;
+
+  if (homa_linux_parse(&config, argc, argv, 1) != 0)
+    return 1;
+  if (init_hist(&rtt_hist, MAX_RTT_US) != 0)
+    return 1;
+  calibrate_tsc();
+  total.config = config;
+
+  printf("Homa benchmark: ncores=%u, msize=%u, rate=%.2f Mb/s per endpoint, "
+      "mpending=%u\n", config.ncores, config.msize, config.rate, config.mpending);
+  printf("One startup echo per endpoint is excluded from measurements.\n");
+  printf("Rates count request/reply payload bytes in one direction.\n");
+  printf("RTTs include drained replies; throughput uses the load interval.\n");
+  printf("RTT histogram cap: %u us\n", MAX_RTT_US);
+  printf("Payload validation: %s\n", config.validate ? "enabled" : "disabled");
+  fflush(stdout);
+
+  for (i = 0; i < config.ncores; i++)
+  {
+    clients[i].config = config;
+    clients[i].config.core = config.cores[i];
+    if (config.local.sin_port != 0)
+      clients[i].config.local.sin_port = htons(ntohs(config.local.sin_port) + i);
+    clients[i].config.remote.sin_port = htons(ntohs(config.remote.sin_port) + i);
+    error = pthread_create(&threads[i], NULL, client_thread, &clients[i]);
+    if (error != 0)
+    {
+      fprintf(stderr, "Cannot start Homa worker: %s\n", strerror(error));
+      ret = 1;
+      break;
+    }
+    started++;
+  }
+
+  /* Release all endpoints on one timebase, or wake ready workers on failure. */
+  pthread_mutex_lock(&state_lock);
+  while (started == config.ncores && ready_workers < started && done_workers == 0)
+    pthread_cond_wait(&state_changed, &state_lock);
+  abort_start = started != config.ncores || done_workers != 0;
+  if (!abort_start)
+  {
+    measurement_start_ns = now_ns();
+    start_measurement(&total, measurement_start_ns);
+  }
+  released = 1;
+  pthread_cond_broadcast(&state_changed);
+  pthread_mutex_unlock(&state_lock);
+
+  do
+  {
+    pthread_mutex_lock(&state_lock);
+    done = done_workers;
+    pthread_mutex_unlock(&state_lock);
+    now = now_ns();
+    if (!abort_start && now >= total.next_report_ns && now < total.end_ns)
+    {
+      collect_interval(&total, clients);
+      print_interval(&total, now);
+    }
+    if (done < started)
+      nanosleep(&pause, NULL);
+  } while (done < started);
+
+  for (i = 0; i < started; i++)
+  {
+    pthread_join(threads[i], &result);
+    if ((intptr_t) result != 0)
+      ret = 1;
+    if (clients[i].start_ns == 0)
+      continue;
+    total.sent += clients[i].sent;
+    total.received += clients[i].received;
+    total.errors += clients[i].errors;
+    total.window_received += clients[i].window_received;
+    total.active += clients[i].active;
+  }
+  if (!abort_start)
+  {
+    collect_interval(&total, clients);
+    now = now_ns();
+    if (now > total.end_ns)
+      now = total.end_ns;
+    if (now > total.last_report_ns)
+      print_interval(&total, now);
+    print_summary(&total);
+  }
+  hist_cleanup(&rtt_hist);
+  return ret;
 }
